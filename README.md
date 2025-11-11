@@ -1,5 +1,7 @@
 # log.c
-A simple logging library implemented in C99
+原作者仓库：https://github.com/rxi/log.c
+
+A simple logging library implemented in C17
 
 ![screenshot](https://cloud.githubusercontent.com/assets/3920290/23831970/a2415e96-0723-11e7-9886-f8f5d2de60fe.png)
 

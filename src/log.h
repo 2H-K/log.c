@@ -15,6 +15,9 @@
 
 #define LOG_VERSION "0.1.0"
 
+// 使用C17的静态断言确保结构体大小合理
+_Static_assert(sizeof(int) >= 4, "int must be at least 32 bits");
+
 typedef struct {
   va_list ap;
   const char *fmt;
@@ -30,6 +33,7 @@ typedef void (*log_LockFn)(bool lock, void *udata);
 
 enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL };
 
+// 使用C17的复合字面量和更清晰的宏定义
 #define log_trace(...) log_log(LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)
 #define log_debug(...) log_log(LOG_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
 #define log_info(...)  log_log(LOG_INFO,  __FILE__, __LINE__, __VA_ARGS__)

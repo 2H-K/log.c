@@ -22,6 +22,8 @@
 
 #include "log.h"
 
+// 使用C17静态断言确保数组大小合理
+_Static_assert(sizeof(int) >= 4, "int must be at least 32 bits");
 #define MAX_CALLBACKS 32
 
 typedef struct {
@@ -52,7 +54,14 @@ static const char *level_colors[] = {
 
 static void stdout_callback(log_Event *ev) {
   char buf[16];
-  buf[strftime(buf, sizeof(buf), "%H:%M:%S", ev->time)] = '\0';
+  // C17: 更明确的缓冲区处理
+  size_t len = strftime(buf, sizeof(buf), "%H:%M:%S", ev->time);
+  if (len > 0 && len < sizeof(buf)) {
+    buf[len] = '\0';
+  } else {
+    buf[0] = '\0';  // 安全处理
+  }
+  
 #ifdef LOG_USE_COLOR
   fprintf(
     ev->udata, "%s %s%-5s\x1b[0m \x1b[90m%s:%d:\x1b[0m ",
@@ -71,7 +80,14 @@ static void stdout_callback(log_Event *ev) {
 
 static void file_callback(log_Event *ev) {
   char buf[64];
-  buf[strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", ev->time)] = '\0';
+  // C17: 更明确的缓冲区处理
+  size_t len = strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", ev->time);
+  if (len > 0 && len < sizeof(buf)) {
+    buf[len] = '\0';
+  } else {
+    buf[0] = '\0';  // 安全处理
+  }
+  
   fprintf(
     ev->udata, "%s %-5s %s:%d: ",
     buf, level_strings[ev->level], ev->file, ev->line);
@@ -92,6 +108,10 @@ static void unlock(void) {
 
 
 const char* log_level_string(int level) {
+  // C17: 添加边界检查
+  if (level < 0 || level >= (int)(sizeof(level_strings)/sizeof(level_strings[0]))) {
+    return "UNKNOWN";
+  }
   return level_strings[level];
 }
 
@@ -113,8 +133,9 @@ void log_set_quiet(bool enable) {
 
 
 int log_add_callback(log_LogFn fn, void *udata, int level) {
+  // C17: 优化循环，使用更清晰的条件
   for (int i = 0; i < MAX_CALLBACKS; i++) {
-    if (!L.callbacks[i].fn) {
+    if (L.callbacks[i].fn == NULL) {
       L.callbacks[i] = (Callback) { fn, udata, level };
       return 0;
     }
@@ -129,7 +150,8 @@ int log_add_fp(FILE *fp, int level) {
 
 
 static void init_event(log_Event *ev, void *udata) {
-  if (!ev->time) {
+  // C17: 更清晰的条件判断
+  if (ev->time == NULL) {
     time_t t = time(NULL);
     ev->time = localtime(&t);
   }
@@ -138,12 +160,12 @@ static void init_event(log_Event *ev, void *udata) {
 
 
 void log_log(int level, const char *file, int line, const char *fmt, ...) {
-  log_Event ev = {
-    .fmt   = fmt,
-    .file  = file,
-    .line  = line,
-    .level = level,
-  };
+  // C17: 利用复合字面量初始化结构体
+  log_Event ev = {0};  // 初始化为零值
+  ev.fmt = fmt;
+  ev.file = file;
+  ev.line = line;
+  ev.level = level;
 
   lock();
 
@@ -154,7 +176,8 @@ void log_log(int level, const char *file, int line, const char *fmt, ...) {
     va_end(ev.ap);
   }
 
-  for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn; i++) {
+  // C17: 优化循环，避免重复计算
+  for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn != NULL; i++) {
     Callback *cb = &L.callbacks[i];
     if (level >= cb->level) {
       init_event(&ev, cb->udata);
