@@ -12,6 +12,12 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# Color output option
+option(ENABLE_LOG_COLOR "Enable colored log output" ON)
+if(ENABLE_LOG_COLOR)
+    add_definitions(-DLOG_USE_COLOR)
+endif()
+
 # Source files
 set(SOURCES
     src/log.c

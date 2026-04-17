@@ -1,22 +1,24 @@
-# Enhanced C Log Library
+# Enhanced C Log Library - Cross Platform
 
-A simple, powerful, and thread-safe logging library implemented in C17.
+A simple, powerful, and thread-safe logging library implemented in C17 with full cross-platform support.
 
 ![screenshot](https://cloud.githubusercontent.com/assets/3920290/23831970/a2415e96-0723-11e7-9886-f8f5d2de60fe.png)
 
-## Features
+## 🚀 Features
 
+- **Cross-Platform Support**: Windows (MSVC/MinGW-w64) & Linux/macOS (GCC/Clang)
 - **Thread-Safe**: Reader-writer locks for concurrent access
 - **Async Logging**: Lock-free queue for non-blocking writes
 - **Log Rotation**: Automatic file rotation by size
 - **Structured Logging**: JSON format support
 - **Thread ID Tracking**: Optional thread ID in output
-- **Syslog Integration**: Native syslog support
+- **Syslog Integration**: Native syslog support (POSIX only)
 - **Dynamic Configuration**: Runtime level/format changes
 - **Performance Stats**: Built-in metrics and monitoring
 - **NULL Safe**: Robust handling of NULL strings
+- **Color Output**: Optional colored terminal output (ANSI codes)
 
-## Quick Start
+## 📦 Quick Start
 
 ### Basic Usage
 
@@ -42,7 +44,93 @@ log_info("Application started");
 log_error("Error: %s", strerror(errno));
 ```
 
-## Core Features
+## 🛠️ Building
+
+### CMake (Cross-Platform Recommended)
+
+```bash
+# Create build directory
+mkdir build && cd build
+
+# Configure with CMake
+# Windows with MSVC
+cmake ..
+
+# Windows with MinGW-w64
+cmake -G "MinGW Makefiles" ..
+
+# Linux/macOS
+cmake ..
+
+# Build the project
+cmake --build .
+```
+
+### Compiler Options
+
+```bash
+# Enable color output (default: ON)
+cmake -DENABLE_LOG_COLOR=ON ..
+
+# Disable examples
+cmake -DBUILD_EXAMPLES=OFF ..
+
+# Disable tests
+cmake -DBUILD_TESTS=OFF ..
+```
+
+### Manual Compilation
+
+```bash
+# Compile as static library
+gcc -c -std=c17 -Wall -Wextra src/log.c -o log.o
+ar rcs liblog.a log.o
+
+# Compile with application
+gcc -std=c17 -Wall -Wextra -I./src \
+    src/log.c src/example.c -o example -lpthread
+
+# Enable color output
+gcc -DLOG_USE_COLOR -std=c17 -Wall -Wextra \
+    src/log.c src/example.c -o example -lpthread
+```
+
+## 🌐 Cross-Platform Support
+
+### Supported Platforms
+- **Windows**: MSVC 2015+, MinGW-w64
+- **Linux**: GCC 4.8+, Clang 3.4+
+- **macOS**: Clang, GCC
+- **Other POSIX**: FreeBSD, etc.
+
+### Platform-Specific Features
+
+| Feature | Windows | POSIX |
+|---------|---------|-------|
+| Threads | Win32 API | pthread |
+| Atomic Ops | InterlockedXxx | C11 stdatomic |
+| Syslog | ❌ Not available | ✅ Available |
+| High-res Time | GetSystemTimePreciseAsFileTime | clock_gettime |
+
+## 🎨 Color Output
+
+Color output is enabled by default and uses ANSI escape codes:
+
+```c
+// Enable/disable color output at compile time
+// Via CMake: -DENABLE_LOG_COLOR=ON/OFF
+// Via compiler: -DLOG_USE_COLOR
+
+// Color mapping:
+// TRACE: Gray    (\x1b[90m)
+// DEBUG: Cyan    (\x1b[36m)
+// INFO:  Green   (\x1b[32m)
+// WARN:  Yellow  (\x1b[33m)
+// ERROR: Red     (\x1b[31m)
+// FATAL: Bright Red (\x1b[91m)
+```
+
+## 📋 Core Features
 
 ### 1. Log Levels
 
@@ -181,17 +269,17 @@ int main(void) {
 }
 ```
 
-### 6. Syslog Integration
+### 6. Syslog Integration (POSIX Only)
 
 ```c
 int main(void) {
     log *ctx = log_create();
 
-    // Add syslog handler
+    // Add syslog handler (POSIX only)
+    #ifdef LOG_PLATFORM_POSIX
     int idx = log_add_syslog_handler(ctx, "myapp", LOG_USER, LOG_INFO);
-
-    // Enable thread ID in syslog
     log_enable_thread_id(ctx, idx, true);
+    #endif
 
     log_ctx_info(ctx, "Application started");
     log_ctx_error(ctx, "Failed to connect to database");
@@ -201,74 +289,7 @@ int main(void) {
 }
 ```
 
-### 7. Multiple Handlers
-
-```c
-int main(void) {
-    log *ctx = log_create();
-
-    // Console handler (all levels) - added by default
-
-    // File handler (INFO+)
-    FILE *fp_info = fopen("info.log", "w");
-    int idx_info = log_add_fp(ctx, fp_info, LOG_INFO);
-
-    // Error file handler (ERROR+ only)
-    FILE *fp_error = fopen("error.log", "w");
-    int idx_error = log_add_fp(ctx, fp_error, LOG_ERROR);
-
-    // JSON handler
-    FILE *fp_json = fopen("logs.json", "w");
-    log_set_format(ctx, log_format_json);
-    int idx_json = log_add_fp(ctx, fp_json, LOG_INFO);
-
-    // Write logs
-    log_ctx_info(ctx, "This goes to console and info.log");
-    log_ctx_error(ctx, "This goes to all handlers");
-
-    // Cleanup
-    log_remove_handler(ctx, idx_info);
-    log_remove_handler(ctx, idx_error);
-    log_remove_handler(ctx, idx_json);
-    fclose(fp_info);
-    fclose(fp_error);
-    fclose(fp_json);
-    log_destroy(ctx);
-    return 0;
-}
-```
-
-### 8. Dynamic Configuration
-
-```c
-int main(void) {
-    log *ctx = log_create();
-
-    FILE *fp = fopen("app.log", "w");
-    int idx = log_add_fp(ctx, fp, LOG_INFO);
-
-    // Initial configuration
-    log_ctx_info(ctx, "Starting with INFO level");
-
-    // Change level dynamically
-    log_set_level(ctx, LOG_ERROR);
-    log_ctx_info(ctx, "This won't appear (below ERROR)");
-
-    // Change handler level
-    log_handler_set_level(ctx, idx, LOG_DEBUG);
-    log_ctx_info(ctx, "Now INFO appears for this handler");
-
-    // Switch to JSON format
-    log_set_format(ctx, log_format_json);
-    log_ctx_info(ctx, "This is JSON formatted");
-
-    fclose(fp);
-    log_destroy(ctx);
-    return 0;
-}
-```
-
-## API Reference
+## 🔧 API Reference
 
 For complete API documentation, see [API.md](API.md).
 
@@ -302,107 +323,7 @@ void log_handler_set_level(log *ctx, int handler_idx, int new_level);
 void log_handler_set_formatter(log *ctx, int handler_idx, log_FormatFn new_fn);
 ```
 
-### Format Functions
-
-```c
-const char* log_format_json(log *ctx, log_Event *ev, char *buf, size_t buf_size);
-void log_enable_text_format(log* ctx);
-void log_enable_json_format(log* ctx);
-```
-
-### Thread Safety Features
-
-```c
-void log_enable_thread_id(log *ctx, int handler_idx, bool enable);
-```
-
-### Syslog Support
-
-```c
-int log_level_to_syslog(int level);
-int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level);
-void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable);
-```
-
-### Performance Monitoring
-
-```c
-int log_get_stats(log *ctx, log_stats *stats);
-void log_rotate(log *ctx);
-```
-
-## Macros
-
-### Default Logger (Global)
-
-```c
-log_trace(fmt, ...);
-log_debug(fmt, ...);
-log_info(fmt, ...);
-log_warn(fmt, ...);
-log_error(fmt, ...);
-log_fatal(fmt, ...);
-```
-
-### Context-Specific
-
-```c
-log_ctx_trace(ctx, fmt, ...);
-log_ctx_debug(ctx, fmt, ...);
-log_ctx_info(ctx, fmt, ...);
-log_ctx_warn(ctx, fmt, ...);
-log_ctx_error(ctx, fmt, ...);
-log_ctx_fatal(ctx, fmt, ...);
-```
-
-## Building
-
-### Compile as Library
-
-```bash
-gcc -c -std=c17 -Wall -Wextra src/log.c -o log.o
-ar rcs liblog.a log.o
-```
-
-### Compile with Application
-
-```bash
-gcc -std=c17 -Wall -Wextra -I./src \
-    src/log.c src/example.c -o example -lpthread
-```
-
-### Enable Color Output
-
-```bash
-gcc -DLOG_USE_COLOR -std=c17 -Wall -Wextra \
-    src/log.c src/example.c -o example -lpthread
-```
-
-## Examples
-
-See [src/example.c](src/example.c) for comprehensive examples of all features:
-
-- Basic logging
-- Level filtering
-- JSON format output
-- File rotation
-- Async logging
-- Thread safety
-- Dynamic handler configuration
-- Mixed formatting
-- Performance statistics
-
-## Testing
-
-Run the test suite:
-
-```bash
-make test
-```
-
-## Performance Statistics
-
-The library provides built-in performance metrics:
+## 📊 Performance Statistics
 
 ```c
 typedef struct log_stats {
@@ -416,7 +337,7 @@ typedef struct log_stats {
 } log_stats;
 ```
 
-## Thread Safety
+## 🔒 Thread Safety
 
 All public APIs are thread-safe:
 
@@ -425,32 +346,41 @@ All public APIs are thread-safe:
 - **Atomic Operations**: For statistics
 - **Safe from Multiple Threads**: Can be called concurrently
 
-## NULL Safety
+## 📝 Examples
 
-The library handles NULL strings gracefully:
+See [src/example.c](src/example.c) for comprehensive examples:
 
-```c
-log_ctx_info(ctx, NULL);        // Safe: prints "(null)"
-log_ctx_info(ctx, "%s", NULL);  // Safe: prints "(null)"
+- Basic logging
+- Level filtering
+- JSON format output
+- File rotation
+- Async logging
+- Thread safety
+- Dynamic handler configuration
+- Mixed formatting
+- Performance statistics
+
+## 🧪 Testing
+
+Run the test suite:
+
+```bash
+cd build
+cmake --build . --target test_log
+./test_log
 ```
 
-## Configuration Constants
-
-```c
-#define LOG_VERSION "2.0.0"
-#define LOG_MAX_QUEUE_SIZE 4096
-#define LOG_MAX_ROTATION_FILES 5
-#define LOG_DEFAULT_MAX_SIZE (10 * 1024 * 1024)  // 10MB
-```
-
-## License
+## 📄 License
 
 MIT License - See [LICENSE](LICENSE) for details.
 
-## Version History
+## 📈 Version History
 
 - **2.0.0** (2026): Major enhancements
-  - Added async logging with lock-free queue
+  - Added cross-platform support (Windows/Linux/macOS)
+  - Added CMake build system
+  - Added colored output support
+  - Enhanced async logging with lock-free queue
   - Added JSON format support
   - Added thread ID tracking
   - Added syslog integration
@@ -461,13 +391,13 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 - **1.0.0** (2020): Original implementation by rxi
 
-## Credits
+## 🙏 Credits
 
 Based on [rxi/log.c](https://github.com/rxi/log.c) (Copyright 2020 rxi)
 
-Enhanced with additional features in 2026.
+Enhanced with cross-platform support and additional features in 2026.
 
-## Contributing
+## 🤝 Contributing
 
 Contributions are welcome! Please ensure:
 
@@ -475,3 +405,4 @@ Contributions are welcome! Please ensure:
 2. All functions are documented
 3. Tests pass
 4. Thread safety is maintained
+5. Cross-platform compatibility is preserved
