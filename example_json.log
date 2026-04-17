@@ -1,3 +1,0 @@
-2026-04-17T13:37:37.277 INFO  src/example.c:47: User logged in: user_id=123, ip=192.168.1.1
-2026-04-17T13:37:37.277 ERROR src/example.c:48: Database connection failed: error="timeout" retry_count=3
-2026-04-17T13:37:37.277 WARN  src/example.c:49: High memory usage: used=85%, threshold=80%

@@ -17,6 +17,17 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <string.h>
+#include <syslog.h>
+
+/* Avoid enum name conflicts with syslog.h */
+#undef LOG_EMERG
+#undef LOG_ALERT
+#undef LOG_CRIT
+#undef LOG_ERR
+#undef LOG_WARNING
+#undef LOG_NOTICE
+#undef LOG_INFO
+#undef LOG_DEBUG
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,6 +41,16 @@ extern "C" {
 
 /* Log levels */
 enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL, LOG_LEVELS };
+
+/* Syslog level mapping */
+#define LOG_SYSLOG_EMERG   0
+#define LOG_SYSLOG_ALERT   1
+#define LOG_SYSLOG_CRIT    2
+#define LOG_SYSLOG_ERR     3
+#define LOG_SYSLOG_WARNING 4
+#define LOG_SYSLOG_NOTICE  5
+#define LOG_SYSLOG_INFO    6
+#define LOG_SYSLOG_DEBUG   7
 
 /* Output format modes */
 enum { LOG_FORMAT_TEXT, LOG_FORMAT_JSON };
@@ -134,6 +155,9 @@ typedef struct log_handler {
   FILE *fp;
   char *filename;
   size_t file_size;
+  bool syslog_enabled;
+  int syslog_facility;
+  bool show_thread_id;
 } log_handler;
 struct log {
   log_rwlock rwlock;
@@ -167,9 +191,14 @@ struct log {
   
   /* File rotation */
   char *file_prefix;
-  
+
   /* Thread safety */
   pthread_mutex_t mutex;
+
+  /* Syslog support */
+  char *syslog_ident;
+  int syslog_facility;
+  bool syslog_enabled_global;
 };
 
 /* Core functions */
@@ -189,6 +218,12 @@ int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
 int log_add_fp(log *ctx, FILE *fp, int level);
 void log_remove_handler(log *ctx, int idx);
 
+/* Thread ID and Syslog support */
+void log_enable_thread_id(log *ctx, int handler_idx, bool enable);
+int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level);
+void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable);
+int log_level_to_syslog(int level);
+
 void log_log(log *ctx, int level, const char *file, int line, const char *fmt, ...);
 void log_rotate(log *ctx);
 
@@ -202,6 +237,9 @@ const char* log_format_json(log *ctx, log_Event *ev, char *buf, size_t buf_size)
 #define log_warn(...)  log_log(log_default(), LOG_WARN,  __FILE__, __LINE__, __VA_ARGS__)
 #define log_error(...) log_log(log_default(), LOG_ERROR, __FILE__, __LINE__, __VA_ARGS__)
 #define log_fatal(...) log_log(log_default(), LOG_FATAL, __FILE__, __LINE__, __VA_ARGS__)
+
+/* Thread ID helpers */
+#define LOG_GET_THREAD_ID() ((unsigned long)pthread_self())
 
 /* Context-specific macros */
 #define log_ctx_trace(ctx, ...) log_log(ctx, LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)

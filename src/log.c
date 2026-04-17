@@ -38,6 +38,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <syslog.h>
 
 _Static_assert(sizeof(int) >= 4, "int must be at least 32 bits");
 
@@ -215,21 +216,37 @@ static int format_text(log *ctx, log_Event *ev, char *buf, size_t buf_size) {
   (void)ctx;
   char time_buf[32];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
-  
-  int written = snprintf(buf, buf_size, "%s %-5s %s:%d: ",
-                         time_buf, level_strings[ev->level],
-                         ev->file ? ev->file : "", ev->line);
-  
+
+  int written = 0;
+
+  if (ctx && buf_size > 0) {
+    for (int i = 0; i < ctx->handler_count; i++) {
+      if (ctx->handlers[i].show_thread_id && ctx->handlers[i].active) {
+        written = snprintf(buf, buf_size, "%s %-5s [%lu] %s:%d: ",
+                        time_buf, level_strings[ev->level],
+                        LOG_GET_THREAD_ID(),
+                        ev->file ? ev->file : "", ev->line);
+        break;
+      }
+    }
+  }
+
+  if (written == 0) {
+    written = snprintf(buf, buf_size, "%s %-5s %s:%d: ",
+                       time_buf, level_strings[ev->level],
+                       ev->file ? ev->file : "", ev->line);
+  }
+
   if (written < 0 || (size_t)written >= buf_size) {
     buf[buf_size - 1] = '\0';
     return buf_size - 1;
   }
-  
+
   va_list args_copy;
   va_copy(args_copy, ev->ap);
   int msg_len = vsnprintf(buf + written, buf_size - written, ev->fmt, args_copy);
   va_end(args_copy);
-  
+
   return written + msg_len;
 }
 
@@ -260,7 +277,27 @@ static void stdout_handler(log *ctx, log_Event *ev) {
   (void)ctx;
   char time_buf[32];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
-  
+
+  if (ctx) {
+    for (int i = 0; i < ctx->handler_count; i++) {
+      if (ctx->handlers[i].show_thread_id && ctx->handlers[i].active && ctx->handlers[i].udata == ev->udata) {
+#ifdef LOG_USE_COLOR
+        fprintf(ev->udata, "%s %s%-5s\x1b[0m \x1b[90m[%lu] %s:%d:\x1b[0m ",
+                time_buf, level_colors[ev->level], level_strings[ev->level],
+                LOG_GET_THREAD_ID(), ev->file ? ev->file : "", ev->line);
+#else
+        fprintf(ev->udata, "%s %-5s [%lu] %s:%d: ",
+                time_buf, level_strings[ev->level],
+                LOG_GET_THREAD_ID(), ev->file ? ev->file : "", ev->line);
+#endif
+        vfprintf(ev->udata, ev->fmt, ev->ap);
+        fprintf(ev->udata, "\n");
+        fflush(ev->udata);
+        return;
+      }
+    }
+  }
+
 #ifdef LOG_USE_COLOR
   fprintf(ev->udata, "%s %s%-5s\x1b[0m \x1b[90m%s:%d:\x1b[0m ",
           time_buf, level_colors[ev->level], level_strings[ev->level],
@@ -270,7 +307,7 @@ static void stdout_handler(log *ctx, log_Event *ev) {
           time_buf, level_strings[ev->level],
           ev->file ? ev->file : "", ev->line);
 #endif
-  
+
   vfprintf(ev->udata, ev->fmt, ev->ap);
   fprintf(ev->udata, "\n");
   fflush(ev->udata);
@@ -336,13 +373,13 @@ static void json_handler(log *ctx, log_Event *ev) {
   char buf[8192];
   char time_buf[32];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
-  
+
   va_list args_copy;
   va_copy(args_copy, ev->ap);
   char msg_buf[4096];
   vsnprintf(msg_buf, sizeof(msg_buf), ev->fmt, args_copy);
   va_end(args_copy);
-  
+
   char escaped_msg[8192];
   size_t j = 0;
   for (size_t i = 0; msg_buf[i] && j < sizeof(escaped_msg) - 1; i++) {
@@ -356,12 +393,29 @@ static void json_handler(log *ctx, log_Event *ev) {
     }
   }
   escaped_msg[j] = '\0';
-  
-  snprintf(buf, sizeof(buf),
-    "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"}",
-    time_buf, level_strings[ev->level],
-    ev->file ? ev->file : "", ev->line, escaped_msg);
-  
+
+  bool show_tid = false;
+  if (ctx) {
+    for (int i = 0; i < ctx->handler_count; i++) {
+      if (ctx->handlers[i].show_thread_id && ctx->handlers[i].active && ctx->handlers[i].udata == ev->udata) {
+        show_tid = true;
+        break;
+      }
+    }
+  }
+
+  if (show_tid) {
+    snprintf(buf, sizeof(buf),
+      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"thread_id\": %lu, \"message\": \"%s\"}",
+      time_buf, level_strings[ev->level],
+      ev->file ? ev->file : "", ev->line, LOG_GET_THREAD_ID(), escaped_msg);
+  } else {
+    snprintf(buf, sizeof(buf),
+      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"}",
+      time_buf, level_strings[ev->level],
+      ev->file ? ev->file : "", ev->line, escaped_msg);
+  }
+
   fprintf(ev->udata, "%s\n", buf);
   fflush(ev->udata);
 }
@@ -415,49 +469,58 @@ static void* async_writer_thread(void *arg) {
 log* log_create(void) {
   log *ctx = calloc(1, sizeof(log));
   if (!ctx) return NULL;
-  
+
   rwlock_init(&ctx->rwlock);
   pthread_mutex_init(&ctx->mutex, NULL);
-  
+
   ctx->level = LOG_TRACE;
   ctx->quiet = false;
   ctx->format_mode = DEFAULT_FORMAT;
   ctx->max_file_size = LOG_DEFAULT_MAX_SIZE;
   ctx->async_enabled = false;
   atomic_store(&ctx->async_running, false);
-  
+
   queue_init(&ctx->queue, DEFAULT_QUEUE_SIZE);
-  
+
   ctx->handler_capacity = MAX_HANDLERS;
   ctx->handlers = calloc(MAX_HANDLERS, sizeof(log_handler));
   ctx->handler_count = 0;
-  
+
   ctx->format_fn = format_text;
-  
+
   memset(&ctx->stats, 0, sizeof(ctx->stats));
-  
+
+  ctx->syslog_ident = NULL;
+  ctx->syslog_facility = LOG_USER;
+  ctx->syslog_enabled_global = false;
+
   log_add_handler(ctx, stdout_handler, stderr, LOG_TRACE);
-  
+
   return ctx;
 }
 
 void log_destroy(log *ctx) {
   if (!ctx) return;
-  
+
   if (ctx->async_enabled) {
     atomic_store(&ctx->async_running, false);
     pthread_join(ctx->async_thread, NULL);
   }
-  
+
   queue_destroy(&ctx->queue);
-  
+
+  if (ctx->syslog_enabled_global) {
+    closelog();
+  }
+
   for (int i = 0; i < ctx->handler_count; i++) {
     free(ctx->handlers[i].filename);
     /* File pointers opened by user should not be closed here */
   }
   free(ctx->handlers);
-  
+
   free(ctx->file_prefix);
+  free(ctx->syslog_ident);
   pthread_mutex_destroy(&ctx->mutex);
   free(ctx);
 }
@@ -527,9 +590,9 @@ int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level) {
   if (!fn || !ctx || ctx->handler_count >= ctx->handler_capacity) {
     return -1;
   }
-  
+
   rwlock_write_lock(&ctx->rwlock);
-  
+
   log_handler *h = &ctx->handlers[ctx->handler_count++];
   h->fn = fn;
   h->udata = udata;
@@ -538,16 +601,19 @@ int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level) {
   h->fp = NULL;
   h->filename = NULL;
   h->file_size = 0;
-  
+  h->syslog_enabled = false;
+  h->syslog_facility = LOG_USER;
+  h->show_thread_id = false;
+
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
 }
 
 int log_add_fp(log *ctx, FILE *fp, int level) {
   if (!ctx) return -1;
-  
+
   rwlock_write_lock(&ctx->rwlock);
-  
+
   log_handler *h = &ctx->handlers[ctx->handler_count++];
   h->fn = file_handler_wrapper;
   h->udata = fp;
@@ -556,7 +622,10 @@ int log_add_fp(log *ctx, FILE *fp, int level) {
   h->active = true;
   h->filename = NULL;
   h->file_size = 0;
-  
+  h->syslog_enabled = false;
+  h->syslog_facility = LOG_USER;
+  h->show_thread_id = false;
+
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
 }
@@ -723,5 +792,105 @@ void log_enable_text_format(log* ctx) {
 void log_enable_json_format(log* ctx) {
   rwlock_write_lock(&ctx->rwlock);
   ctx->format_mode = LOG_FORMAT_JSON;
+  rwlock_write_unlock(&ctx->rwlock);
+}
+
+/* Thread ID support implementation */
+void log_enable_thread_id(log *ctx, int handler_idx, bool enable) {
+  if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return;
+
+  rwlock_write_lock(&ctx->rwlock);
+  ctx->handlers[handler_idx].show_thread_id = enable;
+  rwlock_write_unlock(&ctx->rwlock);
+}
+
+/* Syslog support implementation */
+int log_level_to_syslog(int level) {
+  switch (level) {
+    case LOG_TRACE: return LOG_DEBUG;
+    case LOG_DEBUG: return LOG_DEBUG;
+    case LOG_INFO:  return LOG_INFO;
+    case LOG_WARN:  return LOG_SYSLOG_WARNING;
+    case LOG_ERROR: return LOG_SYSLOG_ERR;
+    case LOG_FATAL: return LOG_SYSLOG_CRIT;
+    default:        return LOG_INFO;
+  }
+}
+
+static void syslog_handler(log *ctx, log_Event *ev) {
+  if (!ctx) return;
+
+  int priority = LOG_USER | log_level_to_syslog(ev->level);
+
+  va_list args_copy;
+  va_copy(args_copy, ev->ap);
+  char msg_buf[4096];
+  vsnprintf(msg_buf, sizeof(msg_buf), ev->fmt, args_copy);
+  va_end(args_copy);
+
+  if (ctx->handlers && ctx->handler_count > 0) {
+    for (int i = 0; i < ctx->handler_count; i++) {
+      if (ctx->handlers[i].show_thread_id && ctx->handlers[i].active) {
+        char full_msg[5120];
+        snprintf(full_msg, sizeof(full_msg), "[%lu] %s:%d: %s",
+                LOG_GET_THREAD_ID(),
+                ev->file ? ev->file : "", ev->line, msg_buf);
+        syslog(priority, "%s", full_msg);
+        return;
+      }
+    }
+  }
+
+  syslog(priority, "%s:%d: %s", ev->file ? ev->file : "", ev->line, msg_buf);
+}
+
+int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level) {
+  if (!ctx) return -1;
+
+  rwlock_write_lock(&ctx->rwlock);
+
+  if (!ctx->syslog_enabled_global) {
+    if (ident) {
+      free(ctx->syslog_ident);
+      ctx->syslog_ident = strdup(ident);
+    }
+    ctx->syslog_facility = facility;
+    openlog(ctx->syslog_ident ? ctx->syslog_ident : "log", LOG_PID | LOG_NDELAY, facility);
+    ctx->syslog_enabled_global = true;
+  }
+
+  log_handler *h = &ctx->handlers[ctx->handler_count++];
+  h->fn = syslog_handler;
+  h->udata = NULL;
+  h->level = level;
+  h->active = true;
+  h->fp = NULL;
+  h->filename = NULL;
+  h->file_size = 0;
+  h->syslog_enabled = true;
+  h->syslog_facility = facility;
+  h->show_thread_id = false;
+
+  rwlock_write_unlock(&ctx->rwlock);
+  return ctx->handler_count - 1;
+}
+
+/* Wrapper for json_handler to avoid unused warning */
+static void json_handler_wrapper(log *ctx, log_Event *ev) {
+  json_handler(ctx, ev);
+}
+
+void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable) {
+  if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return;
+
+  rwlock_write_lock(&ctx->rwlock);
+  ctx->handlers[handler_idx].syslog_enabled = enable;
+
+  if (enable && !ctx->syslog_enabled_global) {
+    openlog(ctx->syslog_ident ? ctx->syslog_ident : "log",
+            LOG_PID | LOG_NDELAY, ctx->handlers[handler_idx].syslog_facility);
+    ctx->syslog_enabled_global = true;
+  }
+
   rwlock_write_unlock(&ctx->rwlock);
 }
