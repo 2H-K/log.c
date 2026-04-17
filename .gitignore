@@ -6,6 +6,10 @@
 *.dll
 *.lib
 *.a
+.vcxproj
+.filters
+.slnx
+.sln
 
 # --- 可执行文件 ---
 # 忽略所有没有后缀名的可执行文件（适用于 Linux/macOS）
