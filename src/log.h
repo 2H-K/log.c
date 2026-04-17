@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2020 rxi
+ * Modified for enhanced features (2026)
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the MIT license. See `log.c` for details.
@@ -12,130 +13,206 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <time.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <string.h>
 
-#define LOG_VERSION "0.1.0"
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// 使用C17的静态断言确保结构体大小合理
-_Static_assert(sizeof(int) >= 4, "int must be at least 32 bits");
+#define LOG_VERSION "2.0.0"
+#define LOG_MAX_QUEUE_SIZE 4096
+#define LOG_MAX_ROTATION_FILES 5
+#define LOG_DEFAULT_MAX_SIZE (10 * 1024 * 1024)  // 10MB
+#define _GNU_SOURCE  /* For strdup */
 
-/**
- * @brief 日志事件结构体，包含日志记录所需的所有信息
- */
-typedef struct {
-  va_list ap;              /**< 可变参数列表，用于格式化日志消息 */
-  const char *fmt;         /**< 格式化字符串 */
-  const char *file;        /**< 发生日志的文件名 */
-  struct tm *time;         /**< 时间信息 */
-  void *udata;             /**< 用户数据指针 */
-  int line;                /**< 发生日志的行号 */
-  int level;               /**< 日志级别 */
-} log_Event;
+/* Log levels */
+enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL, LOG_LEVELS };
 
-/**
- * @brief 日志回调函数类型定义
- * @param ev 日志事件指针
- */
-typedef void (*log_LogFn)(log_Event *ev);
+/* Output format modes */
+enum { LOG_FORMAT_TEXT, LOG_FORMAT_JSON };
 
-/**
- * @brief 日志锁函数类型定义
- * @param lock 是否加锁
- * @param udata 用户数据指针
- */
+/* Forward declarations */
+typedef struct log log;
+typedef struct log_event log_Event;
+typedef void (*log_LogFn)(log *ctx, log_Event *ev);
 typedef void (*log_LockFn)(bool lock, void *udata);
 
 /**
- * @brief 日志级别枚举
+ * Format function that formats the log message into a buffer.
+ * @param ctx The logger context
+ * @param ev Log event
+ * @param buf Output buffer
+ * @param buf_size Buffer size
+ * @return Number of characters written (excluding null terminator)
  */
-enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL };
+typedef int (*log_FormatFn)(log *ctx, log_Event *ev, char *buf, size_t buf_size);
 
 /**
- * @brief 记录TRACE级别的日志
- * @param ... 格式化参数
+ * @brief Log event structure
  */
-#define log_trace(...) log_log(LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)
+struct log_event {
+  va_list ap;
+  const char *fmt;
+  const char *file;
+  struct tm *time;
+  void *udata;
+  int line;
+  int level;
+  double timestamp;  // High-precision timestamp in seconds
+};
 
 /**
- * @brief 记录DEBUG级别的日志
- * @param ... 格式化参数
+ * @brief Logger configuration
  */
-#define log_debug(...) log_log(LOG_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
+typedef struct log_config {
+  int level;
+  bool quiet;
+  int format_mode;           // LOG_FORMAT_TEXT or LOG_FORMAT_JSON
+  size_t max_file_size;      // For rotation
+  bool async_enabled;
+  size_t queue_size;
+  const char *file_prefix;   // For log file rotation
+  log_FormatFn format_fn;    // Custom format function
+} log_config;
 
 /**
- * @brief 记录INFO级别的日志
- * @param ... 格式化参数
+ * @brief Performance statistics
  */
-#define log_info(...)  log_log(LOG_INFO,  __FILE__, __LINE__, __VA_ARGS__)
+typedef struct log_stats {
+  uint64_t total_count;
+  uint64_t level_counts[LOG_LEVELS];
+  uint64_t queue_drops;
+  uint64_t rotation_count;
+  double avg_queue_latency_ms;
+  uint64_t async_writes;
+  uint64_t sync_writes;
+} log_stats;
 
 /**
- * @brief 记录WARN级别的日志
- * @param ... 格式化参数
+ * @brief Log queue entry for async mode
  */
-#define log_warn(...)  log_log(LOG_WARN,  __FILE__, __LINE__, __VA_ARGS__)
+typedef struct log_queue_entry {
+  char *message;
+  int level;
+  char *file;
+  int line;
+  double timestamp;
+  struct log_queue_entry *next;
+} log_queue_entry;
 
 /**
- * @brief 记录ERROR级别的日志
- * @param ... 格式化参数
+ * @brief Log queue structure (lock-free single-producer single-consumer)
  */
-#define log_error(...) log_log(LOG_ERROR, __FILE__, __LINE__, __VA_ARGS__)
+typedef struct log_queue {
+  _Atomic(log_queue_entry*) head;
+  _Atomic(log_queue_entry*) tail;
+  atomic_size_t size;
+  atomic_size_t high_water_mark;
+  size_t max_size;
+} log_queue;
 
 /**
- * @brief 记录FATAL级别的日志
- * @param ... 格式化参数
+ * @brief Reader-writer lock structure (lightweight)
  */
-#define log_fatal(...) log_log(LOG_FATAL, __FILE__, __LINE__, __VA_ARGS__)
+typedef struct log_rwlock {
+  _Atomic(int) readers;
+  _Atomic(int) writer;
+  _Atomic(bool) write_waiting;
+} log_rwlock;
 
 /**
- * @brief 将日志级别转换为字符串表示
- * @param level 日志级别
- * @return 对应级别的字符串表示
+ * @brief Output handler
  */
+typedef struct log_handler {
+  void *udata;
+  log_LogFn fn;
+  int level;
+  bool active;
+  FILE *fp;
+  char *filename;
+  size_t file_size;
+} log_handler;
+struct log {
+  log_rwlock rwlock;
+  
+  void *udata;
+  log_LockFn lock;
+  
+  /* Config */
+  int level;
+  bool quiet;
+  int format_mode;
+  size_t max_file_size;
+  
+  /* Async */
+  bool async_enabled;
+  log_queue queue;
+  pthread_t async_thread;
+  atomic_bool async_running;
+  
+  /* Handlers */
+  log_handler *handlers;
+  int handler_count;
+  int handler_capacity;
+  
+  /* Format function */
+  log_FormatFn format_fn;
+  
+  /* Stats */
+  log_stats stats;
+  atomic_uint_fast64_t last_timestamp;
+  
+  /* File rotation */
+  char *file_prefix;
+  
+  /* Thread safety */
+  pthread_mutex_t mutex;
+};
+
+/* Core functions */
+log* log_create(void);
+void log_destroy(log *ctx);
+
+log* log_default(void);
+
 const char* log_level_string(int level);
+void log_set_level(log *ctx, int level);
+void log_set_quiet(log *ctx, bool enable);
+void log_set_format(log *ctx, log_FormatFn fn);
+int log_set_async(log *ctx, bool enable);
+void log_set_max_file_size(log *ctx, size_t size);
+void log_set_file_prefix(log *ctx, const char *prefix);
+int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
+int log_add_fp(log *ctx, FILE *fp, int level);
+void log_remove_handler(log *ctx, int idx);
 
-/**
- * @brief 设置日志锁函数
- * @param fn 锁函数指针，若为NULL则不使用锁机制
- * @param udata 用户数据指针，传递给锁函数
- */
-void log_set_lock(log_LockFn fn, void *udata);
+void log_log(log *ctx, int level, const char *file, int line, const char *fmt, ...);
+void log_rotate(log *ctx);
 
-/**
- * @brief 设置日志输出级别
- * @param level 日志级别，低于此级别的日志将被忽略
- */
-void log_set_level(int level);
+int log_get_stats(log *ctx, log_stats *stats);
+const char* log_format_json(log *ctx, log_Event *ev, char *buf, size_t buf_size);
 
-/**
- * @brief 设置静默模式
- * @param enable 是否启用静默模式，true为启用，false为禁用
- */
-void log_set_quiet(bool enable);
+/* Default context macros */
+#define log_trace(...) log_log(log_default(), LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)
+#define log_debug(...) log_log(log_default(), LOG_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
+#define log_info(...)  log_log(log_default(), LOG_INFO,  __FILE__, __LINE__, __VA_ARGS__)
+#define log_warn(...)  log_log(log_default(), LOG_WARN,  __FILE__, __LINE__, __VA_ARGS__)
+#define log_error(...) log_log(log_default(), LOG_ERROR, __FILE__, __LINE__, __VA_ARGS__)
+#define log_fatal(...) log_log(log_default(), LOG_FATAL, __FILE__, __LINE__, __VA_ARGS__)
 
-/**
- * @brief 添加自定义日志回调函数
- * @param fn 回调函数指针
- * @param udata 用户数据指针，将传递给回调函数
- * @param level 只有等于或高于此级别的日志才会触发回调
- * @return 成功返回0，失败返回-1
- */
-int log_add_callback(log_LogFn fn, void *udata, int level);
+/* Context-specific macros */
+#define log_ctx_trace(ctx, ...) log_log(ctx, LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)
+#define log_ctx_debug(ctx, ...) log_log(ctx, LOG_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
+#define log_ctx_info(ctx, ...)  log_log(ctx, LOG_INFO,  __FILE__, __LINE__, __VA_ARGS__)
+#define log_ctx_warn(ctx, ...)  log_log(ctx, LOG_WARN,  __FILE__, __LINE__, __VA_ARGS__)
+#define log_ctx_error(ctx, ...) log_log(ctx, LOG_ERROR, __FILE__, __LINE__, __VA_ARGS__)
+#define log_ctx_fatal(ctx, ...) log_log(ctx, LOG_FATAL, __FILE__, __LINE__, __VA_ARGS__)
 
-/**
- * @brief 添加文件流作为日志输出目标
- * @param fp 文件流指针
- * @param level 只有等于或高于此级别的日志才会写入文件
- * @return 成功返回0，失败返回-1
- */
-int log_add_fp(FILE *fp, int level);
-
-/**
- * @brief 记录日志的核心函数
- * @param level 日志级别
- * @param file 发生日志的文件名
- * @param line 发生日志的行号
- * @param fmt 格式化字符串
- * @param ... 格式化参数
- */
-void log_log(int level, const char *file, int line, const char *fmt, ...);
+#ifdef __cplusplus
+}
+#endif
 
 #endif
