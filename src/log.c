@@ -24,23 +24,92 @@
  * IN THE SOFTWARE.
  */
 
+#ifdef LOG_PLATFORM_POSIX
 #define _GNU_SOURCE
+#endif
 #include "log.h"
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <errno.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdatomic.h>
-#include <syslog.h>
 
+#ifdef LOG_PLATFORM_POSIX
+#include <sys/stat.h>
+#endif
+
+#ifdef LOG_PLATFORM_WINDOWS
+#include <windows.h>
+#include <sys/stat.h>
+#endif
+
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(int) >= 4, "int must be at least 32 bits");
+#endif
+#endif
+
+/* ==================== Platform-specific helpers ==================== */
+
+/* Get high-precision timestamp */
+static double get_timestamp(void) {
+#ifdef LOG_PLATFORM_POSIX
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#else
+  FILETIME ft;
+  GetSystemTimePreciseAsFileTime(&ft);
+  ULARGE_INTEGER uli;
+  uli.LowPart = ft.dwLowDateTime;
+  uli.HighPart = ft.dwHighDateTime;
+  /* Convert from 100ns intervals since 1601 to seconds since 1970 */
+  return (double)(uli.QuadPart - 116444736000000000LL) / 10000000.0;
+#endif
+}
+
+/* Sleep for specified milliseconds */
+static void log_sleep_ms(int ms) {
+#ifdef LOG_PLATFORM_POSIX
+  struct timespec ts;
+  ts.tv_sec = ms / 1000;
+  ts.tv_nsec = (ms % 1000) * 1000000L;
+  nanosleep(&ts, NULL);
+#else
+  Sleep(ms);
+#endif
+}
+
+/* CPU pause instruction for spinlocks */
+static void log_cpu_pause(void) {
+#ifdef __GNUC__
+  __asm__ __volatile__("pause" ::: "memory");
+#elif defined(_MSC_VER)
+  _mm_pause();
+#endif
+}
+
+/* ==================== Atomic operation wrappers ==================== */
+
+#ifdef LOG_USE_MSVC_ATOMIC
+
+#define atomic_store(p, v) InterlockedExchange((volatile LONG*)(p), (LONG)(v))
+#define atomic_load(p) ((volatile LONG)(*(p)))
+#define atomic_fetch_add(p, v) InterlockedExchangeAdd((volatile LONG*)(p), (LONG)(v))
+#define atomic_fetch_sub(p, v) InterlockedExchangeAdd((volatile LONG*)(p), -(LONG)(v))
+
+static inline bool atomic_compare_exchange_strong(volatile void* obj, void* expected, void* desired) {
+  return InterlockedCompareExchangePointer((volatile PVOID*)obj, desired, *(PVOID*)expected) == *(PVOID*)expected;
+}
+
+static inline bool atomic_compare_exchange_weak(volatile void* obj, void* expected, void* desired) {
+  return atomic_compare_exchange_strong(obj, expected, desired);
+}
+
+#endif
 
 #define MAX_HANDLERS 32
 #define DEFAULT_QUEUE_SIZE LOG_MAX_QUEUE_SIZE
@@ -60,13 +129,6 @@ static const char *level_colors[] = {
 };
 #endif
 
-/* Helper: Get high-precision timestamp */
-static double get_timestamp(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
 /* Helper: Format timestamp to string */
 static void format_timestamp(double ts, char *buf, size_t size) {
   time_t t = (time_t)ts;
@@ -82,41 +144,76 @@ static void format_timestamp(double ts, char *buf, size_t size) {
 
 /* Reader-Writer Lock Implementation */
 static void rwlock_init(log_rwlock *lock) {
+#ifdef LOG_USE_STDATOMIC
   atomic_store(&lock->readers, 0);
   atomic_store(&lock->writer, 0);
   atomic_store(&lock->write_waiting, false);
+#else
+  lock->readers = 0;
+  lock->writer = 0;
+  lock->write_waiting = false;
+#endif
 }
 
 static void rwlock_read_lock(log_rwlock *lock) {
   int backoff = 1;
+#ifdef LOG_USE_STDATOMIC
   while (atomic_load(&lock->writer) || atomic_load(&lock->write_waiting)) {
+#else
+  while (lock->writer || lock->write_waiting) {
+#endif
     for (int i = 0; i < backoff; i++) {
-      __asm__ __volatile__("pause" ::: "memory");
+      log_cpu_pause();
     }
     if (backoff < 16) backoff *= 2;
   }
+#ifdef LOG_USE_STDATOMIC
   atomic_fetch_add(&lock->readers, 1);
+#else
+  InterlockedIncrement((volatile LONG*)&lock->readers);
+#endif
 }
 
 static void rwlock_read_unlock(log_rwlock *lock) {
+#ifdef LOG_USE_STDATOMIC
   atomic_fetch_sub(&lock->readers, 1);
+#else
+  InterlockedDecrement((volatile LONG*)&lock->readers);
+#endif
 }
 
 static void rwlock_write_lock(log_rwlock *lock) {
+#ifdef LOG_USE_STDATOMIC
   atomic_store(&lock->write_waiting, true);
+#else
+  lock->write_waiting = true;
+#endif
   int backoff = 1;
+#ifdef LOG_USE_STDATOMIC
   while (atomic_load(&lock->readers) > 0 || atomic_load(&lock->writer) > 0) {
+#else
+  while (lock->readers > 0 || lock->writer > 0) {
+#endif
     for (int i = 0; i < backoff; i++) {
-      __asm__ __volatile__("pause" ::: "memory");
+      log_cpu_pause();
     }
     if (backoff < 16) backoff *= 2;
   }
+#ifdef LOG_USE_STDATOMIC
   atomic_store(&lock->write_waiting, false);
   atomic_store(&lock->writer, 1);
+#else
+  lock->write_waiting = false;
+  lock->writer = 1;
+#endif
 }
 
 static void rwlock_write_unlock(log_rwlock *lock) {
+#ifdef LOG_USE_STDATOMIC
   atomic_store(&lock->writer, 0);
+#else
+  lock->writer = 0;
+#endif
 }
 
 /* Lock-free Queue Implementation */
@@ -159,24 +256,42 @@ static void queue_entry_destroy(log_queue_entry *entry) {
 
 static void queue_init(log_queue *q, size_t max_size) {
   log_queue_entry *dummy = calloc(1, sizeof(log_queue_entry));
+#ifdef LOG_USE_STDATOMIC
   atomic_store(&q->head, dummy);
   atomic_store(&q->tail, dummy);
   atomic_store(&q->size, 0);
   atomic_store(&q->high_water_mark, 0);
+#else
+  q->head = dummy;
+  q->tail = dummy;
+  q->size = 0;
+  q->high_water_mark = 0;
+#endif
   q->max_size = max_size;
 }
 
 static bool queue_push(log_queue *q, log_queue_entry *entry) {
+#ifdef LOG_USE_STDATOMIC
   size_t current_size = atomic_load(&q->size);
+#else
+  size_t current_size = q->size;
+#endif
   if (current_size >= q->max_size) {
     return false;
   }
   
   entry->next = NULL;
+#ifdef LOG_USE_STDATOMIC
   log_queue_entry *old_tail = atomic_exchange(&q->tail, entry);
   atomic_store(&old_tail->next, entry);
   atomic_fetch_add(&q->size, 1);
+#else
+  log_queue_entry *old_tail = (log_queue_entry*)InterlockedExchangePointer((volatile PVOID*)&q->tail, entry);
+  old_tail->next = entry;
+  InterlockedIncrement((volatile LONG*)&q->size);
+#endif
   
+#ifdef LOG_USE_STDATOMIC
   size_t new_size = atomic_load(&q->size);
   size_t hwm = atomic_load(&q->high_water_mark);
   while (new_size > hwm) {
@@ -184,22 +299,44 @@ static bool queue_push(log_queue *q, log_queue_entry *entry) {
       break;
     }
   }
+#else
+  size_t new_size = q->size;
+  size_t hwm = q->high_water_mark;
+  while (new_size > hwm) {
+    if (InterlockedCompareExchange((volatile LONG*)&q->high_water_mark, (LONG)new_size, (LONG)hwm) == (LONG)hwm) {
+      break;
+    }
+    hwm = q->high_water_mark;
+  }
+#endif
   
   return true;
 }
 
 static log_queue_entry* queue_pop(log_queue *q) {
+#ifdef LOG_USE_STDATOMIC
   log_queue_entry *head = atomic_load(&q->head);
   log_queue_entry *next = atomic_load(&head->next);
+#else
+  log_queue_entry *head = q->head;
+  log_queue_entry *next = head->next;
+#endif
   
   if (next == NULL) {
     return NULL;
   }
   
+#ifdef LOG_USE_STDATOMIC
   if (atomic_compare_exchange_strong(&q->head, &head, next)) {
     atomic_fetch_sub(&q->size, 1);
     return head;
   }
+#else
+  if (InterlockedCompareExchangePointer((volatile PVOID*)&q->head, next, head) == head) {
+    InterlockedDecrement((volatile LONG*)&q->size);
+    return head;
+  }
+#endif
   
   return NULL;
 }
@@ -421,14 +558,21 @@ static void json_handler(log *ctx, log_Event *ev) {
 }
 
 /* Async writer thread */
+#ifdef LOG_PLATFORM_WINDOWS
+static DWORD WINAPI async_writer_thread(LPVOID arg) {
+#else
 static void* async_writer_thread(void *arg) {
+#endif
   log *ctx = (log*)arg;
   
+#ifdef LOG_USE_STDATOMIC
   while (atomic_load(&ctx->async_running)) {
+#else
+  while (ctx->async_running) {
+#endif
     log_queue_entry *entry = queue_pop(&ctx->queue);
     if (!entry) {
-      struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000};
-      nanosleep(&ts, NULL);
+      log_sleep_ms(100);
       continue;
     }
     
@@ -462,7 +606,11 @@ static void* async_writer_thread(void *arg) {
     queue_entry_destroy(entry);
   }
   
+#ifdef LOG_PLATFORM_WINDOWS
+  return 0;
+#else
   return NULL;
+#endif
 }
 
 /* API Implementation */
@@ -471,14 +619,18 @@ log* log_create(void) {
   if (!ctx) return NULL;
 
   rwlock_init(&ctx->rwlock);
-  pthread_mutex_init(&ctx->mutex, NULL);
+  LOG_MUTEX_INIT(ctx->mutex);
 
   ctx->level = LOG_TRACE;
   ctx->quiet = false;
   ctx->format_mode = DEFAULT_FORMAT;
   ctx->max_file_size = LOG_DEFAULT_MAX_SIZE;
   ctx->async_enabled = false;
+#ifdef LOG_USE_STDATOMIC
   atomic_store(&ctx->async_running, false);
+#else
+  ctx->async_running = false;
+#endif
 
   queue_init(&ctx->queue, DEFAULT_QUEUE_SIZE);
 
@@ -503,15 +655,21 @@ void log_destroy(log *ctx) {
   if (!ctx) return;
 
   if (ctx->async_enabled) {
+#ifdef LOG_USE_STDATOMIC
     atomic_store(&ctx->async_running, false);
-    pthread_join(ctx->async_thread, NULL);
+#else
+    ctx->async_running = false;
+#endif
+    LOG_THREAD_JOIN(ctx->async_thread);
   }
 
   queue_destroy(&ctx->queue);
 
+#if LOG_HAVE_SYSLOG
   if (ctx->syslog_enabled_global) {
     closelog();
   }
+#endif
 
   for (int i = 0; i < ctx->handler_count; i++) {
     free(ctx->handlers[i].filename);
@@ -521,7 +679,7 @@ void log_destroy(log *ctx) {
 
   free(ctx->file_prefix);
   free(ctx->syslog_ident);
-  pthread_mutex_destroy(&ctx->mutex);
+  LOG_MUTEX_DESTROY(ctx->mutex);
   free(ctx);
 }
 
@@ -559,15 +717,31 @@ void log_set_format(log *ctx, log_FormatFn fn) {
 
 int log_set_async(log *ctx, bool enable) {
   if (enable && !ctx->async_enabled) {
+#ifdef LOG_USE_STDATOMIC
     atomic_store(&ctx->async_running, true);
-    if (pthread_create(&ctx->async_thread, NULL, async_writer_thread, ctx) != 0) {
+#else
+    ctx->async_running = true;
+#endif
+#ifdef LOG_PLATFORM_WINDOWS
+    LOG_THREAD_CREATE(ctx->async_thread, async_writer_thread, ctx);
+    if (ctx->async_thread == NULL) {
+      ctx->async_running = false;
+      return -1;
+    }
+#else
+    if (LOG_THREAD_CREATE(ctx->async_thread, async_writer_thread, ctx) != 0) {
       atomic_store(&ctx->async_running, false);
       return -1;
     }
+#endif
     ctx->async_enabled = true;
   } else if (!enable && ctx->async_enabled) {
+#ifdef LOG_USE_STDATOMIC
     atomic_store(&ctx->async_running, false);
-    pthread_join(ctx->async_thread, NULL);
+#else
+    ctx->async_running = false;
+#endif
+    LOG_THREAD_JOIN(ctx->async_thread);
     ctx->async_enabled = false;
   }
   return 0;
@@ -805,6 +979,7 @@ void log_enable_thread_id(log *ctx, int handler_idx, bool enable) {
 }
 
 /* Syslog support implementation */
+#if LOG_HAVE_SYSLOG
 int log_level_to_syslog(int level) {
   switch (level) {
     case LOG_TRACE: return LOG_DEBUG;
@@ -874,12 +1049,25 @@ int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level)
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
 }
+#else
+/* Stub implementations for Windows */
+int log_level_to_syslog(int level) {
+  (void)level;
+  return 0;
+}
+
+int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level) {
+  (void)ctx; (void)ident; (void)facility; (void)level;
+  return -1;
+}
+#endif
 
 /* Wrapper for json_handler to avoid unused warning */
 static void json_handler_wrapper(log *ctx, log_Event *ev) {
   json_handler(ctx, ev);
 }
 
+#if LOG_HAVE_SYSLOG
 void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable) {
   if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return;
 
@@ -894,3 +1082,8 @@ void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable) {
 
   rwlock_write_unlock(&ctx->rwlock);
 }
+#else
+void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable) {
+  (void)ctx; (void)handler_idx; (void)enable;
+}
+#endif

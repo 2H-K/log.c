@@ -11,6 +11,7 @@
 *.slnx
 *.sln
 
+
 # --- 可执行文件 ---
 # 忽略所有没有后缀名的可执行文件（适用于 Linux/macOS）
 # 如果你的可执行文件有固定名称，建议直接写名字，例如 /main
@@ -61,6 +62,7 @@ cmake-build-release/
 
 # --- 构建系统 ---
 # 如果使用 CMake
+build/
 CMakeCache.txt
 CMakeFiles/
 CMakeScripts/
