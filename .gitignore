@@ -1,3 +1,65 @@
-.o
-*.d
-*.o.d
+# --- 编译产物 ---
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.lib
+*.a
+
+# --- 可执行文件 ---
+# 忽略所有没有后缀名的可执行文件（适用于 Linux/macOS）
+# 如果你的可执行文件有固定名称，建议直接写名字，例如 /main
+# 或者通过以下规则排除带后缀的文件：
+*
+!*/
+!*.*
+!Makefile
+!*.c
+!*.h
+!*.md
+!*.gitignore
+
+# Windows 平台的可执行文件
+*.exe
+*.out
+*.app
+
+# --- 编译器产生的调试文件 ---
+*.dSYM/
+*.pdb
+*.idb
+*.ilk
+
+# --- IDE 与 编辑器 ---
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# Visual Studio
+.vs/
+Debug/
+Release/
+x64/
+x86/
+
+# CLion / JetBrains
+.idea/
+cmake-build-debug/
+cmake-build-release/
+
+# 文本编辑器临时文件
+*.swp
+*~
+.DS_Store
+
+# --- 构建系统 ---
+# 如果使用 CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+Makefile
