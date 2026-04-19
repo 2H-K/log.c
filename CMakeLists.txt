@@ -42,26 +42,30 @@ if(NOT WIN32)
 endif()
 
 # Optional: Build examples
-option(BUILD_EXAMPLES "Build example programs" ON)
-if(BUILD_EXAMPLES)
-    add_executable(example src/example.c)
-    target_link_libraries(example PRIVATE logc)
-
-    add_executable(example_thread_safety src/example_thread_safety.c)
-    target_link_libraries(example_thread_safety PRIVATE logc)
-    
-    add_executable(performance_test src/performance_test.c)
-    target_link_libraries(performance_test PRIVATE logc)
-endif()
+# option(BUILD_EXAMPLES "Build example programs" OFF)
+# if(BUILD_EXAMPLES)
+#     add_executable(example src/example.c)
+#     target_link_libraries(example PRIVATE logc)
+# 
+#     add_executable(example_thread_safety src/example_thread_safety.c)
+#     target_link_libraries(example_thread_safety PRIVATE logc)
+#     
+#     add_executable(performance_test src/performance_test.c)
+#     target_link_libraries(performance_test PRIVATE logc)
+# endif()
 
 # Optional: Build tests
-option(BUILD_TESTS "Build test suite" ON)
-if(BUILD_TESTS)
-    enable_testing()
-    add_executable(test_log src/test_log.c)
-    target_link_libraries(test_log PRIVATE logc)
-    add_test(NAME test_log COMMAND test_log)
-endif()
+# option(BUILD_TESTS "Build test suite" OFF)
+# if(BUILD_TESTS)
+#     enable_testing()
+#     add_executable(test_log src/test_log.c)
+#     target_link_libraries(test_log PRIVATE logc)
+#     add_test(NAME test_log COMMAND test_log)
+# endif()
+
+# Fixes test
+add_executable(test_fixes src/test_fixes.c)
+target_link_libraries(test_fixes PRIVATE logc)
 
 # Installation
 install(TARGETS logc

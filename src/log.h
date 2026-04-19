@@ -18,11 +18,9 @@
 
 /* Platform detection */
 #if defined(_WIN32) || defined(_WIN64)
-  #define LOG_PLATFORM_WINDOWS 1
-  #define LOG_PLATFORM_POSIX 0
+  #define LOG_PLATFORM_WINDOWS
 #else
-  #define LOG_PLATFORM_POSIX 1
-  #define LOG_PLATFORM_WINDOWS 0
+  #define LOG_PLATFORM_POSIX
 #endif
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(_MSC_VER)
@@ -52,7 +50,7 @@
   #define LOG_GET_THREAD_ID() ((LOG_THREAD_ID_T)pthread_self())
 #endif
 
-#if LOG_PLATFORM_WINDOWS
+#ifdef LOG_PLATFORM_WINDOWS
   #include <windows.h>
   #define LOG_THREAD_T HANDLE
   #define LOG_THREAD_CREATE(t, f, a) ((t) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(f), (a), 0, NULL))

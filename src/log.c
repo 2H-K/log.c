@@ -60,7 +60,7 @@ static double get_timestamp(void) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-#else
+#elif defined(LOG_PLATFORM_WINDOWS)
   FILETIME ft;
   GetSystemTimePreciseAsFileTime(&ft);
   ULARGE_INTEGER uli;
@@ -78,7 +78,7 @@ static void log_sleep_ms(int ms) {
   ts.tv_sec = ms / 1000;
   ts.tv_nsec = (ms % 1000) * 1000000L;
   nanosleep(&ts, NULL);
-#else
+#elif defined(LOG_PLATFORM_WINDOWS)
   Sleep(ms);
 #endif
 }
@@ -831,22 +831,20 @@ void log_set_format(log *ctx, log_FormatFn fn) {
 
 int log_set_async(log *ctx, bool enable) {
   if (enable && !ctx->async_enabled) {
+#ifdef LOG_PLATFORM_POSIX
+  if (LOG_THREAD_CREATE(ctx->async_thread, async_writer_thread, ctx) != 0) {
+    return -1;
+  }
+#elif defined(LOG_PLATFORM_WINDOWS)
+  ctx->async_thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)async_writer_thread, ctx, 0, NULL);
+  if (ctx->async_thread == NULL) {
+    return -1;
+  }
+#endif
 #ifdef LOG_USE_STDATOMIC
     atomic_store(&ctx->async_running, true);
 #else
     ctx->async_running = true;
-#endif
-#if LOG_PLATFORM_POSIX
-    if (LOG_THREAD_CREATE(ctx->async_thread, async_writer_thread, ctx) != 0) {
-      atomic_store(&ctx->async_running, false);
-      return -1;
-    }
-#else
-    ctx->async_thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)async_writer_thread, ctx, 0, NULL);
-    if (ctx->async_thread == NULL) {
-      ctx->async_running = false;
-      return -1;
-    }
 #endif
     ctx->async_enabled = true;
   } else if (!enable && ctx->async_enabled) {
@@ -876,6 +874,10 @@ void log_set_file_prefix(log *ctx, const char *prefix) {
 
 void log_enable_mpool(log *ctx, bool enable) {
   if (!ctx) return;
+  bool was_async_enabled = ctx->async_enabled;
+  if (was_async_enabled) {
+    log_set_async(ctx, false);
+  }
   rwlock_write_lock(&ctx->rwlock);
   if (!enable && ctx->enable_mpool) {
     mpool_destroy(&ctx->mpool);
@@ -883,13 +885,23 @@ void log_enable_mpool(log *ctx, bool enable) {
   }
   ctx->enable_mpool = enable;
   rwlock_write_unlock(&ctx->rwlock);
+  if (was_async_enabled) {
+    log_set_async(ctx, true);
+  }
 }
 
 void log_enable_ts_cache(log *ctx, bool enable) {
   if (!ctx) return;
+  bool was_async_enabled = ctx->async_enabled;
+  if (was_async_enabled) {
+    log_set_async(ctx, false);
+  }
   rwlock_write_lock(&ctx->rwlock);
   ctx->enable_ts_cache = enable;
   rwlock_write_unlock(&ctx->rwlock);
+  if (was_async_enabled) {
+    log_set_async(ctx, true);
+  }
 }
 
 void log_get_perf_stats(log *ctx, log_stats *stats) {
@@ -1164,14 +1176,16 @@ int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level)
 
   rwlock_write_lock(&ctx->rwlock);
 
-  if (!ctx->syslog_enabled_global) {
-    if (ident) {
-      free(ctx->syslog_ident);
-      ctx->syslog_ident = strdup(ident);
-    }
+  if (ctx->handler_count >= ctx->handler_capacity) {
+    rwlock_write_unlock(&ctx->rwlock);
+    return -1;
+  }
+
+  bool need_to_open_syslog = !ctx->syslog_enabled_global && ident != NULL;
+  if (need_to_open_syslog) {
+    free(ctx->syslog_ident);
+    ctx->syslog_ident = strdup(ident);
     ctx->syslog_facility = facility;
-    openlog(ctx->syslog_ident ? ctx->syslog_ident : "log", LOG_PID | LOG_NDELAY, facility);
-    ctx->syslog_enabled_global = true;
   }
 
   log_handler *h = &ctx->handlers[ctx->handler_count++];
@@ -1182,9 +1196,14 @@ int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level)
   h->fp = NULL;
   h->filename = NULL;
   h->file_size = 0;
-  h->syslog_enabled = true;
+  h->syslog_enabled = need_to_open_syslog;
   h->syslog_facility = facility;
   h->show_thread_id = false;
+
+  if (need_to_open_syslog) {
+    openlog(ctx->syslog_ident, LOG_PID | LOG_NDELAY, facility);
+    ctx->syslog_enabled_global = true;
+  }
 
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
