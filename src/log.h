@@ -19,30 +19,65 @@
 /* Platform detection */
 #if defined(_WIN32) || defined(_WIN64)
   #define LOG_PLATFORM_WINDOWS 1
+  #define LOG_PLATFORM_POSIX 0
 #else
   #define LOG_PLATFORM_POSIX 1
+  #define LOG_PLATFORM_WINDOWS 0
 #endif
 
-/* MSVC compatibility */
-#if defined(_MSC_VER)
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(_MSC_VER)
+  #define LOG_USE_STDATOMIC 1
+  #include <stdatomic.h>
+#elif defined(_MSC_VER)
+  #define LOG_USE_MSVC_ATOMIC 1
+  #include <windows.h>
   #if _MSC_VER < 1900
     #error "MSVC 2015 or later is required"
   #endif
   #ifndef _CRT_SECURE_NO_WARNINGS
     #define _CRT_SECURE_NO_WARNINGS
   #endif
+#else
+  #error "C11 or later with stdatomic.h required, or MSVC"
 #endif
 
-/* Core definitions first (before platform includes that might conflict) */
-#define LOG_VERSION "2.0.0"
+#if LOG_PLATFORM_POSIX
+  #include <pthread.h>
+  #include <unistd.h>
+  #include <sys/param.h>
+  #define LOG_THREAD_T pthread_t
+  #define LOG_THREAD_CREATE(t, f, a) pthread_create(&(t), NULL, (f), (a))
+  #define LOG_THREAD_JOIN(t) pthread_join((t), NULL)
+  #define LOG_THREAD_ID_T unsigned long
+  #define LOG_GET_THREAD_ID() ((LOG_THREAD_ID_T)pthread_self())
+#endif
+
+#if LOG_PLATFORM_WINDOWS
+  #include <windows.h>
+  #define LOG_THREAD_T HANDLE
+  #define LOG_THREAD_CREATE(t, f, a) ((t) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(f), (a), 0, NULL))
+  #define LOG_THREAD_JOIN(t) (WaitForSingleObject((t), INFINITE), CloseHandle((t)))
+  #define LOG_THREAD_ID_T unsigned long
+  #define LOG_GET_THREAD_ID() ((LOG_THREAD_ID_T)GetCurrentThreadId())
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+  #define LOG_THREAD_LOCAL _Thread_local
+#elif defined(_MSC_VER)
+  #define LOG_THREAD_LOCAL __declspec(thread)
+#elif defined(__GNUC__)
+  #define LOG_THREAD_LOCAL __thread
+#else
+  #define LOG_THREAD_LOCAL
+#endif
+
+#define LOG_VERSION "2.0.1"
 #define LOG_MAX_QUEUE_SIZE 4096
 #define LOG_MAX_ROTATION_FILES 5
-#define LOG_DEFAULT_MAX_SIZE (10 * 1024 * 1024)  /* 10MB */
+#define LOG_DEFAULT_MAX_SIZE (10 * 1024 * 1024)
 
-/* Log levels - defined early to avoid conflicts */
 enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL, LOG_LEVELS };
 
-/* Syslog level mapping */
 #define LOG_SYSLOG_EMERG   0
 #define LOG_SYSLOG_ALERT   1
 #define LOG_SYSLOG_CRIT    2
@@ -52,50 +87,12 @@ enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL, LOG_LEVEL
 #define LOG_SYSLOG_INFO    6
 #define LOG_SYSLOG_DEBUG   7
 
-/* Output format modes */
 enum { LOG_FORMAT_TEXT, LOG_FORMAT_JSON };
 
-/* Atomic operations */
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(_MSC_VER)
-  #define LOG_USE_STDATOMIC 1
-  #include <stdatomic.h>
-#elif defined(_MSC_VER)
-  #define LOG_USE_MSVC_ATOMIC 1
-  #include <windows.h>
-#else
-  #error "C11 or later with stdatomic.h required, or MSVC"
-#endif
+#define LOG_USE_COLOR
 
-/* Threading */
-#ifdef LOG_PLATFORM_POSIX
-  #include <pthread.h>
-  #include <unistd.h>
-  #define LOG_THREAD_T pthread_t
-  #define LOG_MUTEX_T pthread_mutex_t
-  #define LOG_MUTEX_INIT(m) pthread_mutex_init(&(m), NULL)
-  #define LOG_MUTEX_DESTROY(m) pthread_mutex_destroy(&(m))
-  #define LOG_MUTEX_LOCK(m) pthread_mutex_lock(&(m))
-  #define LOG_MUTEX_UNLOCK(m) pthread_mutex_unlock(&(m))
-  #define LOG_THREAD_CREATE(t, f, a) pthread_create(&(t), NULL, (f), (a))
-  #define LOG_THREAD_JOIN(t) pthread_join((t), NULL)
-  #define LOG_GET_THREAD_ID() ((unsigned long)pthread_self())
-#else
-  #include <windows.h>
-  #define LOG_THREAD_T HANDLE
-  #define LOG_MUTEX_T CRITICAL_SECTION
-  #define LOG_MUTEX_INIT(m) InitializeCriticalSection(&(m))
-  #define LOG_MUTEX_DESTROY(m) DeleteCriticalSection(&(m))
-  #define LOG_MUTEX_LOCK(m) EnterCriticalSection(&(m))
-  #define LOG_MUTEX_UNLOCK(m) LeaveCriticalSection(&(m))
-  #define LOG_THREAD_CREATE(t, f, a) ((t) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(f), (a), 0, NULL))
-  #define LOG_THREAD_JOIN(t) (WaitForSingleObject((t), INFINITE), CloseHandle((t)))
-  #define LOG_GET_THREAD_ID() ((unsigned long)GetCurrentThreadId())
-#endif
-
-/* Syslog (only on POSIX) */
-#ifdef LOG_PLATFORM_POSIX
+#if LOG_PLATFORM_POSIX
   #include <syslog.h>
-  /* Avoid enum name conflicts with syslog.h - undefine only syslog's macros */
   #ifdef LOG_EMERG
     #undef LOG_EMERG
   #endif
@@ -121,7 +118,6 @@ enum { LOG_FORMAT_TEXT, LOG_FORMAT_JSON };
     #undef LOG_DEBUG
   #endif
   #define LOG_HAVE_SYSLOG 1
-  /* Provide placeholders for any missing syslog constants */
   #ifndef LOG_USER
     #define LOG_USER 0
   #endif
@@ -133,7 +129,6 @@ enum { LOG_FORMAT_TEXT, LOG_FORMAT_JSON };
   #endif
 #else
   #define LOG_HAVE_SYSLOG 0
-  /* Placeholder definitions for non-syslog platforms */
   #define LOG_USER 0
   #define LOG_PID 0
   #define LOG_NDELAY 0
@@ -218,6 +213,36 @@ typedef struct log_queue_entry {
 } log_queue_entry;
 
 /**
+ * @brief Memory pool for log entries (reduces malloc/free overhead)
+ */
+typedef struct log_mpool {
+  log_queue_entry *free_list;
+  size_t allocated;
+  size_t max_size;
+  size_t chunk_count;
+} log_mpool;
+
+/**
+ * @brief Fixed-size buffer for thread-local formatting (avoids stack allocation)
+ */
+typedef struct log_thread_buffer {
+  char format_buf[4096];
+  char time_buf[64];
+  size_t fmt_offset;
+  size_t time_offset;
+} log_thread_buffer;
+
+/**
+ * @brief Timestamp cache to avoid repeated formatting
+ */
+typedef struct log_ts_cache {
+  double last_timestamp;
+  char cached_string[32];
+  unsigned int cache_hits;
+  unsigned int cache_misses;
+} log_ts_cache;
+
+/**
  * @brief Log queue structure (lock-free single-producer single-consumer)
  */
 typedef struct log_queue {
@@ -268,17 +293,15 @@ typedef struct log_handler {
 } log_handler;
 struct log {
   log_rwlock rwlock;
-  
+
   void *udata;
   log_LockFn lock;
-  
-  /* Config */
+
   int level;
   bool quiet;
   int format_mode;
   size_t max_file_size;
-  
-  /* Async */
+
   bool async_enabled;
   log_queue queue;
   LOG_THREAD_T async_thread;
@@ -287,33 +310,36 @@ struct log {
 #else
   volatile bool async_running;
 #endif
-  
-  /* Handlers */
+
   log_handler *handlers;
   int handler_count;
   int handler_capacity;
-  
-  /* Format function */
+
   log_FormatFn format_fn;
-  
-  /* Stats */
+
   log_stats stats;
 #ifdef LOG_USE_STDATOMIC
   atomic_uint_fast64_t last_timestamp;
 #else
   volatile uint64_t last_timestamp;
 #endif
-  
-  /* File rotation */
+
   char *file_prefix;
 
-  /* Thread safety */
-  LOG_MUTEX_T mutex;
+#if LOG_PLATFORM_POSIX
+  pthread_mutex_t mutex;
+#else
+  CRITICAL_SECTION mutex;
+#endif
 
-  /* Syslog support */
   char *syslog_ident;
   int syslog_facility;
   bool syslog_enabled_global;
+
+  log_mpool mpool;
+  log_ts_cache ts_cache;
+  bool enable_ts_cache;
+  bool enable_mpool;
 };
 
 /* Core functions */
@@ -329,6 +355,11 @@ void log_set_format(log *ctx, log_FormatFn fn);
 int log_set_async(log *ctx, bool enable);
 void log_set_max_file_size(log *ctx, size_t size);
 void log_set_file_prefix(log *ctx, const char *prefix);
+/* Performance optimization functions */
+void log_enable_mpool(log *ctx, bool enable);
+void log_enable_ts_cache(log *ctx, bool enable);
+void log_get_perf_stats(log *ctx, log_stats *stats);
+
 int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
 int log_add_fp(log *ctx, FILE *fp, int level);
 void log_remove_handler(log *ctx, int idx);
@@ -338,6 +369,11 @@ void log_enable_thread_id(log *ctx, int handler_idx, bool enable);
 int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level);
 void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable);
 int log_level_to_syslog(int level);
+
+void log_handler_set_level(log *ctx, int handler_idx, int new_level);
+void log_handler_set_formatter(log *ctx, int handler_idx, log_FormatFn new_fn);
+void log_enable_text_format(log* ctx);
+void log_enable_json_format(log* ctx);
 
 void log_log(log *ctx, int level, const char *file, int line, const char *fmt, ...);
 void log_rotate(log *ctx);

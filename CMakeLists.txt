@@ -49,6 +49,9 @@ if(BUILD_EXAMPLES)
 
     add_executable(example_thread_safety src/example_thread_safety.c)
     target_link_libraries(example_thread_safety PRIVATE logc)
+    
+    add_executable(performance_test src/performance_test.c)
+    target_link_libraries(performance_test PRIVATE logc)
 endif()
 
 # Optional: Build tests

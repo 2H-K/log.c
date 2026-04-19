@@ -115,10 +115,11 @@ static inline bool atomic_compare_exchange_weak(volatile void* obj, void* expect
 #define DEFAULT_QUEUE_SIZE LOG_MAX_QUEUE_SIZE
 #define DEFAULT_FORMAT LOG_FORMAT_TEXT
 
-/* Global default logger */
+#define LOG_MPOOL_CHUNK_SIZE 64
+#define LOG_MPOOL_MAX_CHUNKS 64
+
 static log *DEFAULT_LOG = NULL;
 
-/* Level strings */
 static const char *level_strings[] = {
   "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"
 };
@@ -129,7 +130,66 @@ static const char *level_colors[] = {
 };
 #endif
 
-/* Helper: Format timestamp to string */
+static LOG_THREAD_LOCAL log_thread_buffer thread_buf = {0};
+
+static void mpool_init(log_mpool *mp, size_t max_size) {
+  mp->free_list = NULL;
+  mp->allocated = 0;
+  mp->max_size = max_size;
+  mp->chunk_count = 0;
+}
+
+static void mpool_destroy(log_mpool *mp) {
+  while (mp->free_list) {
+    log_queue_entry *next = mp->free_list->next;
+    free(mp->free_list->message);
+    free(mp->free_list->file);
+    free(mp->free_list);
+    mp->free_list = next;
+  }
+  mp->allocated = 0;
+}
+
+static log_queue_entry* mpool_alloc(log_mpool *mp) {
+  if (mp->free_list) {
+    log_queue_entry *entry = mp->free_list;
+    mp->free_list = entry->next;
+    entry->next = NULL;
+    return entry;
+  }
+  if (mp->allocated >= mp->max_size) {
+    return NULL;
+  }
+  log_queue_entry *entry = calloc(1, sizeof(log_queue_entry));
+  if (entry) {
+    entry->message = malloc(512);
+    entry->file = malloc(128);
+    if (!entry->message || !entry->file) {
+      free(entry->message);
+      free(entry->file);
+      free(entry);
+      return NULL;
+    }
+    entry->message[0] = '\0';
+    entry->file[0] = '\0';
+    mp->allocated++;
+  }
+  return entry;
+}
+
+static void mpool_free(log_mpool *mp, log_queue_entry *entry) {
+  if (!entry) return;
+  entry->next = mp->free_list;
+  mp->free_list = entry;
+}
+
+static void ts_cache_init(log_ts_cache *cache) {
+  cache->last_timestamp = 0.0;
+  cache->cached_string[0] = '\0';
+  cache->cache_hits = 0;
+  cache->cache_misses = 0;
+}
+
 static void format_timestamp(double ts, char *buf, size_t size) {
   time_t t = (time_t)ts;
   struct tm *tm_info = localtime(&t);
@@ -140,6 +200,26 @@ static void format_timestamp(double ts, char *buf, size_t size) {
   } else {
     buf[0] = '\0';
   }
+}
+
+static size_t format_timestamp_cached(log *ctx, double ts, char *buf, size_t size) {
+  if (!ctx->enable_ts_cache) {
+    format_timestamp(ts, buf, size);
+    return strlen(buf);
+  }
+  log_ts_cache *cache = &ctx->ts_cache;
+  if (ts - cache->last_timestamp < 0.001) {
+    cache->cache_hits++;
+    strncpy(buf, cache->cached_string, size - 1);
+    buf[size - 1] = '\0';
+    return strlen(buf);
+  }
+  cache->cache_misses++;
+  format_timestamp(ts, buf, size);
+  cache->last_timestamp = ts;
+  strncpy(cache->cached_string, buf, sizeof(cache->cached_string) - 1);
+  cache->cached_string[sizeof(cache->cached_string) - 1] = '\0';
+  return strlen(buf);
 }
 
 /* Reader-Writer Lock Implementation */
@@ -217,41 +297,64 @@ static void rwlock_write_unlock(log_rwlock *lock) {
 }
 
 /* Lock-free Queue Implementation */
-static log_queue_entry* queue_entry_create(log_Event *ev) {
-  log_queue_entry *entry = malloc(sizeof(log_queue_entry));
+static log_queue_entry* queue_entry_create(log *ctx, log_Event *ev) {
+  log_mpool *mp = &ctx->mpool;
+  log_queue_entry *entry = ctx->enable_mpool ? mpool_alloc(mp) : malloc(sizeof(log_queue_entry));
+
   if (!entry) return NULL;
-  
+
   va_list args_copy;
   va_copy(args_copy, ev->ap);
   int len = vsnprintf(NULL, 0, ev->fmt, args_copy);
   va_end(args_copy);
-  
+
   if (len < 0) {
-    free(entry);
+    if (!ctx->enable_mpool) free(entry);
     return NULL;
   }
-  
-  entry->message = malloc(len + 1);
-  if (!entry->message) {
-    free(entry);
+
+  if (ctx->enable_mpool) {
+    if ((size_t)len >= 512) {
+      entry->message = realloc(entry->message, len + 1);
+    }
+    if ((size_t)len >= 128) {
+      entry->file = realloc(entry->file, len + 1);
+    }
+  } else {
+    entry->message = malloc(len + 1);
+    entry->file = strdup(ev->file ? ev->file : "");
+  }
+
+  if (!entry->message || (!entry->file && !ctx->enable_mpool)) {
+    free(entry->message);
+    if (!ctx->enable_mpool) free(entry->file);
+    if (!ctx->enable_mpool) free(entry);
     return NULL;
   }
+
   vsnprintf(entry->message, len + 1, ev->fmt, ev->ap);
-  
+
   entry->level = ev->level;
-  entry->file = strdup(ev->file ? ev->file : "");
+  if (ctx->enable_mpool) {
+    strncpy(entry->file, ev->file ? ev->file : "", 127);
+    entry->file[127] = '\0';
+  }
   entry->line = ev->line;
   entry->timestamp = ev->timestamp;
   entry->next = NULL;
-  
+
   return entry;
 }
 
-static void queue_entry_destroy(log_queue_entry *entry) {
+static void queue_entry_destroy(log *ctx, log_queue_entry *entry) {
   if (!entry) return;
-  free(entry->message);
-  free(entry->file);
-  free(entry);
+  if (ctx->enable_mpool) {
+    mpool_free(&ctx->mpool, entry);
+  } else {
+    free(entry->message);
+    free(entry->file);
+    free(entry);
+  }
 }
 
 static void queue_init(log_queue *q, size_t max_size) {
@@ -342,10 +445,7 @@ static log_queue_entry* queue_pop(log_queue *q) {
 }
 
 static void queue_destroy(log_queue *q) {
-  log_queue_entry *entry;
-  while ((entry = queue_pop(q)) != NULL) {
-    queue_entry_destroy(entry);
-  }
+  (void)q;
 }
 
 /* Default format functions */
@@ -558,10 +658,10 @@ static void json_handler(log *ctx, log_Event *ev) {
 }
 
 /* Async writer thread */
-#ifdef LOG_PLATFORM_WINDOWS
-static DWORD WINAPI async_writer_thread(LPVOID arg) {
-#else
+#if LOG_PLATFORM_POSIX
 static void* async_writer_thread(void *arg) {
+#else
+static DWORD WINAPI async_writer_thread(LPVOID arg) {
 #endif
   log *ctx = (log*)arg;
   
@@ -602,14 +702,14 @@ static void* async_writer_thread(void *arg) {
       }
     }
     rwlock_read_unlock(&ctx->rwlock);
-    
-    queue_entry_destroy(entry);
+
+    queue_entry_destroy(ctx, entry);
   }
-  
-#ifdef LOG_PLATFORM_WINDOWS
-  return 0;
-#else
+
+#if LOG_PLATFORM_POSIX
   return NULL;
+#else
+  return 0;
 #endif
 }
 
@@ -619,7 +719,11 @@ log* log_create(void) {
   if (!ctx) return NULL;
 
   rwlock_init(&ctx->rwlock);
-  LOG_MUTEX_INIT(ctx->mutex);
+#if LOG_PLATFORM_POSIX
+  pthread_mutex_init(&ctx->mutex, NULL);
+#else
+  InitializeCriticalSection(&ctx->mutex);
+#endif
 
   ctx->level = LOG_TRACE;
   ctx->quiet = false;
@@ -645,6 +749,11 @@ log* log_create(void) {
   ctx->syslog_ident = NULL;
   ctx->syslog_facility = LOG_USER;
   ctx->syslog_enabled_global = false;
+
+  mpool_init(&ctx->mpool, LOG_MPOOL_MAX_CHUNKS * LOG_MPOOL_CHUNK_SIZE);
+  ts_cache_init(&ctx->ts_cache);
+  ctx->enable_ts_cache = true;
+  ctx->enable_mpool = false;
 
   log_add_handler(ctx, stdout_handler, stderr, LOG_TRACE);
 
@@ -673,13 +782,18 @@ void log_destroy(log *ctx) {
 
   for (int i = 0; i < ctx->handler_count; i++) {
     free(ctx->handlers[i].filename);
-    /* File pointers opened by user should not be closed here */
   }
   free(ctx->handlers);
 
   free(ctx->file_prefix);
   free(ctx->syslog_ident);
-  LOG_MUTEX_DESTROY(ctx->mutex);
+#if LOG_PLATFORM_POSIX
+  pthread_mutex_destroy(&ctx->mutex);
+#else
+  DeleteCriticalSection(&ctx->mutex);
+#endif
+
+  mpool_destroy(&ctx->mpool);
   free(ctx);
 }
 
@@ -722,15 +836,15 @@ int log_set_async(log *ctx, bool enable) {
 #else
     ctx->async_running = true;
 #endif
-#ifdef LOG_PLATFORM_WINDOWS
-    LOG_THREAD_CREATE(ctx->async_thread, async_writer_thread, ctx);
-    if (ctx->async_thread == NULL) {
-      ctx->async_running = false;
+#if LOG_PLATFORM_POSIX
+    if (LOG_THREAD_CREATE(ctx->async_thread, async_writer_thread, ctx) != 0) {
+      atomic_store(&ctx->async_running, false);
       return -1;
     }
 #else
-    if (LOG_THREAD_CREATE(ctx->async_thread, async_writer_thread, ctx) != 0) {
-      atomic_store(&ctx->async_running, false);
+    ctx->async_thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)async_writer_thread, ctx, 0, NULL);
+    if (ctx->async_thread == NULL) {
+      ctx->async_running = false;
       return -1;
     }
 #endif
@@ -758,6 +872,32 @@ void log_set_file_prefix(log *ctx, const char *prefix) {
   free(ctx->file_prefix);
   ctx->file_prefix = strdup(prefix ? prefix : "log");
   rwlock_write_unlock(&ctx->rwlock);
+}
+
+void log_enable_mpool(log *ctx, bool enable) {
+  if (!ctx) return;
+  rwlock_write_lock(&ctx->rwlock);
+  if (!enable && ctx->enable_mpool) {
+    mpool_destroy(&ctx->mpool);
+    mpool_init(&ctx->mpool, LOG_MPOOL_MAX_CHUNKS * LOG_MPOOL_CHUNK_SIZE);
+  }
+  ctx->enable_mpool = enable;
+  rwlock_write_unlock(&ctx->rwlock);
+}
+
+void log_enable_ts_cache(log *ctx, bool enable) {
+  if (!ctx) return;
+  rwlock_write_lock(&ctx->rwlock);
+  ctx->enable_ts_cache = enable;
+  rwlock_write_unlock(&ctx->rwlock);
+}
+
+void log_get_perf_stats(log *ctx, log_stats *stats) {
+  if (!ctx || !stats) return;
+  rwlock_read_lock(&ctx->rwlock);
+  *stats = ctx->stats;
+  stats->queue_drops = ctx->mpool.allocated;
+  rwlock_read_unlock(&ctx->rwlock);
 }
 
 int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level) {
@@ -833,18 +973,18 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
   ev.line = line;
   ev.level = level;
   ev.timestamp = get_timestamp();
-  
+
   if (ctx->async_enabled) {
     va_start(ev.ap, fmt);
-    log_queue_entry *entry = queue_entry_create(&ev);
+    log_queue_entry *entry = queue_entry_create(ctx, &ev);
     va_end(ev.ap);
-    
+
     if (entry && queue_push(&ctx->queue, entry)) {
       ctx->stats.async_writes++;
     } else {
       ctx->stats.queue_drops++;
       if (entry) {
-        queue_entry_destroy(entry);
+        queue_entry_destroy(ctx, entry);
       }
       va_start(ev.ap, fmt);
       for (int i = 0; i < ctx->handler_count; i++) {
