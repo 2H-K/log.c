@@ -9,6 +9,36 @@
 #include <pthread.h>
 #endif
 
+// 测试所有日志级别
+void test_all_log_levels() {
+    printf("\n=== 测试所有日志级别 ===\n");
+    
+    log *ctx = log_create();
+    if (!ctx) {
+        printf("Failed to initialize log\n");
+        return;
+    }
+    
+    // 测试所有日志级别
+    log_trace(ctx, "这是TRACE级别的日志消息");
+    log_debug(ctx, "这是DEBUG级别的日志消息");
+    log_info(ctx, "这是INFO级别的日志消息");
+    log_warn(ctx, "这是WARN级别的日志消息");
+    log_error(ctx, "这是ERROR级别的日志消息");
+    log_fatal(ctx, "这是FATAL级别的日志消息");
+    
+    // 测试带参数的日志
+    log_trace(ctx, "TRACE: 参数测试 %d, %s", 123, "字符串");
+    log_debug(ctx, "DEBUG: 参数测试 %f, %d", 3.14, 456);
+    log_info(ctx, "INFO: 参数测试 %s", "测试字符串");
+    log_warn(ctx, "WARN: 参数测试 %d", 789);
+    log_error(ctx, "ERROR: 参数测试 %s, %d", "错误", 999);
+    log_fatal(ctx, "FATAL: 参数测试 %d", -1);
+    
+    log_destroy(ctx);
+    printf("=== 所有日志级别测试完成 ===\n");
+}
+
 // 测试 log_set_async 函数的竞态条件
 void test_async_race_condition() {
     printf("\n=== 测试 log_set_async 竞态条件 ===\n");
@@ -27,8 +57,13 @@ void test_async_race_condition() {
             printf("Async mode enabled successfully\n");
         }
         
-        // 写入一些日志
-        log_info(ctx, "Test log message %d", i);
+        // 写入所有级别的日志
+        log_trace(ctx, "Async TRACE test %d", i);
+        log_debug(ctx, "Async DEBUG test %d", i);
+        log_info(ctx, "Async INFO test %d", i);
+        log_warn(ctx, "Async WARN test %d", i);
+        log_error(ctx, "Async ERROR test %d", i);
+        log_fatal(ctx, "Async FATAL test %d", i);
         
         if (log_set_async(ctx, false) != 0) {
             printf("Failed to disable async mode\n");
@@ -63,12 +98,23 @@ void test_mpool_ts_cache_race_condition() {
         log_enable_mpool(ctx, true);
         printf("Memory pool enabled\n");
         
-        log_info(ctx, "Test log with mpool enabled %d", i);
+        // 测试所有级别
+        log_trace(ctx, "MPool TRACE test %d", i);
+        log_debug(ctx, "MPool DEBUG test %d", i);
+        log_info(ctx, "MPool INFO test %d", i);
+        log_warn(ctx, "MPool WARN test %d", i);
+        log_error(ctx, "MPool ERROR test %d", i);
+        log_fatal(ctx, "MPool FATAL test %d", i);
         
         log_enable_mpool(ctx, false);
         printf("Memory pool disabled\n");
         
-        log_info(ctx, "Test log with mpool disabled %d", i);
+        log_trace(ctx, "No MPool TRACE test %d", i);
+        log_debug(ctx, "No MPool DEBUG test %d", i);
+        log_info(ctx, "No MPool INFO test %d", i);
+        log_warn(ctx, "No MPool WARN test %d", i);
+        log_error(ctx, "No MPool ERROR test %d", i);
+        log_fatal(ctx, "No MPool FATAL test %d", i);
     }
     
     // 测试在异步模式下修改时间戳缓存设置
@@ -76,12 +122,22 @@ void test_mpool_ts_cache_race_condition() {
         log_enable_ts_cache(ctx, true);
         printf("Timestamp cache enabled\n");
         
-        log_info(ctx, "Test log with ts cache enabled %d", i);
+        log_trace(ctx, "TSCache TRACE test %d", i);
+        log_debug(ctx, "TSCache DEBUG test %d", i);
+        log_info(ctx, "TSCache INFO test %d", i);
+        log_warn(ctx, "TSCache WARN test %d", i);
+        log_error(ctx, "TSCache ERROR test %d", i);
+        log_fatal(ctx, "TSCache FATAL test %d", i);
         
         log_enable_ts_cache(ctx, false);
         printf("Timestamp cache disabled\n");
         
-        log_info(ctx, "Test log with ts cache disabled %d", i);
+        log_trace(ctx, "No TSCache TRACE test %d", i);
+        log_debug(ctx, "No TSCache DEBUG test %d", i);
+        log_info(ctx, "No TSCache INFO test %d", i);
+        log_warn(ctx, "No TSCache WARN test %d", i);
+        log_error(ctx, "No TSCache ERROR test %d", i);
+        log_fatal(ctx, "No TSCache FATAL test %d", i);
     }
     
     // 禁用异步模式
@@ -117,8 +173,13 @@ void test_syslog_resource_leak() {
     
     printf("Added %d syslog handlers\n", added);
     
-    // 写入一些日志
-    log_info(ctx, "Test syslog message");
+    // 写入所有级别的日志
+    log_trace(ctx, "Syslog TRACE message");
+    log_debug(ctx, "Syslog DEBUG message");
+    log_info(ctx, "Syslog INFO message");
+    log_warn(ctx, "Syslog WARN message");
+    log_error(ctx, "Syslog ERROR message");
+    log_fatal(ctx, "Syslog FATAL message");
     
     log_destroy(ctx);
     printf("=== 测试完成 ===\n");
@@ -130,7 +191,13 @@ DWORD WINAPI thread_function(LPVOID arg) {
     log *ctx = (log*)arg;
     
     for (int i = 0; i < 100; i++) {
-        log_info(ctx, "Thread %lu: test message %d", GetCurrentThreadId(), i);
+        // 每个线程写入所有级别的日志
+        log_trace(ctx, "Thread %lu: TRACE message %d", GetCurrentThreadId(), i);
+        log_debug(ctx, "Thread %lu: DEBUG message %d", GetCurrentThreadId(), i);
+        log_info(ctx, "Thread %lu: INFO message %d", GetCurrentThreadId(), i);
+        log_warn(ctx, "Thread %lu: WARN message %d", GetCurrentThreadId(), i);
+        log_error(ctx, "Thread %lu: ERROR message %d", GetCurrentThreadId(), i);
+        log_fatal(ctx, "Thread %lu: FATAL message %d", GetCurrentThreadId(), i);
     }
     
     return 0;
@@ -141,7 +208,13 @@ void* thread_function(void* arg) {
     log *ctx = (log*)arg;
     
     for (int i = 0; i < 100; i++) {
-        log_info(ctx, "Thread %lu: test message %d", pthread_self(), i);
+        // 每个线程写入所有级别的日志
+        log_trace(ctx, "Thread %lu: TRACE message %d", pthread_self(), i);
+        log_debug(ctx, "Thread %lu: DEBUG message %d", pthread_self(), i);
+        log_info(ctx, "Thread %lu: INFO message %d", pthread_self(), i);
+        log_warn(ctx, "Thread %lu: WARN message %d", pthread_self(), i);
+        log_error(ctx, "Thread %lu: ERROR message %d", pthread_self(), i);
+        log_fatal(ctx, "Thread %lu: FATAL message %d", pthread_self(), i);
     }
     
     return NULL;
@@ -204,6 +277,7 @@ void test_multithread_async() {
 int main() {
     printf("开始测试修复后的功能...\n");
     
+    test_all_log_levels();
     test_async_race_condition();
     test_mpool_ts_cache_race_condition();
     test_syslog_resource_leak();
