@@ -79,20 +79,67 @@ cmake -DBUILD_EXAMPLES=OFF ..
 cmake -DBUILD_TESTS=OFF ..
 ```
 
-### 手动编译
+### Makefile 构建
+
+项目提供跨平台的 Makefile，自动检测编译器和操作系统：
+
+#### Linux / macOS（GCC / Clang）
 
 ```bash
-# 编译为静态库
-gcc -c -std=c17 -Wall -Wextra src/log.c -o log.o
-ar rcs liblog.a log.o
+# 编译静态库
+make
 
-# 与应用程序一起编译
-gcc -std=c17 -Wall -Wextra -I./src \
-    src/log.c src/example.c -o example -lpthread
+# 编译测试程序
+make test_fixes
 
-# 启用颜色输出
-gcc -DLOG_USE_COLOR -std=c17 -Wall -Wextra \
-    src/log.c src/example.c -o example -lpthread
+# 清理
+make clean
+```
+
+#### Windows（MinGW-w64）
+
+```bash
+# MinGW 下直接使用 GCC 工具链
+mingw32-make
+
+mingw32-make test_fixes
+
+mingw32-make clean
+```
+
+#### Windows（MSVC）
+
+需从"开发者命令提示符"或 `vcvars64.bat` 环境运行：
+
+```bash
+# 指定 CC=cl 以启用 MSVC 编译路径
+make CC=cl
+
+make CC=cl test_fixes
+
+make CC=cl clean
+```
+
+#### 编译产出
+
+| 目标 | 说明 |
+|------|------|
+| `all`（默认） | 编译静态库 `liblogc.a`（GCC）或 `logc.lib`（MSVC） |
+| `test_fixes` | 编译测试程序 `test_fixes.exe` |
+
+#### 与应用程序链接
+
+```bash
+# 先编译库
+make
+
+# 然后链接你的程序
+gcc -std=c11 -Wall -Wextra -I./src \
+    your_app.c -L. -llogc -o your_app
+
+# 或直接一起编译（无需 Makefile）
+gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
+    src/log.c your_app.c -o your_app -lpthread
 ```
 
 ## 🌐 跨平台支持

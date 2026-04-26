@@ -1,73 +1,57 @@
-# Enhanced Log Library Makefile
+# ============================================================================
+#  Makefile for log.c — cross-platform static library + test builds
+#  Compatible with: GCC (Linux), MinGW-w64 (Windows), MSVC (Windows)
+# ============================================================================
 
-CC = gcc
-CFLAGS = -std=c17 -Wall -Wextra -pedantic -g -O2 -pthread
-LDFLAGS = -pthread
+# ----- Detect OS -----
+ifdef OS
+  RM       = del /Q
+  IS_WIN   = 1
+else
+  RM       = rm -f
+  IS_WIN   =
+endif
 
-# Source files
-LIB_SRC = src/log.c
-TEST_SRC = src/test_log.c
-EXAMPLE_SRC = src/example.c
-THREAD_SAFETY_EXAMPLE_SRC = src/example_thread_safety.c
+# ----- Detect compiler & set platform flags -----
+# If user didn't set CC explicitly, auto-detect
+ifneq ($(CC),cl)
+  # GCC / MinGW / Clang path
+  LIB_PFX  = lib
+  LIB_EXT  = .a
+  AR       = ar
+  TARGET   = liblogc.a
+  ifdef IS_WIN
+    LDFLAGS  =
+  else
+    LDFLAGS  = -lpthread
+  endif
+  CFLAGS  += -std=c11 -Wall -Wextra -I src
+  TEST_EXT = .exe
+else
+  # MSVC cl.exe path
+  LIB_PFX  =
+  LIB_EXT  = .lib
+  AR       = lib
+  TARGET   = logc.lib
+  LDFLAGS  =
+  CFLAGS  += /std:c11 /W4 /WX- /D_CRT_SECURE_NO_WARNINGS /I src
+  TEST_EXT = .exe
+endif
 
-# Object files
-LIB_OBJ = $(LIB_SRC:.c=.o)
-TEST_OBJ = $(TEST_SRC:.c=.o)
-EXAMPLE_OBJ = $(EXAMPLE_SRC:.c=.o)
-THREAD_SAFETY_EXAMPLE_OBJ = $(THREAD_SAFETY_EXAMPLE_SRC:.c=.o)
+# ----- Default: build library only -----
+.PHONY: all lib test_fixes clean
 
-# Targets
-LIB_NAME = liblog.a
-TEST_BIN = test_log
-EXAMPLE_BIN = example
-THREAD_SAFETY_EXAMPLE_BIN = example_thread_safety
+all: $(TARGET)
 
-.PHONY: all clean test example thread_safety
+# ----- Static library -----
+$(TARGET): src/log.c src/log.h
+	$(CC) $(CFLAGS) -c src/log.c -o log.o
+	$(AR) rcs $@ log.o
 
-all: $(LIB_NAME) test example thread_safety
+# ----- Test executable -----
+test_fixes$(TEST_EXT): test/test_bug.c src/log.c src/log.h
+	$(CC) $(CFLAGS) -o $@ test/test_bug.c src/log.c $(LDFLAGS)
 
-# Compile library
-$(LIB_OBJ): %.o: %.c src/log.h
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Create static library
-$(LIB_NAME): $(LIB_OBJ)
-	ar rcs $@ $^
-
-# Compile test
-$(TEST_BIN): $(TEST_OBJ) $(LIB_OBJ)
-	$(CC) $(CFLAGS) $(TEST_OBJ) $(LIB_OBJ) -o $(TEST_BIN) $(LDFLAGS)
-
-# Compile example
-$(EXAMPLE_BIN): $(EXAMPLE_OBJ) $(LIB_OBJ)
-	$(CC) $(CFLAGS) $(EXAMPLE_OBJ) $(LIB_OBJ) -o $(EXAMPLE_BIN) $(LDFLAGS)
-
-# Compile thread safety example
-$(THREAD_SAFETY_EXAMPLE_BIN): $(THREAD_SAFETY_EXAMPLE_OBJ) $(LIB_OBJ)
-	$(CC) $(CFLAGS) $(THREAD_SAFETY_EXAMPLE_OBJ) $(LIB_OBJ) -o $(THREAD_SAFETY_EXAMPLE_BIN) $(LDFLAGS)
-
-# Run tests
-test: $(TEST_BIN)
-	./$(TEST_BIN)
-
-# Run example
-run_example: $(EXAMPLE_BIN)
-	./$(EXAMPLE_BIN)
-
-# Run thread safety example
-thread_safety: $(THREAD_SAFETY_EXAMPLE_BIN)
-	./$(THREAD_SAFETY_EXAMPLE_BIN)
-
+# ----- Clean -----
 clean:
-	rm -f $(LIB_OBJ) $(TEST_OBJ) $(EXAMPLE_OBJ) $(THREAD_SAFETY_EXAMPLE_OBJ)
-	rm -f $(LIB_NAME) $(TEST_BIN) $(EXAMPLE_BIN) $(THREAD_SAFETY_EXAMPLE_BIN)
-	rm -f test_output.log* test_rotation* *.log
-	rm -f example_*.log
-
-# Debug build
-debug: CFLAGS += -DDEBUG -g3 -O0
-debug: clean all
-
-# Release build
-release: CFLAGS += -O3 -DNDEBUG
-release: clean all
+	$(RM) *.o *.a *.lib $(TARGET) test_fixes$(TEST_EXT) 2>nul || true

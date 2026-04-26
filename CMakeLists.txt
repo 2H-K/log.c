@@ -64,8 +64,8 @@ endif()
 # endif()
 
 # Fixes test
-add_executable(test_fixes src/test_fixes.c)
-target_link_libraries(test_fixes PRIVATE logc)
+# add_executable(test_fixes src/test_fixes.c)
+# target_link_libraries(test_fixes PRIVATE logc)
 
 # Installation
 install(TARGETS logc

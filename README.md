@@ -79,20 +79,65 @@ cmake -DBUILD_EXAMPLES=OFF ..
 cmake -DBUILD_TESTS=OFF ..
 ```
 
-### Manual Compilation
+### Makefile Build
+
+The project provides a cross-platform Makefile that auto-detects the compiler and OS:
+
+#### Linux / macOS (GCC / Clang)
 
 ```bash
-# Compile as static library
-gcc -c -std=c17 -Wall -Wextra src/log.c -o log.o
-ar rcs liblog.a log.o
+# Build static library
+make
 
-# Compile with application
-gcc -std=c17 -Wall -Wextra -I./src \
-    src/log.c src/example.c -o example -lpthread
+# Build test binary
+make test_fixes
 
-# Enable color output
-gcc -DLOG_USE_COLOR -std=c17 -Wall -Wextra \
-    src/log.c src/example.c -o example -lpthread
+# Clean
+make clean
+```
+
+#### Windows (MinGW-w64)
+
+```bash
+mingw32-make
+
+mingw32-make test_fixes
+
+mingw32-make clean
+```
+
+#### Windows (MSVC)
+
+Run from the "Developer Command Prompt" or after sourcing `vcvars64.bat`:
+
+```bash
+make CC=cl
+
+make CC=cl test_fixes
+
+make CC=cl clean
+```
+
+#### Build Targets
+
+| Target | Description |
+|--------|-------------|
+| `all` (default) | Static library `liblogc.a` (GCC) or `logc.lib` (MSVC) |
+| `test_fixes` | Test binary `test_fixes.exe` |
+
+#### Linking With Your Application
+
+```bash
+# Build the library first
+make
+
+# Then link your program
+gcc -std=c11 -Wall -Wextra -I./src \
+    your_app.c -L. -llogc -o your_app
+
+# Or compile everything together (no Makefile needed)
+gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
+    src/log.c your_app.c -o your_app -lpthread
 ```
 
 ## 🌐 Cross-Platform Support

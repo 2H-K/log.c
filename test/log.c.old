@@ -315,40 +315,24 @@ static log_queue_entry* queue_entry_create(log *ctx, log_Event *ev) {
 
   if (ctx->enable_mpool) {
     if ((size_t)len >= 512) {
-      char *new_msg = realloc(entry->message, (size_t)len + 1);
-      if (new_msg) {
-        entry->message = new_msg;
-      }
+      entry->message = realloc(entry->message, len + 1);
     }
-    size_t file_len = ev->file ? strlen(ev->file) : 0;
-    if (file_len >= 128) {
-      char *new_file = realloc(entry->file, file_len + 1);
-      if (new_file) {
-        entry->file = new_file;
-      }
+    if ((size_t)len >= 128) {
+      entry->file = realloc(entry->file, len + 1);
     }
   } else {
-    entry->message = malloc((size_t)len + 1);
+    entry->message = malloc(len + 1);
     entry->file = strdup(ev->file ? ev->file : "");
   }
 
-  if (!entry->message) {
-    if (!ctx->enable_mpool) {
-      free(entry->file);
-      free(entry);
-    }
+  if (!entry->message || (!entry->file && !ctx->enable_mpool)) {
+    free(entry->message);
+    if (!ctx->enable_mpool) free(entry->file);
+    if (!ctx->enable_mpool) free(entry);
     return NULL;
   }
 
-  if (!entry->file) {
-    if (!ctx->enable_mpool) {
-      free(entry->message);
-      free(entry);
-    }
-    return NULL;
-  }
-
-  vsnprintf(entry->message, (size_t)len + 1, ev->fmt, ev->ap);
+  vsnprintf(entry->message, len + 1, ev->fmt, ev->ap);
 
   entry->level = ev->level;
   if (ctx->enable_mpool) {
@@ -461,18 +445,7 @@ static log_queue_entry* queue_pop(log_queue *q) {
 }
 
 static void queue_destroy(log_queue *q) {
-  if (!q) return;
-  log_queue_entry *cur = q->head;
-  while (cur) {
-    log_queue_entry *next = cur->next;
-    free(cur->message);
-    free(cur->file);
-    free(cur);
-    cur = next;
-  }
-  q->head = NULL;
-  q->tail = NULL;
-  q->size = 0;
+  (void)q;
 }
 
 /* Default format functions */
@@ -896,10 +869,6 @@ void log_set_file_prefix(log *ctx, const char *prefix) {
   rwlock_write_lock(&ctx->rwlock);
   free(ctx->file_prefix);
   ctx->file_prefix = strdup(prefix ? prefix : "log");
-  if (!ctx->file_prefix) {
-    rwlock_write_unlock(&ctx->rwlock);
-    return;
-  }
   rwlock_write_unlock(&ctx->rwlock);
 }
 
@@ -1216,10 +1185,6 @@ int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level)
   if (need_to_open_syslog) {
     free(ctx->syslog_ident);
     ctx->syslog_ident = strdup(ident);
-    if (!ctx->syslog_ident) {
-      rwlock_write_unlock(&ctx->rwlock);
-      return -1;
-    }
     ctx->syslog_facility = facility;
   }
 
