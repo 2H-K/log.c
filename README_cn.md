@@ -102,7 +102,7 @@ make clean
 # MinGW 下直接使用 GCC 工具链
 mingw32-make
 
-mingw32-make test_fixes
+mingw32-make test
 
 mingw32-make clean
 ```

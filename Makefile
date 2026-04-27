@@ -16,6 +16,9 @@ endif
 # If user didn't set CC explicitly, auto-detect
 ifneq ($(CC),cl)
   # GCC / MinGW / Clang path
+  ifeq ($(origin CC),default)
+    CC := gcc
+  endif
   LIB_PFX  = lib
   LIB_EXT  = .a
   AR       = ar
@@ -39,7 +42,7 @@ else
 endif
 
 # ----- Default: build library only -----
-.PHONY: all lib test_fixes clean
+.PHONY: all lib test test_fixes clean
 
 all: $(TARGET)
 
@@ -49,9 +52,11 @@ $(TARGET): src/log.c src/log.h
 	$(AR) rcs $@ log.o
 
 # ----- Test executable -----
-test_fixes$(TEST_EXT): test/test_bug.c src/log.c src/log.h
+test: test$(TEST_EXT)
+
+test$(TEST_EXT): test/test_bug.c src/log.c src/log.h
 	$(CC) $(CFLAGS) -o $@ test/test_bug.c src/log.c $(LDFLAGS)
 
 # ----- Clean -----
 clean:
-	$(RM) *.o *.a *.lib $(TARGET) test_fixes$(TEST_EXT) 2>nul || true
+	$(RM) *.o *.a *.lib $(TARGET) test$(TEST_EXT) test_fixes$(TEST_EXT) 2>nul || true
