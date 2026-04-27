@@ -35,6 +35,14 @@
   #ifndef _CRT_SECURE_NO_WARNINGS
     #define _CRT_SECURE_NO_WARNINGS
   #endif
+  /* MSVC C mode: bool is not a keyword, use unsigned char */
+  #ifndef __cplusplus
+    #ifndef bool
+      #define bool unsigned char
+      #define true 1
+      #define false 0
+    #endif
+  #endif
 #else
   #error "C11 or later with stdatomic.h required, or MSVC"
 #endif
@@ -143,8 +151,8 @@ extern "C" {
 
 /* Forward declarations */
 typedef struct log log;
-typedef struct log_event log_Event;
-typedef void (*log_LogFn)(log *ctx, log_Event *ev);
+typedef struct log_event log_event;
+typedef void (*log_LogFn)(log *ctx, log_event *ev);
 typedef void (*log_LockFn)(bool lock, void *udata);
 
 /**
@@ -155,7 +163,7 @@ typedef void (*log_LockFn)(bool lock, void *udata);
  * @param buf_size Buffer size
  * @return Number of characters written (excluding null terminator)
  */
-typedef int (*log_FormatFn)(log *ctx, log_Event *ev, char *buf, size_t buf_size);
+typedef int (*log_FormatFn)(log *ctx, log_event *ev, char *buf, size_t buf_size);
 
 /**
  * @brief Log event structure
@@ -377,7 +385,7 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
 void log_rotate(log *ctx);
 
 int log_get_stats(log *ctx, log_stats *stats);
-const char* log_format_json(log *ctx, log_Event *ev, char *buf, size_t buf_size);
+const char* log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size);
 
 /* Default context macros */
 #define log_trace(...) log_log(log_default(), LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)

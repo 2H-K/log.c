@@ -297,7 +297,7 @@ static void rwlock_write_unlock(log_rwlock *lock) {
 }
 
 /* Lock-free Queue Implementation */
-static log_queue_entry* queue_entry_create(log *ctx, log_Event *ev) {
+static log_queue_entry* queue_entry_create(log *ctx, log_event *ev) {
   log_mpool *mp = &ctx->mpool;
   log_queue_entry *entry = ctx->enable_mpool ? mpool_alloc(mp) : malloc(sizeof(log_queue_entry));
 
@@ -476,7 +476,7 @@ static void queue_destroy(log_queue *q) {
 }
 
 /* Default format functions */
-static int format_text(log *ctx, log_Event *ev, char *buf, size_t buf_size) {
+static int format_text(log *ctx, log_event *ev, char *buf, size_t buf_size) {
   (void)ctx;
   char time_buf[32];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
@@ -537,7 +537,7 @@ static void rotate_file(log *ctx, const char *filename) {
 }
 
 /* Output handlers */
-static void stdout_handler(log *ctx, log_Event *ev) {
+static void stdout_handler(log *ctx, log_event *ev) {
   (void)ctx;
   char time_buf[32];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
@@ -577,7 +577,7 @@ static void stdout_handler(log *ctx, log_Event *ev) {
   fflush(ev->udata);
 }
 
-static void file_handler_internal(log *ctx, log_Event *ev, int handler_idx) {
+static void file_handler_internal(log *ctx, log_event *ev, int handler_idx) {
   char buf[4096];
   char time_buf[32];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
@@ -618,7 +618,7 @@ static void file_handler_internal(log *ctx, log_Event *ev, int handler_idx) {
   fflush(ev->udata);
 }
 
-static void file_handler_wrapper(log *ctx, log_Event *ev) {
+static void file_handler_wrapper(log *ctx, log_event *ev) {
   FILE *target_fp = ev->udata;
   
   for (int i = 0; i < ctx->handler_count; i++) {
@@ -633,7 +633,7 @@ static void file_handler_wrapper(log *ctx, log_Event *ev) {
   fflush(ev->udata);
 }
 
-static void json_handler(log *ctx, log_Event *ev) {
+static void json_handler(log *ctx, log_event *ev) {
   char buf[8192];
   char time_buf[32];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
@@ -705,7 +705,7 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
     
     double queue_latency = (get_timestamp() - entry->timestamp) * 1000.0;
     
-    log_Event ev = {0};
+    log_event ev = {0};
     ev.level = entry->level;
     ev.file = entry->file;
     ev.line = entry->line;
@@ -892,10 +892,56 @@ void log_set_max_file_size(log *ctx, size_t size) {
   rwlock_write_unlock(&ctx->rwlock);
 }
 
+/**
+ * Check if the path contains path traversal sequences or is an absolute path.
+ * Returns 1 if the path is safe (no traversal), 0 if unsafe.
+ */
+static int is_path_safe(const char *path) {
+  if (!path || path[0] == '\0') {
+    return 0;
+  }
+
+  /* Reject absolute paths:
+   * - Unix: starts with '/'
+   * - Windows: starts with 'X:\' or 'X:/' or '\\' (UNC)
+   */
+  if (path[0] == '/' || path[0] == '\\') {
+    return 0;
+  }
+#ifdef LOG_PLATFORM_WINDOWS
+  if (path[1] == ':') {
+    return 0;
+  }
+#endif
+
+  /* Check for ".." path traversal sequences */
+  const char *p = path;
+  while (*p) {
+    /* Check for ".." at start or after a separator */
+    if (p[0] == '.' && p[1] == '.') {
+      /* ".." at end of string or followed by separator */
+      if (p[2] == '\0' || p[2] == '/' || p[2] == '\\') {
+        return 0;
+      }
+    }
+    p++;
+  }
+
+  return 1;
+}
+
 void log_set_file_prefix(log *ctx, const char *prefix) {
   rwlock_write_lock(&ctx->rwlock);
+
+  const char *safe_prefix = prefix ? prefix : "log";
+
+  if (!is_path_safe(safe_prefix)) {
+    rwlock_write_unlock(&ctx->rwlock);
+    return;
+  }
+
   free(ctx->file_prefix);
-  ctx->file_prefix = strdup(prefix ? prefix : "log");
+  ctx->file_prefix = strdup(safe_prefix);
   if (!ctx->file_prefix) {
     rwlock_write_unlock(&ctx->rwlock);
     return;
@@ -905,11 +951,13 @@ void log_set_file_prefix(log *ctx, const char *prefix) {
 
 void log_enable_mpool(log *ctx, bool enable) {
   if (!ctx) return;
+  rwlock_write_lock(&ctx->rwlock);
   bool was_async_enabled = ctx->async_enabled;
   if (was_async_enabled) {
+    rwlock_write_unlock(&ctx->rwlock);
     log_set_async(ctx, false);
+    rwlock_write_lock(&ctx->rwlock);
   }
-  rwlock_write_lock(&ctx->rwlock);
   if (!enable && ctx->enable_mpool) {
     mpool_destroy(&ctx->mpool);
     mpool_init(&ctx->mpool, LOG_MPOOL_MAX_CHUNKS * LOG_MPOOL_CHUNK_SIZE);
@@ -923,11 +971,13 @@ void log_enable_mpool(log *ctx, bool enable) {
 
 void log_enable_ts_cache(log *ctx, bool enable) {
   if (!ctx) return;
+  rwlock_write_lock(&ctx->rwlock);
   bool was_async_enabled = ctx->async_enabled;
   if (was_async_enabled) {
+    rwlock_write_unlock(&ctx->rwlock);
     log_set_async(ctx, false);
+    rwlock_write_lock(&ctx->rwlock);
   }
-  rwlock_write_lock(&ctx->rwlock);
   ctx->enable_ts_cache = enable;
   rwlock_write_unlock(&ctx->rwlock);
   if (was_async_enabled) {
@@ -1010,7 +1060,7 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
     ctx->stats.level_counts[level]++;
   }
   
-  log_Event ev = {0};
+  log_event ev = {0};
   ev.fmt = fmt;
   ev.file = file;
   ev.line = line;
@@ -1072,7 +1122,7 @@ int log_get_stats(log *ctx, log_stats *stats) {
   return 0;
 }
 
-const char* log_format_json(log *ctx, log_Event *ev, char *buf, size_t buf_size) {
+const char* log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size) {
   char time_buf[32];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
   
@@ -1175,7 +1225,7 @@ int log_level_to_syslog(int level) {
   }
 }
 
-static void syslog_handler(log *ctx, log_Event *ev) {
+static void syslog_handler(log *ctx, log_event *ev) {
   if (!ctx) return;
 
   int priority = LOG_USER | log_level_to_syslog(ev->level);
@@ -1257,7 +1307,7 @@ int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level)
 #endif
 
 /* Wrapper for json_handler to avoid unused warning */
-static void json_handler_wrapper(log *ctx, log_Event *ev) {
+static void json_handler_wrapper(log *ctx, log_event *ev) {
   json_handler(ctx, ev);
 }
 
