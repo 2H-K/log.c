@@ -8,7 +8,7 @@ A simple, powerful, and thread-safe logging library implemented in C17 with full
 
 - **Cross-Platform Support**: Windows (MSVC/MinGW-w64) & Linux/macOS (GCC/Clang)
 - **Thread-Safe**: Reader-writer locks for concurrent access
-- **Async Logging**: Lock-free queue for non-blocking writes
+- **Async Logging**: Asynchronous queue for non-blocking writes
 - **Log Rotation**: Automatic file rotation by size
 - **Structured Logging**: JSON format support
 - **Thread ID Tracking**: Optional thread ID in output
@@ -219,7 +219,7 @@ log_destroy(ctx);
 log *ctx = log_create();
 
 // Set JSON format
-log_set_format(ctx, log_format_json);
+log_enable_json_format(ctx);
 
 // Add file handler
 FILE *fp = fopen("logs.json", "w");
@@ -288,7 +288,7 @@ int main(void) {
 int main(void) {
     log *ctx = log_create();
 
-    // Enable async mode with lock-free queue
+    // Enable async mode (asynchronous queue)
     log_set_async(ctx, true);
 
     FILE *fp = fopen("async.log", "w");
@@ -387,7 +387,7 @@ typedef struct log_stats {
 All public APIs are thread-safe:
 
 - **Reader-Writer Locks**: Protects configuration changes
-- **Lock-Free Queue**: For async mode (SPSC)
+- **Asynchronous Queue: dedicated writer thread drains a bounded queue
 - **Atomic Operations**: For statistics
 - **Safe from Multiple Threads**: Can be called concurrently
 
@@ -425,7 +425,7 @@ MIT License - See [LICENSE](LICENSE) for details.
   - Added cross-platform support (Windows/Linux/macOS)
   - Added CMake build system
   - Added colored output support
-  - Enhanced async logging with lock-free queue
+  - Enhanced async logging with Asynchronous Queue: dedicated writer thread drains a bounded queue
   - Added JSON format support
   - Added thread ID tracking
   - Added syslog integration

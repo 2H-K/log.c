@@ -158,7 +158,7 @@ void test_wrong_realloc_condition() {
     log_queue_entry *queued = ctx->queue.head;
     int found = 0;
     while (queued) {
-        if (queued->file && queued->message && strlen(queued->message) > 0) {
+        if (queued->file && queued->msg && strlen(queued->msg) > 0) {
             size_t file_buf_size = _msize(queued->file);
             size_t name_len = strlen(queued->file) + 1;
             printf("  entry->file 内容: \"%s\" (%zu 字节 + null)\n", queued->file, name_len);

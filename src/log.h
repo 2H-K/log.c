@@ -171,6 +171,7 @@ typedef int (*log_FormatFn)(log *ctx, log_event *ev, char *buf, size_t buf_size)
 struct log_event {
   va_list ap;
   const char *fmt;
+  const char *raw_msg;  /* Pre-formatted message (async path); used instead of fmt */
   const char *file;
   struct tm *time;
   void *udata;
@@ -185,7 +186,6 @@ struct log_event {
 typedef struct log_config {
   int level;
   bool quiet;
-  int format_mode;           /* LOG_FORMAT_TEXT or LOG_FORMAT_JSON */
   size_t max_file_size;      /* For rotation */
   bool async_enabled;
   size_t queue_size;
@@ -210,7 +210,7 @@ typedef struct log_stats {
  * @brief Log queue entry for async mode
  */
 typedef struct log_queue_entry {
-  char *message;
+  char *msg;    /* Pure message string (formatted once, no prefix) */
   int level;
   char *file;
   int line;
@@ -249,22 +249,21 @@ typedef struct log_ts_cache {
 } log_ts_cache;
 
 /**
- * @brief Log queue structure (lock-free single-producer single-consumer)
+ * @brief Log queue structure (mutex + condition variable for async mode)
  */
 typedef struct log_queue {
-#ifdef LOG_USE_STDATOMIC
-  _Atomic(log_queue_entry*) head;
-  _Atomic(log_queue_entry*) tail;
-  atomic_size_t size;
-  atomic_size_t high_water_mark;
-#else
-  /* MSVC atomic pointers using InterlockedXxx functions */
-  log_queue_entry* volatile head;
-  log_queue_entry* volatile tail;
-  volatile size_t size;
-  volatile size_t high_water_mark;
-#endif
+  log_queue_entry *head;
+  log_queue_entry *tail;
+  size_t size;
   size_t max_size;
+  bool closed;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_t mtx;
+  pthread_cond_t cond;
+#else
+  CRITICAL_SECTION mtx;
+  CONDITION_VARIABLE cond;
+#endif
 } log_queue;
 
 /**
@@ -283,6 +282,11 @@ typedef struct log_rwlock {
 } log_rwlock;
 
 /**
+ * @brief Handler kinds (used to switch text/json output per handler)
+ */
+enum { HANDLER_STDOUT, HANDLER_FILE, HANDLER_SYSLOG, HANDLER_CUSTOM };
+
+/**
  * @brief Output handler
  */
 typedef struct log_handler {
@@ -296,6 +300,7 @@ typedef struct log_handler {
   bool syslog_enabled;
   int syslog_facility;
   bool show_thread_id;
+  int kind;
 } log_handler;
 struct log {
   log_rwlock rwlock;
@@ -305,7 +310,6 @@ struct log {
 
   int level;
   bool quiet;
-  int format_mode;
   size_t max_file_size;
 
   bool async_enabled;
@@ -385,7 +389,15 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
 void log_rotate(log *ctx);
 
 int log_get_stats(log *ctx, log_stats *stats);
-const char* log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size);
+int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size);
+
+/* Advanced pipeline configuration (must be called with no active async logging) */
+typedef struct {
+  log_FormatFn transform;
+  log_LogFn output;
+  void* context;
+} log_stage_function;
+void log_configure_pipeline(log* ctx, log_stage_function* stages, int stage_count);
 
 /* Default context macros */
 #define log_trace(...) log_log(log_default(), LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)

@@ -54,14 +54,14 @@ endif()
 #     target_link_libraries(performance_test PRIVATE logc)
 # endif()
 
-# Optional: Build tests
-# option(BUILD_TESTS "Build test suite" OFF)
-# if(BUILD_TESTS)
-#     enable_testing()
-#     add_executable(test_log src/test_log.c)
-#     target_link_libraries(test_log PRIVATE logc)
-#     add_test(NAME test_log COMMAND test_log)
-# endif()
+# Tests
+option(BUILD_TESTS "Build test suite" ON)
+if(BUILD_TESTS)
+    enable_testing()
+    add_executable(test_suite test/test_suite.c)
+    target_link_libraries(test_suite PRIVATE logc)
+    add_test(NAME test_suite COMMAND test_suite)
+endif()
 
 # Fixes test
 # add_executable(test_fixes src/test_fixes.c)

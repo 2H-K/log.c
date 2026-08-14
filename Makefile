@@ -42,7 +42,7 @@ else
 endif
 
 # ----- Default: build library only -----
-.PHONY: all lib test test_fixes clean
+.PHONY: all lib test test_suite clean
 
 all: $(TARGET)
 
@@ -51,12 +51,17 @@ $(TARGET): src/log.c src/log.h
 	$(CC) $(CFLAGS) -c src/log.c -o log.o
 	$(AR) rcs $@ log.o
 
-# ----- Test executable -----
+# ----- Test executables -----
 test: test$(TEST_EXT)
 
 test$(TEST_EXT): test/test_bug.c src/log.c src/log.h
 	$(CC) $(CFLAGS) -o $@ test/test_bug.c src/log.c $(LDFLAGS)
 
+test_suite: test_suite$(TEST_EXT)
+
+test_suite$(TEST_EXT): test/test_suite.c src/log.c src/log.h
+	$(CC) $(CFLAGS) -o $@ test/test_suite.c src/log.c $(LDFLAGS)
+
 # ----- Clean -----
 clean:
-	$(RM) *.o *.a *.lib $(TARGET) test$(TEST_EXT) test_fixes$(TEST_EXT) 2>nul || true
+	$(RM) *.o *.a *.lib $(TARGET) test$(TEST_EXT) test_suite$(TEST_EXT) 2>nul || true

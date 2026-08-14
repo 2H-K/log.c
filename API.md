@@ -22,7 +22,7 @@ Version 2.0.0
 This is an enhanced logging library for C17 that provides:
 
 - Thread-safe logging with reader-writer locks
-- Asynchronous logging with lock-free queues
+- Asynchronous logging with Asynchronous Queue: dedicated writer thread drains a bounded queue
 - Log file rotation based on size
 - JSON format output for structured logging
 - Dynamic runtime configuration
@@ -152,7 +152,7 @@ log_log(ctx, LOG_INFO, __FILE__, __LINE__, "Value: %d", 42);
 - Thread-safe with reader-writer locks
 - Filters messages below configured level
 - Respects quiet mode setting
-- Supports async mode with lock-free queue
+- Supports async mode with Asynchronous Queue: dedicated writer thread drains a bounded queue
 
 ---
 
@@ -260,7 +260,7 @@ if (log_set_async(ctx, true) != 0) {
 ```
 
 **Notes:**
-- Uses lock-free SPSC queue
+- Uses a bounded queue drained by a writer thread
 - Background thread handles writes
 - Queue drops messages when full
 - Must disable before destroy
@@ -447,11 +447,11 @@ log_handler_set_formatter(ctx, idx, log_format_json);
 
 ### log_format_json()
 
-Formats a log event as JSON.
+Formats a log event as a full JSON line.
 
 **Prototype:**
 ```c
-const char* log_format_json(log *ctx, log_Event *ev, char *buf, size_t buf_size);
+int log_format_json(log *ctx, log_Event *ev, char *buf, size_t buf_size);
 ```
 
 **Parameters:**
@@ -461,7 +461,7 @@ const char* log_format_json(log *ctx, log_Event *ev, char *buf, size_t buf_size)
 - `buf_size`: Buffer size
 
 **Returns:**
-- Pointer to formatted string (same as buf)
+- Number of characters written into `buf` (excluding NUL)
 
 **Example:**
 ```c
@@ -469,7 +469,7 @@ char buf[8192];
 log_Event ev = {0};
 ev.fmt = "Test message";
 ev.level = LOG_INFO;
-const char *json = log_format_json(ctx, &ev, buf, sizeof(buf));
+int n = log_format_json(ctx, &ev, buf, sizeof(buf));
 ```
 
 **Output Format:**
@@ -553,7 +553,7 @@ log_enable_thread_id(ctx, idx, true);
 **Thread Safety:**
 - All public APIs are thread-safe
 - Uses reader-writer locks for configuration
-- Lock-free queue for async mode
+- Asynchronous Queue: dedicated writer thread drains a bounded queue
 - Safe to call from multiple threads
 
 ---
@@ -807,7 +807,7 @@ int main(void) {
     log *ctx = log_create();
 
     // Set JSON format
-    log_set_format(ctx, log_format_json);
+    log_enable_json_format(ctx);
 
     // Add file handler
     FILE *fp = fopen("logs.json", "w");
@@ -940,7 +940,7 @@ int main(void) {
 
     // JSON handler
     FILE *fp_json = fopen("logs.json", "w");
-    log_set_format(ctx, log_format_json);
+    log_enable_json_format(ctx);
     int idx_json = log_add_fp(ctx, fp_json, LOG_INFO);
 
     // Write logs
@@ -982,7 +982,7 @@ int main(void) {
     log_ctx_info(ctx, "Now INFO appears for this handler");
 
     // Switch to JSON format
-    log_set_format(ctx, log_format_json);
+    log_enable_json_format(ctx);
     log_ctx_info(ctx, "This is JSON formatted");
 
     fclose(fp);

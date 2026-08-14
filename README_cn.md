@@ -221,7 +221,7 @@ log_destroy(ctx);
 log *ctx = log_create();
 
 // 设置 JSON 格式
-log_set_format(ctx, log_format_json);
+log_enable_json_format(ctx);
 
 // 添加文件处理器
 FILE *fp = fopen("logs.json", "w");
