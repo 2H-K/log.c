@@ -13,6 +13,7 @@
 #else
 #include <unistd.h>
 #include <sys/stat.h>
+#include <malloc.h>
 #define PATH_SEP "/"
 #endif
 
@@ -151,7 +152,11 @@ void test_wrong_realloc_condition() {
     log_ctx_info(ctx, "%s", msg);
 
     /* 等异步线程处理完 entry */
+#ifdef _WIN32
     Sleep(300);
+#else
+    usleep(300 * 1000);
+#endif
 
     /* 验证 entry->file 是否被错误扩大 */
     /* 注意: queue_pop 返回哑结点, 所以实际 entry 仍在队列 head 中 */
@@ -159,7 +164,11 @@ void test_wrong_realloc_condition() {
     int found = 0;
     while (queued) {
         if (queued->file && queued->msg && strlen(queued->msg) > 0) {
+#ifdef _WIN32
             size_t file_buf_size = _msize(queued->file);
+#else
+            size_t file_buf_size = malloc_usable_size(queued->file);
+#endif
             size_t name_len = strlen(queued->file) + 1;
             printf("  entry->file 内容: \"%s\" (%zu 字节 + null)\n", queued->file, name_len);
             printf("  entry->file 实际缓冲区大小: %zu 字节\n", file_buf_size);

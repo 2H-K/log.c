@@ -24,9 +24,6 @@
  * IN THE SOFTWARE.
  */
 
-#ifdef LOG_PLATFORM_POSIX
-#define _GNU_SOURCE
-#endif
 #include "log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -71,15 +68,6 @@ static double get_timestamp(void) {
 #endif
 }
 
-/* CPU pause instruction for spinlocks */
-static void log_cpu_pause(void) {
-#ifdef __GNUC__
-  __asm__ __volatile__("pause" ::: "memory");
-#elif defined(_MSC_VER)
-  _mm_pause();
-#endif
-}
-
 /* ==================== Atomic operation wrappers ==================== */
 
 #ifdef LOG_USE_MSVC_ATOMIC
@@ -105,6 +93,17 @@ static inline bool atomic_compare_exchange_weak(volatile void* obj, void* expect
 #define LOG_MPOOL_CHUNK_SIZE 64
 #define LOG_MPOOL_MAX_CHUNKS 64
 
+/* Atomic stats helpers (field must be a member of ctx->stats) */
+#ifdef LOG_USE_STDATOMIC
+  #define STAT_INC(f)      atomic_fetch_add(&ctx->stats.f, 1)
+  #define STAT_LOAD(f)     atomic_load(&ctx->stats.f)
+  #define STAT_STORE(f, v) atomic_store(&ctx->stats.f, (v))
+#else
+  #define STAT_INC(f)      InterlockedExchangeAdd64((volatile LONG64*)&ctx->stats.f, 1)
+  #define STAT_LOAD(f)     (ctx->stats.f)
+  #define STAT_STORE(f, v) (ctx->stats.f = (v))
+#endif
+
 static log *DEFAULT_LOG = NULL;
 
 static const char *level_strings[] = {
@@ -122,9 +121,19 @@ static void mpool_init(log_mpool *mp, size_t max_size) {
   mp->allocated = 0;
   mp->max_size = max_size;
   mp->chunk_count = 0;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_init(&mp->mtx, NULL);
+#else
+  InitializeCriticalSection(&mp->mtx);
+#endif
 }
 
 static void mpool_destroy(log_mpool *mp) {
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&mp->mtx);
+#else
+  EnterCriticalSection(&mp->mtx);
+#endif
   while (mp->free_list) {
     log_queue_entry *next = mp->free_list->next;
     free(mp->free_list->msg);
@@ -133,51 +142,103 @@ static void mpool_destroy(log_mpool *mp) {
     mp->free_list = next;
   }
   mp->allocated = 0;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&mp->mtx);
+  pthread_mutex_destroy(&mp->mtx);
+#else
+  LeaveCriticalSection(&mp->mtx);
+  DeleteCriticalSection(&mp->mtx);
+#endif
 }
 
 static log_queue_entry* mpool_alloc(log_mpool *mp) {
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&mp->mtx);
+#else
+  EnterCriticalSection(&mp->mtx);
+#endif
+  log_queue_entry *entry = NULL;
   if (mp->free_list) {
-    log_queue_entry *entry = mp->free_list;
+    entry = mp->free_list;
     mp->free_list = entry->next;
     entry->next = NULL;
-    return entry;
-  }
-  if (mp->allocated >= mp->max_size) {
-    return NULL;
-  }
-  log_queue_entry *entry = calloc(1, sizeof(log_queue_entry));
-  if (entry) {
-    entry->msg = malloc(512);
-    entry->file = malloc(128);
-    if (!entry->msg || !entry->file) {
-      free(entry->msg);
-      free(entry->file);
-      free(entry);
-      return NULL;
+  } else if (mp->allocated < mp->max_size) {
+    entry = calloc(1, sizeof(log_queue_entry));
+    if (entry) {
+      entry->msg = malloc(512);
+      entry->file = malloc(128);
+      if (!entry->msg || !entry->file) {
+        free(entry->msg);
+        free(entry->file);
+        free(entry);
+        entry = NULL;
+      } else {
+        entry->msg[0] = '\0';
+        entry->file[0] = '\0';
+        mp->allocated++;
+      }
     }
-    entry->msg[0] = '\0';
-    entry->file[0] = '\0';
-    mp->allocated++;
   }
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&mp->mtx);
+#else
+  LeaveCriticalSection(&mp->mtx);
+#endif
   return entry;
 }
 
 static void mpool_free(log_mpool *mp, log_queue_entry *entry) {
   if (!entry) return;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&mp->mtx);
+#else
+  EnterCriticalSection(&mp->mtx);
+#endif
   entry->next = mp->free_list;
   mp->free_list = entry;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&mp->mtx);
+#else
+  LeaveCriticalSection(&mp->mtx);
+#endif
 }
 
-static void ts_cache_init(log_ts_cache *cache) {
-  cache->last_timestamp = 0.0;
-  cache->cached_string[0] = '\0';
-  cache->cache_hits = 0;
-  cache->cache_misses = 0;
-}
+static LOG_THREAD_LOCAL log_ts_cache ts_cache_local;
 
-static void format_timestamp(double ts, char *buf, size_t size) {
+/* Format a high-precision timestamp. When use_cache is set, the
+ * "%Y-%m-%dT%H:%M:%S" part is cached per thread and reused while the
+ * whole-second value does not change (avoids localtime + strftime). */
+static void format_timestamp(double ts, char *buf, size_t size, bool use_cache) {
   time_t t = (time_t)ts;
-  struct tm *tm_info = localtime(&t);
+  log_ts_cache *cache = &ts_cache_local;
+  struct tm tm_buf;
+  if (use_cache) {
+    if (cache->cached_string[0] != '\0' && cache->last_timestamp == (double)t) {
+      cache->cache_hits++;
+      snprintf(buf, size, "%s.%03d", cache->cached_string, (int)((ts - (double)t) * 1000));
+      return;
+    }
+#if defined(LOG_PLATFORM_POSIX)
+    struct tm *tm_info = localtime_r(&t, &tm_buf);
+#else
+    struct tm *tm_info = localtime_s(&tm_buf, &t) == 0 ? &tm_buf : NULL;
+#endif
+    if (tm_info) {
+      strftime(cache->cached_string, sizeof(cache->cached_string), "%Y-%m-%dT%H:%M:%S", tm_info);
+      cache->last_timestamp = (double)t;
+      cache->cache_misses++;
+      snprintf(buf, size, "%s.%03d", cache->cached_string, (int)((ts - (double)t) * 1000));
+      return;
+    }
+    cache->cached_string[0] = '\0';
+    buf[0] = '\0';
+    return;
+  }
+#if defined(LOG_PLATFORM_POSIX)
+  struct tm *tm_info = localtime_r(&t, &tm_buf);
+#else
+  struct tm *tm_info = localtime_s(&tm_buf, &t) == 0 ? &tm_buf : NULL;
+#endif
   if (tm_info) {
     strftime(buf, size, "%Y-%m-%dT%H:%M:%S", tm_info);
     int ms = (int)((ts - (double)t) * 1000);
@@ -187,77 +248,59 @@ static void format_timestamp(double ts, char *buf, size_t size) {
   }
 }
 
-/* Reader-Writer Lock Implementation */
+/* ==================== Reader-Writer Lock (platform rwlock) ==================== */
+
 static void rwlock_init(log_rwlock *lock) {
-#ifdef LOG_USE_STDATOMIC
-  atomic_store(&lock->readers, 0);
-  atomic_store(&lock->writer, 0);
-  atomic_store(&lock->write_waiting, false);
+#if defined(LOG_PLATFORM_POSIX)
+#if defined(__GLIBC__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
+  pthread_rwlockattr_t attr;
+  pthread_rwlockattr_init(&attr);
+  pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+  pthread_rwlock_init(&lock->lock, &attr);
+  pthread_rwlockattr_destroy(&attr);
 #else
-  lock->readers = 0;
-  lock->writer = 0;
-  lock->write_waiting = false;
+  pthread_rwlock_init(&lock->lock, NULL);
+#endif
+#else
+  InitializeSRWLock(&lock->lock);
+#endif
+}
+
+static void rwlock_destroy(log_rwlock *lock) {
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_rwlock_destroy(&lock->lock);
 #endif
 }
 
 static void rwlock_read_lock(log_rwlock *lock) {
-  int backoff = 1;
-#ifdef LOG_USE_STDATOMIC
-  while (atomic_load(&lock->writer) || atomic_load(&lock->write_waiting)) {
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_rwlock_rdlock(&lock->lock);
 #else
-  while (lock->writer || lock->write_waiting) {
-#endif
-    for (int i = 0; i < backoff; i++) {
-      log_cpu_pause();
-    }
-    if (backoff < 16) backoff *= 2;
-  }
-#ifdef LOG_USE_STDATOMIC
-  atomic_fetch_add(&lock->readers, 1);
-#else
-  InterlockedIncrement((volatile LONG*)&lock->readers);
+  AcquireSRWLockShared(&lock->lock);
 #endif
 }
 
 static void rwlock_read_unlock(log_rwlock *lock) {
-#ifdef LOG_USE_STDATOMIC
-  atomic_fetch_sub(&lock->readers, 1);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_rwlock_unlock(&lock->lock);
 #else
-  InterlockedDecrement((volatile LONG*)&lock->readers);
+  ReleaseSRWLockShared(&lock->lock);
 #endif
 }
 
 static void rwlock_write_lock(log_rwlock *lock) {
-#ifdef LOG_USE_STDATOMIC
-  atomic_store(&lock->write_waiting, true);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_rwlock_wrlock(&lock->lock);
 #else
-  lock->write_waiting = true;
-#endif
-  int backoff = 1;
-#ifdef LOG_USE_STDATOMIC
-  while (atomic_load(&lock->readers) > 0 || atomic_load(&lock->writer) > 0) {
-#else
-  while (lock->readers > 0 || lock->writer > 0) {
-#endif
-    for (int i = 0; i < backoff; i++) {
-      log_cpu_pause();
-    }
-    if (backoff < 16) backoff *= 2;
-  }
-#ifdef LOG_USE_STDATOMIC
-  atomic_store(&lock->write_waiting, false);
-  atomic_store(&lock->writer, 1);
-#else
-  lock->write_waiting = false;
-  lock->writer = 1;
+  AcquireSRWLockExclusive(&lock->lock);
 #endif
 }
 
 static void rwlock_write_unlock(log_rwlock *lock) {
-#ifdef LOG_USE_STDATOMIC
-  atomic_store(&lock->writer, 0);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_rwlock_unlock(&lock->lock);
 #else
-  lock->writer = 0;
+  ReleaseSRWLockExclusive(&lock->lock);
 #endif
 }
 
@@ -335,28 +378,55 @@ static void queue_init(log_queue *q, size_t max_size) {
   q->size = 0;
   q->max_size = max_size;
   q->closed = false;
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_init(&q->mtx, NULL);
   pthread_cond_init(&q->cond, NULL);
+  pthread_cond_init(&q->space_cond, NULL);
 #else
   InitializeCriticalSection(&q->mtx);
   InitializeConditionVariable(&q->cond);
+  InitializeConditionVariable(&q->space_cond);
 #endif
 }
 
-static bool queue_push(log_queue *q, log_queue_entry *entry) {
-#if LOG_PLATFORM_POSIX
+static bool queue_push(log *ctx, log_queue_entry *entry, bool blocking) {
+  log_queue *q = &ctx->queue;
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&q->mtx);
 #else
   EnterCriticalSection(&q->mtx);
 #endif
-  if (q->closed || q->size >= q->max_size) {
-#if LOG_PLATFORM_POSIX
+  if (q->closed) {
+#if defined(LOG_PLATFORM_POSIX)
     pthread_mutex_unlock(&q->mtx);
 #else
     LeaveCriticalSection(&q->mtx);
 #endif
     return false;
+  }
+  while (q->size >= q->max_size) {
+    if (!blocking) {
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&q->mtx);
+#else
+      LeaveCriticalSection(&q->mtx);
+#endif
+      return false;
+    }
+    STAT_INC(queue_blocked);
+#if defined(LOG_PLATFORM_POSIX)
+    pthread_cond_wait(&q->space_cond, &q->mtx);
+#else
+    SleepConditionVariableCS(&q->space_cond, &q->mtx, INFINITE);
+#endif
+    if (q->closed) {
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&q->mtx);
+#else
+      LeaveCriticalSection(&q->mtx);
+#endif
+      return false;
+    }
   }
   entry->next = NULL;
   if (q->tail) {
@@ -366,7 +436,7 @@ static bool queue_push(log_queue *q, log_queue_entry *entry) {
   }
   q->tail = entry;
   q->size++;
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_cond_signal(&q->cond);
   pthread_mutex_unlock(&q->mtx);
 #else
@@ -377,7 +447,7 @@ static bool queue_push(log_queue *q, log_queue_entry *entry) {
 }
 
 static log_queue_entry* queue_pop(log_queue *q) {
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&q->mtx);
   while (!q->closed && q->size == 0) {
     pthread_cond_wait(&q->cond, &q->mtx);
@@ -392,6 +462,7 @@ static log_queue_entry* queue_pop(log_queue *q) {
     q->tail = NULL;
   }
   q->size--;
+  pthread_cond_signal(&q->space_cond);
   pthread_mutex_unlock(&q->mtx);
   return entry;
 #else
@@ -409,28 +480,31 @@ static log_queue_entry* queue_pop(log_queue *q) {
     q->tail = NULL;
   }
   q->size--;
+  WakeConditionVariable(&q->space_cond);
   LeaveCriticalSection(&q->mtx);
   return entry;
 #endif
 }
 
 static void queue_shutdown(log_queue *q) {
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&q->mtx);
   q->closed = true;
   pthread_cond_broadcast(&q->cond);
+  pthread_cond_broadcast(&q->space_cond);
   pthread_mutex_unlock(&q->mtx);
 #else
   EnterCriticalSection(&q->mtx);
   q->closed = true;
   WakeAllConditionVariable(&q->cond);
+  WakeAllConditionVariable(&q->space_cond);
   LeaveCriticalSection(&q->mtx);
 #endif
 }
 
 /* Reopen a queue that was shut down (used when async is re-enabled). */
 static void queue_reopen(log_queue *q) {
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&q->mtx);
   q->closed = false;
   pthread_mutex_unlock(&q->mtx);
@@ -443,7 +517,7 @@ static void queue_reopen(log_queue *q) {
 
 static void queue_destroy(log_queue *q) {
   if (!q) return;
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&q->mtx);
 #else
   EnterCriticalSection(&q->mtx);
@@ -459,10 +533,11 @@ static void queue_destroy(log_queue *q) {
   q->head = NULL;
   q->tail = NULL;
   q->size = 0;
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_unlock(&q->mtx);
   pthread_mutex_destroy(&q->mtx);
   pthread_cond_destroy(&q->cond);
+  pthread_cond_destroy(&q->space_cond);
 #else
   LeaveCriticalSection(&q->mtx);
   DeleteCriticalSection(&q->mtx);
@@ -494,7 +569,8 @@ static int format_prefix(log *ctx, log_event *ev, char *buf, size_t buf_size,
     return n < 0 ? 0 : n;
   }
   char time_buf[32];
-  format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
+  format_timestamp(ev->timestamp, time_buf, sizeof(time_buf),
+                   ctx && ctx->enable_ts_cache);
 #ifdef LOG_USE_COLOR
   if (use_color) {
     if (show_tid) {
@@ -537,8 +613,8 @@ static void rotate_file(log *ctx, const char *filename) {
   char new_path[512];
   snprintf(new_path, sizeof(new_path), "%s.1", ctx->file_prefix);
   rename(filename, new_path);
-  
-  ctx->stats.rotation_count++;
+
+  STAT_INC(rotation_count);
 }
 
 /* Output handlers */
@@ -589,6 +665,11 @@ static void file_handler_internal(log *ctx, log_event *ev, int handler_idx) {
 
   FILE *fp = ctx->handlers[handler_idx].fp;
   size_t written = fwrite(buf, 1, end + 1, fp);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&ctx->file_mtx);
+#else
+  EnterCriticalSection(&ctx->file_mtx);
+#endif
   ctx->handlers[handler_idx].file_size += written;
 
   if (ctx->handlers[handler_idx].file_size >= ctx->max_file_size) {
@@ -603,6 +684,11 @@ static void file_handler_internal(log *ctx, log_event *ev, int handler_idx) {
       ctx->handlers[handler_idx].file_size = 0;
     }
   }
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&ctx->file_mtx);
+#else
+  LeaveCriticalSection(&ctx->file_mtx);
+#endif
 
   fflush(ev->udata);
   free(msg);
@@ -631,7 +717,8 @@ static void json_handler(log *ctx, log_event *ev) {
   if (!msg) return;
 
   char time_buf[32];
-  format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
+  format_timestamp(ev->timestamp, time_buf, sizeof(time_buf),
+                   ctx && ctx->enable_ts_cache);
 
   char escaped_msg[8192];
   size_t j = 0;
@@ -676,7 +763,7 @@ static void json_handler(log *ctx, log_event *ev) {
 }
 
 /* Async writer thread */
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
 static void* async_writer_thread(void *arg) {
 #else
 static DWORD WINAPI async_writer_thread(LPVOID arg) {
@@ -699,14 +786,15 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
     ev.timestamp = entry->timestamp;
     ev.raw_msg = entry->msg;
 
-    uint64_t total_latency_ops = ctx->stats.total_count > 0 ?
-      (uint64_t)(ctx->stats.avg_queue_latency_ms * ctx->stats.total_count) : 0;
-    ctx->stats.total_count++;
-    if (ctx->stats.total_count > 0) {
-      ctx->stats.avg_queue_latency_ms =
-        (double)(total_latency_ops + (uint64_t)(queue_latency * 1000)) / ctx->stats.total_count;
+    uint64_t tc = STAT_LOAD(total_count);
+    uint64_t total_latency_ops = tc > 0 ?
+      (uint64_t)(STAT_LOAD(avg_queue_latency_ms) * (double)tc) : 0;
+    tc = STAT_INC(total_count) + 1;
+    if (tc > 0) {
+      STAT_STORE(avg_queue_latency_ms,
+        (double)(total_latency_ops + (uint64_t)(queue_latency * 1000)) / (double)tc);
     }
-    ctx->stats.async_writes++;
+    STAT_INC(async_writes);
 
     rwlock_read_lock(&ctx->rwlock);
     for (int i = 0; i < ctx->handler_count; i++) {
@@ -720,7 +808,7 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
     queue_entry_destroy(ctx, entry);
   }
 
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   return NULL;
 #else
   return 0;
@@ -732,22 +820,24 @@ log* log_create(void) {
   log *ctx = calloc(1, sizeof(log));
   if (!ctx) return NULL;
 
+  /* Pre-warm the timezone state once so that concurrent log calls never
+   * race inside glibc's lazily-initialized tzset_internal. */
+  tzset();
+
   rwlock_init(&ctx->rwlock);
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_init(&ctx->mutex, NULL);
+  pthread_mutex_init(&ctx->file_mtx, NULL);
 #else
   InitializeCriticalSection(&ctx->mutex);
+  InitializeCriticalSection(&ctx->file_mtx);
 #endif
 
   ctx->level = LOG_TRACE;
   ctx->quiet = false;
   ctx->max_file_size = LOG_DEFAULT_MAX_SIZE;
   ctx->async_enabled = false;
-#ifdef LOG_USE_STDATOMIC
-  atomic_store(&ctx->async_running, false);
-#else
-  ctx->async_running = false;
-#endif
+  ctx->queue_policy = LOG_QUEUE_FALLBACK_SYNC;
 
   queue_init(&ctx->queue, DEFAULT_QUEUE_SIZE);
 
@@ -757,14 +847,11 @@ log* log_create(void) {
 
   ctx->format_fn = NULL;
 
-  memset(&ctx->stats, 0, sizeof(ctx->stats));
-
   ctx->syslog_ident = NULL;
   ctx->syslog_facility = LOG_USER;
   ctx->syslog_enabled_global = false;
 
   mpool_init(&ctx->mpool, LOG_MPOOL_MAX_CHUNKS * LOG_MPOOL_CHUNK_SIZE);
-  ts_cache_init(&ctx->ts_cache);
   ctx->enable_ts_cache = true;
   ctx->enable_mpool = false;
 
@@ -781,11 +868,6 @@ void log_destroy(log *ctx) {
 
   if (ctx->async_enabled) {
     queue_shutdown(&ctx->queue);
-#ifdef LOG_USE_STDATOMIC
-    atomic_store(&ctx->async_running, false);
-#else
-    ctx->async_running = false;
-#endif
     LOG_THREAD_JOIN(ctx->async_thread);
   }
 
@@ -804,12 +886,15 @@ void log_destroy(log *ctx) {
 
   free(ctx->file_prefix);
   free(ctx->syslog_ident);
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_destroy(&ctx->mutex);
+  pthread_mutex_destroy(&ctx->file_mtx);
 #else
   DeleteCriticalSection(&ctx->mutex);
+  DeleteCriticalSection(&ctx->file_mtx);
 #endif
 
+  rwlock_destroy(&ctx->rwlock);
   mpool_destroy(&ctx->mpool);
   free(ctx);
 }
@@ -850,41 +935,21 @@ int log_set_async(log *ctx, bool enable) {
   if (!ctx) return -1;
   if (enable && !ctx->async_enabled) {
     queue_reopen(&ctx->queue);
-#ifdef LOG_USE_STDATOMIC
-    atomic_store(&ctx->async_running, true);
-#else
-    ctx->async_running = true;
-#endif
     ctx->async_enabled = true;
 #ifdef LOG_PLATFORM_POSIX
     if (LOG_THREAD_CREATE(ctx->async_thread, async_writer_thread, ctx) != 0) {
       ctx->async_enabled = false;
-#ifdef LOG_USE_STDATOMIC
-      atomic_store(&ctx->async_running, false);
-#else
-      ctx->async_running = false;
-#endif
       return -1;
     }
 #elif defined(LOG_PLATFORM_WINDOWS)
     ctx->async_thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)async_writer_thread, ctx, 0, NULL);
     if (ctx->async_thread == NULL) {
       ctx->async_enabled = false;
-#ifdef LOG_USE_STDATOMIC
-      atomic_store(&ctx->async_running, false);
-#else
-      ctx->async_running = false;
-#endif
       return -1;
     }
 #endif
   } else if (!enable && ctx->async_enabled) {
     queue_shutdown(&ctx->queue);
-#ifdef LOG_USE_STDATOMIC
-    atomic_store(&ctx->async_running, false);
-#else
-    ctx->async_running = false;
-#endif
     LOG_THREAD_JOIN(ctx->async_thread);
     ctx->async_enabled = false;
   }
@@ -956,7 +1021,7 @@ void log_set_file_prefix(log *ctx, const char *prefix) {
 
 void log_enable_mpool(log *ctx, bool enable) {
   if (!ctx) return;
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&ctx->mutex);
 #else
   EnterCriticalSection(&ctx->mutex);
@@ -975,7 +1040,7 @@ void log_enable_mpool(log *ctx, bool enable) {
   if (was_async_enabled) {
     log_set_async(ctx, true);
   }
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_unlock(&ctx->mutex);
 #else
   LeaveCriticalSection(&ctx->mutex);
@@ -984,7 +1049,7 @@ void log_enable_mpool(log *ctx, bool enable) {
 
 void log_enable_ts_cache(log *ctx, bool enable) {
   if (!ctx) return;
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&ctx->mutex);
 #else
   EnterCriticalSection(&ctx->mutex);
@@ -999,17 +1064,43 @@ void log_enable_ts_cache(log *ctx, bool enable) {
   if (was_async_enabled) {
     log_set_async(ctx, true);
   }
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_unlock(&ctx->mutex);
 #else
   LeaveCriticalSection(&ctx->mutex);
 #endif
 }
 
+void log_set_queue_policy(log *ctx, int policy) {
+  if (!ctx || policy < LOG_QUEUE_FALLBACK_SYNC || policy > LOG_QUEUE_BLOCK) return;
+  rwlock_write_lock(&ctx->rwlock);
+  ctx->queue_policy = policy;
+  rwlock_write_unlock(&ctx->rwlock);
+}
+
+/* Snapshot the atomic stats into a plain struct (thread-safe) */
+static void stats_snapshot(log *ctx, log_stats *stats) {
+#ifdef LOG_USE_STDATOMIC
+  stats->total_count = STAT_LOAD(total_count);
+  for (int i = 0; i < LOG_LEVELS; i++) {
+    stats->level_counts[i] = STAT_LOAD(level_counts[i]);
+  }
+  stats->queue_drops = STAT_LOAD(queue_drops);
+  stats->queue_blocked = STAT_LOAD(queue_blocked);
+  stats->rotation_count = STAT_LOAD(rotation_count);
+  stats->avg_queue_latency_ms = STAT_LOAD(avg_queue_latency_ms);
+  stats->async_writes = STAT_LOAD(async_writes);
+  stats->sync_writes = STAT_LOAD(sync_writes);
+#else
+  (void)ctx;
+  *stats = ctx->stats;
+#endif
+}
+
 void log_get_perf_stats(log *ctx, log_stats *stats) {
   if (!ctx || !stats) return;
   rwlock_read_lock(&ctx->rwlock);
-  *stats = ctx->stats;
+  stats_snapshot(ctx, stats);
   rwlock_read_unlock(&ctx->rwlock);
 }
 
@@ -1039,6 +1130,7 @@ int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level) {
 
 int log_add_fp(log *ctx, FILE *fp, int level) {
   if (!ctx) return -1;
+  if (ctx->handler_count >= ctx->handler_capacity) return -1;
 
   rwlock_write_lock(&ctx->rwlock);
 
@@ -1077,9 +1169,9 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
     return;
   }
   
-  ctx->stats.total_count++;
+  STAT_INC(total_count);
   if (level >= 0 && level < LOG_LEVELS) {
-    ctx->stats.level_counts[level]++;
+    STAT_INC(level_counts[level]);
   }
   
   log_event ev = {0};
@@ -1094,25 +1186,31 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
     log_queue_entry *entry = queue_entry_create(ctx, &ev);
     va_end(ev.ap);
 
-    if (entry && queue_push(&ctx->queue, entry)) {
-      ctx->stats.async_writes++;
+    bool pushed = entry &&
+      queue_push(ctx, entry, ctx->queue_policy == LOG_QUEUE_BLOCK);
+    if (pushed) {
+      STAT_INC(async_writes);
     } else {
-      ctx->stats.queue_drops++;
+      STAT_INC(queue_drops);
       if (entry) {
         queue_entry_destroy(ctx, entry);
       }
-      va_start(ev.ap, fmt);
-      for (int i = 0; i < ctx->handler_count; i++) {
-        if (ctx->handlers[i].active && ctx->handlers[i].fn && level >= ctx->handlers[i].level) {
-          ev.udata = ctx->handlers[i].udata;
-          ctx->handlers[i].fn(ctx, &ev);
+      if (ctx->queue_policy != LOG_QUEUE_DROP) {
+        /* FALLBACK_SYNC: queue full -> write synchronously (zero loss).
+         * BLOCK: queue closed while waiting -> degrade to synchronous write. */
+        va_start(ev.ap, fmt);
+        for (int i = 0; i < ctx->handler_count; i++) {
+          if (ctx->handlers[i].active && ctx->handlers[i].fn && level >= ctx->handlers[i].level) {
+            ev.udata = ctx->handlers[i].udata;
+            ctx->handlers[i].fn(ctx, &ev);
+          }
         }
+        va_end(ev.ap);
+        STAT_INC(sync_writes);
       }
-      va_end(ev.ap);
-      ctx->stats.sync_writes++;
     }
   } else {
-    ctx->stats.sync_writes++;
+    STAT_INC(sync_writes);
     va_start(ev.ap, fmt);
     for (int i = 0; i < ctx->handler_count; i++) {
       if (ctx->handlers[i].active && ctx->handlers[i].fn && level >= ctx->handlers[i].level) {
@@ -1138,7 +1236,7 @@ int log_get_stats(log *ctx, log_stats *stats) {
   if (!ctx || !stats) return -1;
   
   rwlock_read_lock(&ctx->rwlock);
-  *stats = ctx->stats;
+  stats_snapshot(ctx, stats);
   rwlock_read_unlock(&ctx->rwlock);
   
   return 0;
@@ -1149,7 +1247,8 @@ int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size) {
   if (!msg) return 0;
 
   char time_buf[32];
-  format_timestamp(ev->timestamp, time_buf, sizeof(time_buf));
+  format_timestamp(ev->timestamp, time_buf, sizeof(time_buf),
+                   ctx && ctx->enable_ts_cache);
 
   char escaped_msg[8192];
   size_t j = 0;

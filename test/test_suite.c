@@ -37,7 +37,8 @@ static int count_lines(const char *path) {
 static const char *test_files[] = {
   "t_levels.txt", "t_text.txt", "t_json.txt", "t_custom.txt",
   "t_rot.log", "t_rot.log.1", "t_rot.log.2", "t_rot.log.3", "t_rot.log.4",
-  "t_async.txt", "t_afmt.txt", "t_mt_sync.txt", "t_mt_async.txt", "t_null.txt"
+  "t_async.txt", "t_afmt.txt", "t_mt_sync.txt", "t_mt_async.txt", "t_null.txt",
+  "t_drop.txt", "t_block.txt", "t_fb.txt"
 };
 static void cleanup_test_files(void) {
   for (size_t i = 0; i < sizeof(test_files) / sizeof(test_files[0]); i++) {
@@ -250,6 +251,83 @@ static void test_null_safety(void) {
   CHECK(1, "NULL strings / NULL ctx do not crash");
 }
 
+/* 11. Handler capacity (log_add_fp must not overflow the handler array) */
+static void test_handler_capacity(void) {
+  log *ctx = log_create();
+  int idx = -1, rejected = 0, accepted = 0;
+  for (int i = 0; i < 64; i++) {
+    idx = log_add_fp(ctx, NULL, LOG_INFO);
+    if (idx < 0) rejected++;
+    else accepted++;
+  }
+  CHECK(accepted == 31, "31 extra handlers accepted (capacity 32 minus stdout)");
+  CHECK(rejected == 33, "further handlers rejected, no overflow");
+  log_destroy(ctx);
+}
+
+/* 12. Queue policy: DROP (queue full -> message dropped, caller never blocks) */
+#define QPOL_N 50000
+static void test_queue_drop(void) {
+  FILE *fp = fopen("t_drop.txt", "w");
+  log *ctx = log_create();
+  log_add_fp(ctx, fp, LOG_INFO);
+  ctx->handlers[0].active = false;
+  ctx->queue.max_size = 8;
+  log_set_queue_policy(ctx, LOG_QUEUE_DROP);
+  log_set_async(ctx, true);
+  for (int i = 0; i < QPOL_N; i++) {
+    log_ctx_info(ctx, "m%d", i);
+  }
+  log_set_async(ctx, false);
+  fclose(fp);
+  log_destroy(ctx);
+  int lines = count_lines("t_drop.txt");
+  CHECK(lines < QPOL_N, "DROP: overloaded queue loses messages");
+  CHECK(lines > 0, "DROP: some messages still delivered");
+}
+
+/* 13. Queue policy: BLOCK (queue full -> producer waits, zero loss) */
+static void test_queue_block(void) {
+  FILE *fp = fopen("t_block.txt", "w");
+  log *ctx = log_create();
+  log_add_fp(ctx, fp, LOG_INFO);
+  ctx->handlers[0].active = false;
+  ctx->queue.max_size = 8;
+  log_set_queue_policy(ctx, LOG_QUEUE_BLOCK);
+  log_set_async(ctx, true);
+  for (int i = 0; i < QPOL_N; i++) {
+    log_ctx_info(ctx, "m%d", i);
+  }
+  log_set_async(ctx, false);
+  log_stats st = {0};
+  log_get_stats(ctx, &st);
+  fclose(fp);
+  log_destroy(ctx);
+  CHECK(count_lines("t_block.txt") == QPOL_N, "BLOCK: every message written (zero loss)");
+  CHECK(st.queue_drops == 0, "BLOCK: no drops");
+  CHECK(st.sync_writes == 0, "BLOCK: no sync fallback");
+}
+
+/* 14. Queue policy: FALLBACK_SYNC (default, zero loss via sync writes) */
+static void test_queue_fallback(void) {
+  FILE *fp = fopen("t_fb.txt", "w");
+  log *ctx = log_create();
+  log_add_fp(ctx, fp, LOG_INFO);
+  ctx->handlers[0].active = false;
+  ctx->queue.max_size = 8;
+  log_set_async(ctx, true);
+  for (int i = 0; i < QPOL_N; i++) {
+    log_ctx_info(ctx, "m%d", i);
+  }
+  log_set_async(ctx, false);
+  log_stats st = {0};
+  log_get_stats(ctx, &st);
+  fclose(fp);
+  log_destroy(ctx);
+  CHECK(count_lines("t_fb.txt") == QPOL_N, "FALLBACK: zero loss via synchronous writes");
+  CHECK(st.sync_writes > 0, "FALLBACK: sync fallback was exercised");
+}
+
 int main(void) {
   cleanup_test_files();
   test_levels();
@@ -262,6 +340,10 @@ int main(void) {
   test_multithread();
   test_path_safety();
   test_null_safety();
+  test_handler_capacity();
+  test_queue_drop();
+  test_queue_block();
+  test_queue_fallback();
   cleanup_test_files();
 
   printf("\n%d tests, %d failure(s)\n", g_tests, g_fails);

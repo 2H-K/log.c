@@ -9,19 +9,22 @@
 #ifndef LOG_H
 #define LOG_H
 
+/* Platform detection (must precede feature-test macros and system headers) */
+#if defined(_WIN32) || defined(_WIN64)
+  #define LOG_PLATFORM_WINDOWS
+#else
+  #define LOG_PLATFORM_POSIX
+  #if !defined(_GNU_SOURCE)
+    #define _GNU_SOURCE
+  #endif
+#endif
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <time.h>
 #include <stdint.h>
 #include <string.h>
-
-/* Platform detection */
-#if defined(_WIN32) || defined(_WIN64)
-  #define LOG_PLATFORM_WINDOWS
-#else
-  #define LOG_PLATFORM_POSIX
-#endif
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(_MSC_VER)
   #define LOG_USE_STDATOMIC 1
@@ -47,7 +50,7 @@
   #error "C11 or later with stdatomic.h required, or MSVC"
 #endif
 
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   #include <pthread.h>
   #include <unistd.h>
   #include <sys/param.h>
@@ -95,9 +98,16 @@ enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL, LOG_LEVEL
 
 enum { LOG_FORMAT_TEXT, LOG_FORMAT_JSON };
 
+/* Queue full handling policy (async mode) */
+enum {
+  LOG_QUEUE_FALLBACK_SYNC = 0,  /* Queue full -> write synchronously (default) */
+  LOG_QUEUE_DROP,               /* Queue full -> drop the message */
+  LOG_QUEUE_BLOCK               /* Queue full -> block until space is available */
+};
+
 #define LOG_USE_COLOR
 
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   #include <syslog.h>
   #ifdef LOG_EMERG
     #undef LOG_EMERG
@@ -194,16 +204,28 @@ typedef struct log_config {
 } log_config;
 
 /**
- * @brief Performance statistics
+ * @brief Performance statistics (atomic counters, safe for concurrent readers)
  */
 typedef struct log_stats {
-  uint64_t total_count;
-  uint64_t level_counts[LOG_LEVELS];
-  uint64_t queue_drops;
-  uint64_t rotation_count;
-  double avg_queue_latency_ms;
-  uint64_t async_writes;
-  uint64_t sync_writes;
+#ifdef LOG_USE_STDATOMIC
+  atomic_uint_fast64_t total_count;
+  atomic_uint_fast64_t level_counts[LOG_LEVELS];
+  atomic_uint_fast64_t queue_drops;
+  atomic_uint_fast64_t queue_blocked;
+  atomic_uint_fast64_t rotation_count;
+  _Atomic(double) avg_queue_latency_ms;
+  atomic_uint_fast64_t async_writes;
+  atomic_uint_fast64_t sync_writes;
+#else
+  volatile uint64_t total_count;
+  volatile uint64_t level_counts[LOG_LEVELS];
+  volatile uint64_t queue_drops;
+  volatile uint64_t queue_blocked;
+  volatile uint64_t rotation_count;
+  volatile double avg_queue_latency_ms;
+  volatile uint64_t async_writes;
+  volatile uint64_t sync_writes;
+#endif
 } log_stats;
 
 /**
@@ -226,6 +248,11 @@ typedef struct log_mpool {
   size_t allocated;
   size_t max_size;
   size_t chunk_count;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_t mtx;
+#else
+  CRITICAL_SECTION mtx;
+#endif
 } log_mpool;
 
 /**
@@ -249,7 +276,7 @@ typedef struct log_ts_cache {
 } log_ts_cache;
 
 /**
- * @brief Log queue structure (mutex + condition variable for async mode)
+ * @brief Log queue structure (mutex + condition variables for async mode)
  */
 typedef struct log_queue {
   log_queue_entry *head;
@@ -260,24 +287,22 @@ typedef struct log_queue {
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_t mtx;
   pthread_cond_t cond;
+  pthread_cond_t space_cond;
 #else
   CRITICAL_SECTION mtx;
   CONDITION_VARIABLE cond;
+  CONDITION_VARIABLE space_cond;
 #endif
 } log_queue;
 
 /**
- * @brief Reader-writer lock structure (lightweight)
+ * @brief Reader-writer lock structure (wraps the platform rwlock)
  */
 typedef struct log_rwlock {
-#ifdef LOG_USE_STDATOMIC
-  _Atomic(int) readers;
-  _Atomic(int) writer;
-  _Atomic(bool) write_waiting;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_rwlock_t lock;
 #else
-  volatile int readers;
-  volatile int writer;
-  volatile bool write_waiting;
+  SRWLOCK lock;
 #endif
 } log_rwlock;
 
@@ -313,13 +338,9 @@ struct log {
   size_t max_file_size;
 
   bool async_enabled;
+  int queue_policy;
   log_queue queue;
   LOG_THREAD_T async_thread;
-#ifdef LOG_USE_STDATOMIC
-  atomic_bool async_running;
-#else
-  volatile bool async_running;
-#endif
 
   log_handler *handlers;
   int handler_count;
@@ -328,18 +349,15 @@ struct log {
   log_FormatFn format_fn;
 
   log_stats stats;
-#ifdef LOG_USE_STDATOMIC
-  atomic_uint_fast64_t last_timestamp;
-#else
-  volatile uint64_t last_timestamp;
-#endif
 
   char *file_prefix;
 
-#if LOG_PLATFORM_POSIX
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_t mutex;
+  pthread_mutex_t file_mtx;
 #else
   CRITICAL_SECTION mutex;
+  CRITICAL_SECTION file_mtx;
 #endif
 
   char *syslog_ident;
@@ -347,9 +365,8 @@ struct log {
   bool syslog_enabled_global;
 
   log_mpool mpool;
-  log_ts_cache ts_cache;
-  bool enable_ts_cache;
   bool enable_mpool;
+  bool enable_ts_cache;
 };
 
 /* Core functions */
@@ -363,6 +380,7 @@ void log_set_level(log *ctx, int level);
 void log_set_quiet(log *ctx, bool enable);
 void log_set_format(log *ctx, log_FormatFn fn);
 int log_set_async(log *ctx, bool enable);
+void log_set_queue_policy(log *ctx, int policy);
 void log_set_max_file_size(log *ctx, size_t size);
 void log_set_file_prefix(log *ctx, const char *prefix);
 /* Performance optimization functions */

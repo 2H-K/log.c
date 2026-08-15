@@ -29,7 +29,7 @@ ifneq ($(CC),cl)
     LDFLAGS  = -lpthread
   endif
   CFLAGS  += -std=c11 -Wall -Wextra -I src
-  TEST_EXT = .exe
+  TEST_EXT =
 else
   # MSVC cl.exe path
   LIB_PFX  =
@@ -42,7 +42,7 @@ else
 endif
 
 # ----- Default: build library only -----
-.PHONY: all lib test test_suite clean
+.PHONY: all lib test test_suite tsan clean
 
 all: $(TARGET)
 
@@ -52,9 +52,11 @@ $(TARGET): src/log.c src/log.h
 	$(AR) rcs $@ log.o
 
 # ----- Test executables -----
-test: test$(TEST_EXT)
+# NOTE: the binary is named test_bug (not test) so it does not collide
+# with the test/ source directory on POSIX systems.
+test: test_bug$(TEST_EXT)
 
-test$(TEST_EXT): test/test_bug.c src/log.c src/log.h
+test_bug$(TEST_EXT): test/test_bug.c src/log.c src/log.h
 	$(CC) $(CFLAGS) -o $@ test/test_bug.c src/log.c $(LDFLAGS)
 
 test_suite: test_suite$(TEST_EXT)
@@ -62,6 +64,11 @@ test_suite: test_suite$(TEST_EXT)
 test_suite$(TEST_EXT): test/test_suite.c src/log.c src/log.h
 	$(CC) $(CFLAGS) -o $@ test/test_suite.c src/log.c $(LDFLAGS)
 
+# ThreadSanitizer build: detects data races in multithreaded tests
+tsan: test/test_suite.c src/log.c src/log.h
+	$(CC) $(CFLAGS) -fsanitize=thread -g -O1 -o tsan_test test/test_suite.c src/log.c $(LDFLAGS)
+	./tsan_test
+
 # ----- Clean -----
 clean:
-	$(RM) *.o *.a *.lib $(TARGET) test$(TEST_EXT) test_suite$(TEST_EXT) 2>nul || true
+	$(RM) *.o *.a *.lib $(TARGET) test_bug$(TEST_EXT) test_suite$(TEST_EXT) tsan_test 2>nul || true
