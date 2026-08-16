@@ -270,7 +270,7 @@ static void test_queue_drop(void) {
   log *ctx = log_create();
   log_add_fp(ctx, fp, LOG_INFO);
   ctx->handlers[0].active = false;
-  ctx->queue.max_size = 8;
+  log_set_queue_size(ctx, 1);
   log_set_queue_policy(ctx, LOG_QUEUE_DROP);
   log_set_async(ctx, true);
   for (int i = 0; i < QPOL_N; i++) {
@@ -290,7 +290,7 @@ static void test_queue_block(void) {
   log *ctx = log_create();
   log_add_fp(ctx, fp, LOG_INFO);
   ctx->handlers[0].active = false;
-  ctx->queue.max_size = 8;
+  log_set_queue_size(ctx, 2);
   log_set_queue_policy(ctx, LOG_QUEUE_BLOCK);
   log_set_async(ctx, true);
   for (int i = 0; i < QPOL_N; i++) {
@@ -312,7 +312,7 @@ static void test_queue_fallback(void) {
   log *ctx = log_create();
   log_add_fp(ctx, fp, LOG_INFO);
   ctx->handlers[0].active = false;
-  ctx->queue.max_size = 8;
+  log_set_queue_size(ctx, 2);
   log_set_async(ctx, true);
   for (int i = 0; i < QPOL_N; i++) {
     log_ctx_info(ctx, "m%d", i);

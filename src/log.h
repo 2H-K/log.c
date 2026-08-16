@@ -207,26 +207,29 @@ typedef struct log_config {
  * @brief Performance statistics (atomic counters, safe for concurrent readers)
  */
 typedef struct log_stats {
-#ifdef LOG_USE_STDATOMIC
-  atomic_uint_fast64_t total_count;
-  atomic_uint_fast64_t level_counts[LOG_LEVELS];
-  atomic_uint_fast64_t queue_drops;
-  atomic_uint_fast64_t queue_blocked;
-  atomic_uint_fast64_t rotation_count;
-  _Atomic(double) avg_queue_latency_ms;
-  atomic_uint_fast64_t async_writes;
-  atomic_uint_fast64_t sync_writes;
-#else
-  volatile uint64_t total_count;
-  volatile uint64_t level_counts[LOG_LEVELS];
-  volatile uint64_t queue_drops;
-  volatile uint64_t queue_blocked;
-  volatile uint64_t rotation_count;
-  volatile double avg_queue_latency_ms;
-  volatile uint64_t async_writes;
-  volatile uint64_t sync_writes;
-#endif
+  uint64_t total_count;
+  uint64_t level_counts[LOG_LEVELS];
+  uint64_t queue_drops;
+  uint64_t queue_blocked;
+  uint64_t rotation_count;
+  double avg_queue_latency_ms;
+  uint64_t async_writes;
+  uint64_t sync_writes;
 } log_stats;
+
+/**
+ * @brief Per-thread statistics (cache-line aligned to prevent false sharing)
+ */
+typedef struct log_thread_stats {
+  uint64_t total_count;
+  uint64_t level_counts[LOG_LEVELS];
+  uint64_t queue_drops;
+  uint64_t queue_blocked;
+  uint64_t rotation_count;
+  uint64_t async_writes;
+  uint64_t sync_writes;
+  uint64_t padding[4];
+} __attribute__((aligned(64))) log_thread_stats;
 
 /**
  * @brief Log queue entry for async mode
@@ -254,6 +257,50 @@ typedef struct log_mpool {
   CRITICAL_SECTION mtx;
 #endif
 } log_mpool;
+
+/**
+ * @brief Per-thread arena allocator (bump allocator, zero contention)
+ */
+typedef struct log_arena {
+  char *buffer;
+  size_t offset;
+  size_t capacity;
+  struct log_arena *next;
+} log_arena;
+
+/**
+ * @brief Ring buffer entry (pre-allocated, cache-friendly)
+ */
+typedef struct log_ring_entry {
+  char msg[512];
+  char file[128];
+  int level;
+  int line;
+  double timestamp;
+  bool has_large_msg;
+  bool has_large_file;
+} log_ring_entry;
+
+/**
+ * @brief Lock-free ring buffer for async logging
+ */
+typedef struct log_ring_queue {
+  log_ring_entry *buffer;
+  size_t capacity;
+  size_t mask;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_t mtx;
+  pthread_cond_t cond;
+  pthread_cond_t space_cond;
+#else
+  CRITICAL_SECTION mtx;
+  CONDITION_VARIABLE cond;
+  CONDITION_VARIABLE space_cond;
+#endif
+  atomic_size_t head;
+  atomic_size_t tail;
+  bool closed;
+} log_ring_queue;
 
 /**
  * @brief Fixed-size buffer for thread-local formatting (avoids stack allocation)
@@ -294,6 +341,11 @@ typedef struct log_queue {
   CONDITION_VARIABLE space_cond;
 #endif
 } log_queue;
+
+/**
+ * @brief Clock source selection for timestamp generation
+ */
+enum { LOG_CLOCK_REALTIME, LOG_CLOCK_REALTIME_COARSE, LOG_CLOCK_MONOTONIC, LOG_CLOCK_MONOTONIC_COARSE };
 
 /**
  * @brief Reader-writer lock structure (wraps the platform rwlock)
@@ -368,6 +420,10 @@ struct log {
   log_mpool mpool;
   bool enable_mpool;
   bool enable_ts_cache;
+
+  log_ring_queue ring_queue;
+  bool use_ring_queue;
+  int clock_source;
 };
 
 /* Core functions */
@@ -388,6 +444,9 @@ void log_set_file_prefix(log *ctx, const char *prefix);
 void log_enable_mpool(log *ctx, bool enable);
 void log_enable_ts_cache(log *ctx, bool enable);
 void log_get_perf_stats(log *ctx, log_stats *stats);
+void log_enable_ring_queue(log *ctx, bool enable);
+void log_set_clock_source(log *ctx, int clock_source);
+void log_set_queue_size(log *ctx, size_t size);
 
 int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
 int log_add_fp(log *ctx, FILE *fp, int level);
