@@ -326,6 +326,7 @@ typedef struct log_handler {
   int syslog_facility;
   bool show_thread_id;
   int kind;
+  bool owns_file;
 } log_handler;
 struct log {
   log_rwlock rwlock;
@@ -390,6 +391,7 @@ void log_get_perf_stats(log *ctx, log_stats *stats);
 
 int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
 int log_add_fp(log *ctx, FILE *fp, int level);
+int log_add_file(log *ctx, const char *filename, int level);
 void log_remove_handler(log *ctx, int idx);
 
 /* Thread ID and Syslog support */

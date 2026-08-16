@@ -333,8 +333,10 @@ static log_queue_entry* queue_entry_create(log *ctx, log_event *ev) {
       if (!new_file) goto fail;
       entry->file = new_file;
     }
-    strncpy(entry->file, ev->file ? ev->file : "", 127);
-    entry->file[127] = '\0';
+    if (ev->file) {
+      memcpy(entry->file, ev->file, file_len);
+    }
+    entry->file[file_len] = '\0';
   } else {
     entry->msg = malloc((size_t)len + 1);
     if (!entry->msg) goto fail;
@@ -649,22 +651,23 @@ static void file_handler_internal(log *ctx, log_event *ev, int handler_idx) {
   char *msg = format_message(ev);
   if (!msg) return;
 
-  char buf[8192];
-  int len = format_prefix(ctx, ev, buf, sizeof(buf) - 2,
-                          ctx->handlers[handler_idx].show_thread_id, false);
-  if (len < 0) { free(msg); return; }
-  if ((size_t)len >= sizeof(buf)) len = (int)sizeof(buf) - 2;
+  char prefix[512];
+  int prefix_len = format_prefix(ctx, ev, prefix, sizeof(prefix),
+                                 ctx->handlers[handler_idx].show_thread_id, false);
+  if (prefix_len < 0) { free(msg); return; }
+  if ((size_t)prefix_len >= sizeof(prefix)) prefix_len = (int)sizeof(prefix) - 1;
 
   size_t msg_len = strlen(msg);
-  size_t avail = sizeof(buf) - 2 - (size_t)len;
-  size_t copy = msg_len < avail ? msg_len : avail;
-  memcpy(buf + len, msg, copy);
-  size_t end = (size_t)len + copy;
-  buf[end] = '\n';
-  buf[end + 1] = '\0';
+  size_t total = (size_t)prefix_len + msg_len + 2;
+  char *buf = malloc(total);
+  if (!buf) { free(msg); return; }
+  memcpy(buf, prefix, prefix_len);
+  memcpy(buf + prefix_len, msg, msg_len);
+  buf[prefix_len + msg_len] = '\n';
+  buf[prefix_len + msg_len + 1] = '\0';
 
   FILE *fp = ctx->handlers[handler_idx].fp;
-  size_t written = fwrite(buf, 1, end + 1, fp);
+  size_t written = fwrite(buf, 1, total - 1, fp);
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&ctx->file_mtx);
 #else
@@ -673,14 +676,18 @@ static void file_handler_internal(log *ctx, log_event *ev, int handler_idx) {
   ctx->handlers[handler_idx].file_size += written;
 
   if (ctx->handlers[handler_idx].file_size >= ctx->max_file_size) {
-    fflush(fp);
-    if (fp != stderr && fp != stdout) {
-      fclose(fp);
-    }
-    rotate_file(ctx, ctx->file_prefix);
+    if (ctx->handlers[handler_idx].owns_file) {
+      fflush(fp);
+      if (fp != stderr && fp != stdout) {
+        fclose(fp);
+      }
+      rotate_file(ctx, ctx->file_prefix);
 
-    ctx->handlers[handler_idx].fp = fopen(ctx->file_prefix, "a");
-    if (ctx->handlers[handler_idx].fp) {
+      ctx->handlers[handler_idx].fp = fopen(ctx->file_prefix, "a");
+      if (ctx->handlers[handler_idx].fp) {
+        ctx->handlers[handler_idx].file_size = 0;
+      }
+    } else {
       ctx->handlers[handler_idx].file_size = 0;
     }
   }
@@ -691,6 +698,7 @@ static void file_handler_internal(log *ctx, log_event *ev, int handler_idx) {
 #endif
 
   fflush(ev->udata);
+  free(buf);
   free(msg);
 }
 
@@ -720,15 +728,25 @@ static void json_handler(log *ctx, log_event *ev) {
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf),
                    ctx && ctx->enable_ts_cache);
 
-  char escaped_msg[8192];
-  size_t j = 0;
-  for (size_t i = 0; msg[i] && j < sizeof(escaped_msg) - 1; i++) {
+  size_t msg_len = strlen(msg);
+  size_t esc_len = 0;
+  for (size_t i = 0; i < msg_len; i++) {
     switch (msg[i]) {
-      case '"':  if (j < sizeof(escaped_msg) - 2) { escaped_msg[j++] = '\\'; escaped_msg[j++] = '"'; } break;
-      case '\\': if (j < sizeof(escaped_msg) - 2) { escaped_msg[j++] = '\\'; escaped_msg[j++] = '\\'; } break;
-      case '\n': if (j < sizeof(escaped_msg) - 2) { escaped_msg[j++] = '\\'; escaped_msg[j++] = 'n'; } break;
-      case '\r': if (j < sizeof(escaped_msg) - 2) { escaped_msg[j++] = '\\'; escaped_msg[j++] = 'r'; } break;
-      case '\t': if (j < sizeof(escaped_msg) - 2) { escaped_msg[j++] = '\\'; escaped_msg[j++] = 't'; } break;
+      case '"': case '\\': case '\n': case '\r': case '\t': esc_len += 2; break;
+      default: esc_len += 1; break;
+    }
+  }
+
+  char *escaped_msg = malloc(esc_len + 1);
+  if (!escaped_msg) { free(msg); return; }
+  size_t j = 0;
+  for (size_t i = 0; i < msg_len; i++) {
+    switch (msg[i]) {
+      case '"':  escaped_msg[j++] = '\\'; escaped_msg[j++] = '"'; break;
+      case '\\': escaped_msg[j++] = '\\'; escaped_msg[j++] = '\\'; break;
+      case '\n': escaped_msg[j++] = '\\'; escaped_msg[j++] = 'n'; break;
+      case '\r': escaped_msg[j++] = '\\'; escaped_msg[j++] = 'r'; break;
+      case '\t': escaped_msg[j++] = '\\'; escaped_msg[j++] = 't'; break;
       default:   escaped_msg[j++] = msg[i]; break;
     }
   }
@@ -745,21 +763,37 @@ static void json_handler(log *ctx, log_event *ev) {
     }
   }
 
-  char buf[8192];
+  const char *file_str = ev->file ? ev->file : "";
+  const char *lvl_str = level_strings[ev->level];
+  int line_val = ev->line;
+
+  size_t needed = 0;
   if (show_tid) {
-    snprintf(buf, sizeof(buf),
+    needed = snprintf(NULL, 0,
       "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"thread_id\": %lu, \"message\": \"%s\"}",
-      time_buf, level_strings[ev->level],
-      ev->file ? ev->file : "", ev->line, LOG_GET_THREAD_ID(), escaped_msg);
+      time_buf, lvl_str, file_str, line_val, LOG_GET_THREAD_ID(), escaped_msg);
   } else {
-    snprintf(buf, sizeof(buf),
+    needed = snprintf(NULL, 0,
       "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"}",
-      time_buf, level_strings[ev->level],
-      ev->file ? ev->file : "", ev->line, escaped_msg);
+      time_buf, lvl_str, file_str, line_val, escaped_msg);
+  }
+
+  char *buf = malloc(needed + 2);
+  if (!buf) { free(escaped_msg); return; }
+  if (show_tid) {
+    snprintf(buf, needed + 1,
+      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"thread_id\": %lu, \"message\": \"%s\"}",
+      time_buf, lvl_str, file_str, line_val, LOG_GET_THREAD_ID(), escaped_msg);
+  } else {
+    snprintf(buf, needed + 1,
+      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"}",
+      time_buf, lvl_str, file_str, line_val, escaped_msg);
   }
 
   fprintf(ev->udata, "%s\n", buf);
   fflush(ev->udata);
+  free(escaped_msg);
+  free(buf);
 }
 
 /* Async writer thread */
@@ -858,6 +892,7 @@ log* log_create(void) {
   log_add_handler(ctx, stdout_handler, stderr, LOG_TRACE);
   if (ctx->handler_count > 0) {
     ctx->handlers[0].kind = HANDLER_STDOUT;
+    ctx->handlers[0].owns_file = false;
   }
 
   return ctx;
@@ -880,6 +915,12 @@ void log_destroy(log *ctx) {
 #endif
 
   for (int i = 0; i < ctx->handler_count; i++) {
+    if (ctx->handlers[i].owns_file && ctx->handlers[i].fp) {
+      fflush(ctx->handlers[i].fp);
+      if (ctx->handlers[i].fp != stderr && ctx->handlers[i].fp != stdout) {
+        fclose(ctx->handlers[i].fp);
+      }
+    }
     free(ctx->handlers[i].filename);
   }
   free(ctx->handlers);
@@ -1146,6 +1187,34 @@ int log_add_fp(log *ctx, FILE *fp, int level) {
   h->syslog_facility = LOG_USER;
   h->show_thread_id = false;
   h->kind = HANDLER_FILE;
+  h->owns_file = false;
+
+  rwlock_write_unlock(&ctx->rwlock);
+  return ctx->handler_count - 1;
+}
+
+int log_add_file(log *ctx, const char *filename, int level) {
+  if (!ctx || !filename) return -1;
+  if (ctx->handler_count >= ctx->handler_capacity) return -1;
+
+  FILE *fp = fopen(filename, "a");
+  if (!fp) return -1;
+
+  rwlock_write_lock(&ctx->rwlock);
+
+  log_handler *h = &ctx->handlers[ctx->handler_count++];
+  h->fn = file_handler_wrapper;
+  h->udata = fp;
+  h->fp = fp;
+  h->level = level;
+  h->active = true;
+  h->filename = strdup(filename);
+  h->file_size = 0;
+  h->syslog_enabled = false;
+  h->syslog_facility = LOG_USER;
+  h->show_thread_id = false;
+  h->kind = HANDLER_FILE;
+  h->owns_file = true;
 
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;

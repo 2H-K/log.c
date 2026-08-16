@@ -131,16 +131,14 @@ static void test_custom_format(void) {
 
 /* 5. Rotation */
 static void test_rotation(void) {
-  FILE *fp = fopen("t_rot.log", "w");
   log *ctx = log_create();
-  log_add_fp(ctx, fp, LOG_INFO);
+  log_add_file(ctx, "t_rot.log", LOG_INFO);
   ctx->handlers[0].active = false;
   log_set_file_prefix(ctx, "t_rot.log");
   log_set_max_file_size(ctx, 1024);
   for (int i = 0; i < 5000; i++) {
     log_ctx_info(ctx, "line %d padding padding padding", i);
   }
-  fclose(fp);
   log_destroy(ctx);
   FILE *r1 = fopen("t_rot.log.1", "r");
   CHECK(r1 != NULL, "rotation produced .1");
