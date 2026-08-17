@@ -1383,6 +1383,7 @@ void log_set_quiet(log *ctx, bool enable) {
 }
 
 void log_set_format(log *ctx, log_FormatFn fn) {
+  if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->format_fn = fn;
   rwlock_write_unlock(&ctx->rwlock);
@@ -1418,6 +1419,7 @@ int log_set_async(log *ctx, bool enable) {
 }
 
 void log_set_max_file_size(log *ctx, size_t size) {
+  if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->max_file_size = size;
   rwlock_write_unlock(&ctx->rwlock);
@@ -1460,6 +1462,7 @@ static int is_path_safe(const char *path) {
 }
 
 void log_set_file_prefix(log *ctx, const char *prefix) {
+  if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
 
   const char *safe_prefix = prefix ? prefix : "log";
@@ -1603,7 +1606,7 @@ int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level) {
 }
 
 int log_add_fp(log *ctx, FILE *fp, int level) {
-  if (!ctx) return -1;
+  if (!ctx || !fp) return -1;
   if (ctx->handler_count >= ctx->handler_capacity) return -1;
 
   rwlock_write_lock(&ctx->rwlock);
@@ -1890,13 +1893,13 @@ void log_enable_thread_id(log *ctx, int handler_idx, bool enable) {
 #if LOG_HAVE_SYSLOG
 int log_level_to_syslog(int level) {
   switch (level) {
-    case LOG_TRACE: return LOG_DEBUG;
-    case LOG_DEBUG: return LOG_DEBUG;
-    case LOG_INFO:  return LOG_INFO;
-    case LOG_WARN:  return LOG_SYSLOG_WARNING;
-    case LOG_ERROR: return LOG_SYSLOG_ERR;
-    case LOG_FATAL: return LOG_SYSLOG_CRIT;
-    default:        return LOG_INFO;
+    case LOG_TRACE: return 7; /* LOG_DEBUG */
+    case LOG_DEBUG: return 7; /* LOG_DEBUG */
+    case LOG_INFO:  return 6; /* LOG_INFO */
+    case LOG_WARN:  return 4; /* LOG_WARNING */
+    case LOG_ERROR: return 3; /* LOG_ERR */
+    case LOG_FATAL: return 2; /* LOG_CRIT */
+    default:        return 6; /* LOG_INFO */
   }
 }
 

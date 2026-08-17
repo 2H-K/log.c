@@ -19,14 +19,8 @@ if(ENABLE_LOG_COLOR)
 endif()
 
 # Source files
-set(SOURCES
-    src/log.c
-)
-
-# Header files
-set(HEADERS
-    src/log.h
-)
+set(SOURCES src/log.c)
+set(HEADERS src/log.h)
 
 # Static library
 add_library(logc STATIC ${SOURCES} ${HEADERS})
@@ -41,22 +35,39 @@ if(NOT WIN32)
     target_link_libraries(logc PUBLIC Threads::Threads)
 endif()
 
+# Test framework
+add_library(test_harness STATIC tests/test_harness.c)
+target_include_directories(test_harness PUBLIC tests)
+
 # Tests
 option(BUILD_TESTS "Build test suite" ON)
 if(BUILD_TESTS)
     enable_testing()
 
-    add_executable(benchmark tests/benchmark.c)
-    target_link_libraries(benchmark PRIVATE logc)
-    add_test(NAME benchmark COMMAND benchmark)
+    # Core tests (no threading)
+    add_executable(test_core tests/core.c)
+    target_link_libraries(test_core PRIVATE logc test_harness)
+    add_test(NAME test_core COMMAND test_core)
 
-    add_executable(feature_test tests/feature_test.c)
-    target_link_libraries(feature_test PRIVATE logc)
-    add_test(NAME feature_test COMMAND feature_test)
+    # Thread safety tests
+    add_executable(test_thread tests/thread.c)
+    target_link_libraries(test_thread PRIVATE logc test_harness Threads::Threads)
+    add_test(NAME test_thread COMMAND test_thread)
 
-    add_executable(thread_test tests/thread_test.c)
-    target_link_libraries(thread_test PRIVATE logc)
-    add_test(NAME thread_test COMMAND thread_test)
+    # Stress tests
+    add_executable(test_stress tests/stress.c)
+    target_link_libraries(test_stress PRIVATE logc test_harness Threads::Threads)
+    add_test(NAME test_stress COMMAND test_stress)
+
+    # Platform tests
+    add_executable(test_platform tests/platform.c)
+    target_link_libraries(test_platform PRIVATE logc test_harness Threads::Threads)
+    add_test(NAME test_platform COMMAND test_platform)
+
+    # Performance benchmarks
+    add_executable(test_perf tests/perf.c)
+    target_link_libraries(test_perf PRIVATE logc test_harness Threads::Threads)
+    add_test(NAME test_perf COMMAND test_perf)
 endif()
 
 # Examples
