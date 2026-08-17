@@ -8,8 +8,8 @@ A simple, powerful, and thread-safe logging library implemented in C17 with full
 
 - **Cross-Platform Support**: Windows (MSVC/MinGW-w64) & Linux/macOS (GCC/Clang)
 - **Thread-Safe**: Reader-writer locks for concurrent access
-- **Async Logging**: Asynchronous queue for non-blocking writes
-- **Log Rotation**: Automatic file rotation by size
+- **Async Logging**: Lock-free ring buffer queue with dedicated writer thread
+- **Log Rotation**: Automatic file rotation by size (up to 5 rotated files)
 - **Structured Logging**: JSON format support
 - **Thread ID Tracking**: Optional thread ID in output
 - **Syslog Integration**: Native syslog support (POSIX only)
@@ -17,6 +17,18 @@ A simple, powerful, and thread-safe logging library implemented in C17 with full
 - **Performance Stats**: Built-in metrics and monitoring
 - **NULL Safe**: Robust handling of NULL strings
 - **Color Output**: Optional colored terminal output (ANSI codes)
+- **Compile-Time Flags**: Selectively disable features to reduce binary size
+
+## 📊 Performance
+
+Benchmark results (Linux, GCC -O2):
+
+| Mode | Throughput | Latency |
+|------|-----------|---------|
+| Sync (single-thread) | ~1,300,000 msg/s | ~0.7 us/msg |
+| Sync (8 threads) | ~3,400,000 msg/s | — |
+| Async (single-thread) | ~5,700,000 msg/s | ~0.2 us/msg |
+| Async (8 threads) | ~4,000,000 msg/s | — |
 
 ## 📦 Quick Start
 
@@ -64,6 +76,9 @@ cmake ..
 
 # Build the project
 cmake --build .
+
+# Run tests
+ctest --output-on-failure
 ```
 
 ### Compiler Options
@@ -89,8 +104,11 @@ The project provides a cross-platform Makefile that auto-detects the compiler an
 # Build static library
 make
 
-# Build test binary
-make test_fixes
+# Build and run all tests
+make run-tests
+
+# Build and run unified test suite
+make run-all
 
 # Clean
 make clean
@@ -101,7 +119,7 @@ make clean
 ```bash
 mingw32-make
 
-mingw32-make test_fixes
+mingw32-make run-tests
 
 mingw32-make clean
 ```
@@ -113,7 +131,7 @@ Run from the "Developer Command Prompt" or after sourcing `vcvars64.bat`:
 ```bash
 make CC=cl
 
-make CC=cl test_fixes
+make CC=cl run-tests
 
 make CC=cl clean
 ```
@@ -123,7 +141,14 @@ make CC=cl clean
 | Target | Description |
 |--------|-------------|
 | `all` (default) | Static library `liblogc.a` (GCC) or `logc.lib` (MSVC) |
-| `test_fixes` | Test binary `test_fixes.exe` |
+| `test_core` | Core functionality tests |
+| `test_thread` | Thread safety tests |
+| `test_platform` | Platform-specific tests |
+| `test_stress` | Stress and edge-case tests |
+| `test_perf` | Performance benchmarks |
+| `test_all` | Unified test runner (all categories) |
+| `run-tests` | Build and run all test categories |
+| `run-all` | Build and run unified test suite |
 
 #### Linking With Your Application
 
@@ -174,6 +199,23 @@ Color output is enabled by default and uses ANSI escape codes:
 // ERROR: Red     (\x1b[31m)
 // FATAL: Bright Red (\x1b[91m)
 ```
+
+## 🔧 Compile-Time Feature Flags
+
+Disable optional features to reduce binary size:
+
+| Flag | Description | Savings |
+|------|-------------|---------|
+| `LOG_DISABLE_JSON` | Disable JSON formatting | ~2 KB |
+| `LOG_DISABLE_SYSLOG` | Disable Syslog support | ~1 KB |
+| `LOG_DISABLE_ASYNC` | Disable async logging | ~3 KB |
+| `LOG_DISABLE_MPOOL` | Disable memory pool | ~1 KB |
+| `LOG_DISABLE_RING_QUEUE` | Disable ring buffer queue | ~2 KB |
+| `LOG_DISABLE_STATS` | Disable performance stats | ~0.5 KB |
+| `LOG_DISABLE_FILE_OPS` | Disable file operations | ~3 KB |
+| `LOG_DISABLE_THREAD_ID` | Disable thread ID | ~0.3 KB |
+| `LOG_DISABLE_TS_CACHE` | Disable timestamp cache | ~0.2 KB |
+| `LOG_MINIMAL` | Disable all optional features | ~13 KB |
 
 ## 📋 Core Features
 
@@ -288,8 +330,11 @@ int main(void) {
 int main(void) {
     log *ctx = log_create();
 
-    // Enable async mode (asynchronous queue)
+    // Enable async mode (ring buffer queue + dedicated writer thread)
     log_set_async(ctx, true);
+
+    // Set queue full policy: FALLBACK_SYNC, DROP, or BLOCK
+    log_set_queue_policy(ctx, LOG_QUEUE_FALLBACK_SYNC);
 
     FILE *fp = fopen("async.log", "w");
     log_add_fp(ctx, fp, LOG_INFO);
@@ -305,8 +350,10 @@ int main(void) {
     // Check performance stats
     log_stats stats;
     log_get_stats(ctx, &stats);
-    printf("Total: %lu, Async writes: %lu, Queue drops: %lu\n",
-           stats.total_count, stats.async_writes, stats.queue_drops);
+    printf("Total: %llu, Async writes: %llu, Queue drops: %llu\n",
+           (unsigned long long)stats.total_count,
+           (unsigned long long)stats.async_writes,
+           (unsigned long long)stats.queue_drops);
 
     fclose(fp);
     log_destroy(ctx);
@@ -354,6 +401,7 @@ void log_set_level(log *ctx, int level);
 void log_set_quiet(log *ctx, bool enable);
 void log_set_format(log *ctx, log_FormatFn fn);
 int log_set_async(log *ctx, bool enable);
+void log_set_queue_policy(log *ctx, int policy);
 void log_set_max_file_size(log *ctx, size_t size);
 void log_set_file_prefix(log *ctx, const char *prefix);
 ```
@@ -363,9 +411,9 @@ void log_set_file_prefix(log *ctx, const char *prefix);
 ```c
 int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
 int log_add_fp(log *ctx, FILE *fp, int level);
+int log_add_file(log *ctx, const char *filename, int level);
 void log_remove_handler(log *ctx, int idx);
 void log_handler_set_level(log *ctx, int handler_idx, int new_level);
-void log_handler_set_formatter(log *ctx, int handler_idx, log_FormatFn new_fn);
 ```
 
 ## 📊 Performance Statistics
@@ -375,6 +423,7 @@ typedef struct log_stats {
     uint64_t total_count;               // Total messages logged
     uint64_t level_counts[LOG_LEVELS]; // Count per level
     uint64_t queue_drops;              // Dropped messages (async)
+    uint64_t queue_blocked;            // Blocked count (async)
     uint64_t rotation_count;           // File rotations
     double avg_queue_latency_ms;        // Avg async latency
     uint64_t async_writes;             // Async write count
@@ -387,32 +436,47 @@ typedef struct log_stats {
 All public APIs are thread-safe:
 
 - **Reader-Writer Locks**: Protects configuration changes
-- **Asynchronous Queue: dedicated writer thread drains a bounded queue
-- **Atomic Operations**: For statistics
+- **Lock-Free Ring Buffer**: For async logging (SPSC pattern)
+- **Atomic Operations**: For statistics counters
 - **Safe from Multiple Threads**: Can be called concurrently
 
 ## 📝 Examples
 
-See [src/example.c](src/example.c) for comprehensive examples:
+See [tests/example.c](tests/example.c) for comprehensive examples:
 
 - Basic logging
 - Level filtering
 - JSON format output
 - File rotation
 - Async logging
-- Thread safety
-- Dynamic handler configuration
-- Mixed formatting
+- Thread ID display
+- Custom formatter
+- Custom handler (memory buffer)
 - Performance statistics
 
 ## 🧪 Testing
 
-Run the test suite:
+The project includes 101 tests across 6 categories:
+
+| Category | Tests | Description |
+|----------|-------|-------------|
+| core | 22 | Levels, handlers, format, null safety, stats, boundary |
+| thread | 8 | Multi-threaded sync/async, config races |
+| platform | 8 | Syslog, rotation, unicode paths |
+| stress | 33 | Queue full, long messages, integrity, crash safety |
+| perf | 12 | Throughput and latency benchmarks |
+
+### Run Tests
 
 ```bash
+# Using CMake + CTest
 cd build
-cmake --build . --target test_log
-./test_log
+cmake --build .
+ctest --output-on-failure
+
+# Using Makefile
+make run-tests    # Run all categories separately
+make run-all      # Run unified test suite
 ```
 
 ## 📄 License
@@ -421,11 +485,17 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 ## 📈 Version History
 
+- **2.0.1** (2026): Code quality improvements
+  - Cleaned up compiler warnings (unused variables, format strings)
+  - Removed dead code (arena allocator, unused functions)
+  - Added comprehensive example.c demonstrating all features
+  - Fixed format string portability (uint64_t printing)
+
 - **2.0.0** (2026): Major enhancements
   - Added cross-platform support (Windows/Linux/macOS)
   - Added CMake build system
   - Added colored output support
-  - Enhanced async logging with Asynchronous Queue: dedicated writer thread drains a bounded queue
+  - Enhanced async logging with lock-free ring buffer queue
   - Added JSON format support
   - Added thread ID tracking
   - Added syslog integration
@@ -433,6 +503,7 @@ MIT License - See [LICENSE](LICENSE) for details.
   - Added dynamic configuration APIs
   - Enhanced thread safety with reader-writer locks
   - Added NULL string safety
+  - Added compile-time feature flags
 
 - **1.0.0** (2020): Original implementation by rxi
 

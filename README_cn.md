@@ -8,8 +8,8 @@
 
 - **跨平台支持**: Windows (MSVC/MinGW-w64) & Linux/macOS (GCC/Clang)
 - **线程安全**: 读写锁保护并发访问
-- **异步日志**: 无锁队列实现非阻塞写入
-- **日志轮转**: 按大小自动轮转文件
+- **异步日志**: 无锁环形缓冲区队列 + 专用写入线程
+- **日志轮转**: 按大小自动轮转文件（最多 5 个轮转文件）
 - **结构化日志**: JSON 格式支持
 - **线程ID追踪**: 输出中可选显示线程ID
 - **Syslog集成**: 原生 syslog 支持（仅 POSIX）
@@ -17,6 +17,18 @@
 - **性能统计**: 内置指标和监控
 - **NULL安全**: 健壮的 NULL 字符串处理
 - **颜色输出**: 可选彩色终端输出（ANSI 代码）
+- **编译时标志**: 可选择性禁用以减小二进制体积
+
+## 📊 性能
+
+基准测试结果（Linux, GCC -O2）：
+
+| 模式 | 吞吐量 | 延迟 |
+|------|--------|------|
+| 同步（单线程） | ~1,300,000 msg/s | ~0.7 us/msg |
+| 同步（8 线程） | ~3,400,000 msg/s | — |
+| 异步（单线程） | ~5,700,000 msg/s | ~0.2 us/msg |
+| 异步（8 线程） | ~4,000,000 msg/s | — |
 
 ## 📦 快速开始
 
@@ -64,6 +76,9 @@ cmake ..
 
 # 构建项目
 cmake --build .
+
+# 运行测试
+ctest --output-on-failure
 ```
 
 ### 编译器选项
@@ -89,8 +104,11 @@ cmake -DBUILD_TESTS=OFF ..
 # 编译静态库
 make
 
-# 编译测试程序
-make test_fixes
+# 构建并运行所有测试
+make run-tests
+
+# 构建并运行统一测试套件
+make run-all
 
 # 清理
 make clean
@@ -99,10 +117,9 @@ make clean
 #### Windows（MinGW-w64）
 
 ```bash
-# MinGW 下直接使用 GCC 工具链
 mingw32-make
 
-mingw32-make test
+mingw32-make run-tests
 
 mingw32-make clean
 ```
@@ -112,10 +129,9 @@ mingw32-make clean
 需从"开发者命令提示符"或 `vcvars64.bat` 环境运行：
 
 ```bash
-# 指定 CC=cl 以启用 MSVC 编译路径
 make CC=cl
 
-make CC=cl test_fixes
+make CC=cl run-tests
 
 make CC=cl clean
 ```
@@ -125,7 +141,14 @@ make CC=cl clean
 | 目标 | 说明 |
 |------|------|
 | `all`（默认） | 编译静态库 `liblogc.a`（GCC）或 `logc.lib`（MSVC） |
-| `test_fixes` | 编译测试程序 `test_fixes.exe` |
+| `test_core` | 核心功能测试 |
+| `test_thread` | 线程安全测试 |
+| `test_platform` | 平台特定测试 |
+| `test_stress` | 压力和边界测试 |
+| `test_perf` | 性能基准测试 |
+| `test_all` | 统一测试运行器（所有类别） |
+| `run-tests` | 构建并运行所有测试类别 |
+| `run-all` | 构建并运行统一测试套件 |
 
 #### 与应用程序链接
 
@@ -176,6 +199,23 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 // ERROR: 红色    (\x1b[31m)
 // FATAL: 亮红色 (\x1b[91m)
 ```
+
+## 🔧 编译时功能标志
+
+禁用可选功能以减小二进制体积：
+
+| 标志 | 说明 | 节省 |
+|------|------|------|
+| `LOG_DISABLE_JSON` | 禁用 JSON 格式化 | ~2 KB |
+| `LOG_DISABLE_SYSLOG` | 禁用 Syslog 支持 | ~1 KB |
+| `LOG_DISABLE_ASYNC` | 禁用异步日志 | ~3 KB |
+| `LOG_DISABLE_MPOOL` | 禁用内存池 | ~1 KB |
+| `LOG_DISABLE_RING_QUEUE` | 禁用环形缓冲区队列 | ~2 KB |
+| `LOG_DISABLE_STATS` | 禁用性能统计 | ~0.5 KB |
+| `LOG_DISABLE_FILE_OPS` | 禁用文件操作 | ~3 KB |
+| `LOG_DISABLE_THREAD_ID` | 禁用线程ID | ~0.3 KB |
+| `LOG_DISABLE_TS_CACHE` | 禁用时间戳缓存 | ~0.2 KB |
+| `LOG_MINIMAL` | 禁用所有可选功能 | ~13 KB |
 
 ## 📋 核心功能
 
@@ -290,8 +330,11 @@ int main(void) {
 int main(void) {
     log *ctx = log_create();
 
-    // 启用异步模式（无锁队列）
+    // 启用异步模式（环形缓冲区队列 + 专用写入线程）
     log_set_async(ctx, true);
+
+    // 设置队列满策略：FALLBACK_SYNC、DROP 或 BLOCK
+    log_set_queue_policy(ctx, LOG_QUEUE_FALLBACK_SYNC);
 
     FILE *fp = fopen("async.log", "w");
     log_add_fp(ctx, fp, LOG_INFO);
@@ -307,8 +350,10 @@ int main(void) {
     // 检查性能统计
     log_stats stats;
     log_get_stats(ctx, &stats);
-    printf("总计: %lu, 异步写入: %lu, 队列丢弃: %lu\n",
-           stats.total_count, stats.async_writes, stats.queue_drops);
+    printf("总计: %llu, 异步写入: %llu, 队列丢弃: %llu\n",
+           (unsigned long long)stats.total_count,
+           (unsigned long long)stats.async_writes,
+           (unsigned long long)stats.queue_drops);
 
     fclose(fp);
     log_destroy(ctx);
@@ -356,6 +401,7 @@ void log_set_level(log *ctx, int level);
 void log_set_quiet(log *ctx, bool enable);
 void log_set_format(log *ctx, log_FormatFn fn);
 int log_set_async(log *ctx, bool enable);
+void log_set_queue_policy(log *ctx, int policy);
 void log_set_max_file_size(log *ctx, size_t size);
 void log_set_file_prefix(log *ctx, const char *prefix);
 ```
@@ -365,9 +411,9 @@ void log_set_file_prefix(log *ctx, const char *prefix);
 ```c
 int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
 int log_add_fp(log *ctx, FILE *fp, int level);
+int log_add_file(log *ctx, const char *filename, int level);
 void log_remove_handler(log *ctx, int idx);
 void log_handler_set_level(log *ctx, int handler_idx, int new_level);
-void log_handler_set_formatter(log *ctx, int handler_idx, log_FormatFn new_fn);
 ```
 
 ## 📊 性能统计
@@ -377,6 +423,7 @@ typedef struct log_stats {
     uint64_t total_count;               // 总日志消息数
     uint64_t level_counts[LOG_LEVELS]; // 各级别计数
     uint64_t queue_drops;              // 丢弃的消息数（异步）
+    uint64_t queue_blocked;            // 阻塞次数（异步）
     uint64_t rotation_count;           // 文件轮转次数
     double avg_queue_latency_ms;        // 平均异步延迟
     uint64_t async_writes;             // 异步写入计数
@@ -389,32 +436,47 @@ typedef struct log_stats {
 所有公共 API 都是线程安全的：
 
 - **读写锁**: 保护配置更改
-- **无锁队列**: 用于异步模式（SPSC）
-- **原子操作**: 用于统计信息
+- **无锁环形缓冲区**: 用于异步日志（SPSC 模式）
+- **原子操作**: 用于统计计数器
 - **多线程安全**: 可以并发调用
 
 ## 📝 示例
 
-查看 [src/example.c](src/example.c) 获取全面示例：
+查看 [tests/example.c](tests/example.c) 获取全面示例：
 
 - 基础日志
 - 级别过滤
 - JSON 格式输出
 - 文件轮转
 - 异步日志
-- 线程安全
-- 动态处理器配置
-- 混合格式化
+- 线程ID显示
+- 自定义格式化器
+- 自定义处理器（内存缓冲区）
 - 性能统计
 
 ## 🧪 测试
 
-运行测试套件：
+项目包含 101 个测试，分为 6 个类别：
+
+| 类别 | 测试数 | 说明 |
+|------|--------|------|
+| core | 22 | 级别、处理器、格式、NULL安全、统计、边界 |
+| thread | 8 | 多线程同步/异步、配置竞态 |
+| platform | 8 | Syslog、轮转、Unicode路径 |
+| stress | 33 | 队列满、长消息、完整性、崩溃安全 |
+| perf | 12 | 吞吐量和延迟基准测试 |
+
+### 运行测试
 
 ```bash
+# 使用 CMake + CTest
 cd build
-cmake --build . --target test_log
-./test_log
+cmake --build .
+ctest --output-on-failure
+
+# 使用 Makefile
+make run-tests    # 分别运行所有类别
+make run-all      # 运行统一测试套件
 ```
 
 ## 📄 许可证
@@ -423,11 +485,17 @@ MIT 许可证 - 详情请参阅 [LICENSE](LICENSE)。
 
 ## 📈 版本历史
 
+- **2.0.1** (2026): 代码质量改进
+  - 清理编译警告（未使用变量、格式字符串）
+  - 移除死代码（arena 分配器、未使用函数）
+  - 添加全面的 example.c 演示所有功能
+  - 修复格式字符串可移植性（uint64_t 打印）
+
 - **2.0.0** (2026): 重大增强
   - 添加跨平台支持（Windows/Linux/macOS）
   - 添加 CMake 构建系统
   - 添加彩色输出支持
-  - 增强异步日志（无锁队列）
+  - 增强异步日志（无锁环形缓冲区队列）
   - 添加 JSON 格式支持
   - 添加线程ID追踪
   - 添加 syslog 集成
@@ -435,6 +503,7 @@ MIT 许可证 - 详情请参阅 [LICENSE](LICENSE)。
   - 添加动态配置 API
   - 增强线程安全（读写锁）
   - 添加 NULL 字符串安全
+  - 添加编译时功能标志
 
 - **1.0.0** (2020): rxi 的原始实现
 
