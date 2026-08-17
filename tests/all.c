@@ -22,10 +22,14 @@
 /* Platform tests */
 #include "platform/test_syslog.c"
 #include "platform/test_rotation.c"
+#include "platform/test_unicode_path.c"
 
 /* Stress tests */
 #include "stress/test_queue_full.c"
 #include "stress/test_long_message.c"
+#include "stress/test_integrity.c"
+#include "stress/test_crash_safety.c"
+#include "stress/test_resource_usage.c"
 
 /* Perf tests */
 #include "perf/bench_sync.c"
@@ -47,10 +51,14 @@ int main(void) {
     /* Platform */
     extern void test_syslog_register(void);
     extern void test_rotation_register(void);
+    extern void test_unicode_path_register(void);
 
     /* Stress */
     extern void test_queue_full_register(void);
     extern void test_long_message_register(void);
+    extern void test_integrity_register(void);
+    extern void test_crash_safety_register(void);
+    extern void test_resource_usage_register(void);
 
     /* Perf */
     extern void bench_sync_register(void);
@@ -68,9 +76,13 @@ int main(void) {
 
     test_syslog_register();
     test_rotation_register();
+    test_unicode_path_register();
 
     test_queue_full_register();
     test_long_message_register();
+    test_integrity_register();
+    test_crash_safety_register();
+    test_resource_usage_register();
 
     bench_sync_register();
     bench_async_register();
