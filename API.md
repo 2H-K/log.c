@@ -193,16 +193,17 @@ void log_set_quiet(log *ctx, bool enable);
 
 **Parameters:**
 - `ctx`: Logger context
-- `enable`: true to suppress stderr output
+- `enable`: true to suppress all logging output
 
 **Example:**
 ```c
-log_set_quiet(ctx, true);  // Suppress stderr
+log_set_quiet(ctx, true);  // Suppress all output
 ```
 
 **Notes:**
-- Only affects stderr handler
-- File handlers continue to receive logs
+- When enabled, suppresses ALL handlers (including file handlers)
+- Use this to completely silence the logger
+- To suppress only stderr while keeping file handlers, remove the stderr handler instead
 
 ---
 

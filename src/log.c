@@ -397,8 +397,8 @@ static log_queue_entry* queue_entry_create(log *ctx, log_event *ev) {
   if (len < 0) goto fail;
 
   if (use_mpool) {
-    /* Grow pooled msg buffer only if needed; keep old pointer on failure (Bug 2) */
-    if ((size_t)len >= 512) {
+    /* Allocate msg buffer if NULL or too small */
+    if (!entry->msg || (size_t)len >= 512) {
       char *new_msg = realloc(entry->msg, (size_t)len + 1);
       if (!new_msg) goto fail;
       entry->msg = new_msg;
@@ -406,7 +406,7 @@ static log_queue_entry* queue_entry_create(log *ctx, log_event *ev) {
     vsnprintf(entry->msg, (size_t)len + 1, ev->fmt, ev->ap);
 
     size_t file_len = ev->file ? strlen(ev->file) : 0;
-    if (file_len >= 128) {
+    if (!entry->file || file_len >= 128) {
       char *new_file = realloc(entry->file, file_len + 1);
       if (!new_file) goto fail;
       entry->file = new_file;
@@ -957,6 +957,8 @@ static void file_handler_internal(log *ctx, log_event *ev, int handler_idx) {
       ctx->handlers[handler_idx].fp = fopen(ctx->file_prefix, "a");
       if (ctx->handlers[handler_idx].fp) {
         ctx->handlers[handler_idx].file_size = 0;
+        /* Update udata to match new fp so handler can be found */
+        ctx->handlers[handler_idx].udata = ctx->handlers[handler_idx].fp;
       }
     } else {
       ctx->handlers[handler_idx].file_size = 0;
@@ -1118,6 +1120,11 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
         }
       }
       rwlock_read_unlock(&ctx->rwlock);
+      /* format_message returns a strdup, so free the original */
+      free(entry->msg);
+      free(entry->file);
+      entry->msg = NULL;
+      entry->file = NULL;
       queue_entry_destroy(ctx, entry);
     }
   }
@@ -1301,22 +1308,20 @@ void log_set_max_file_size(log *ctx, size_t size) {
 }
 
 /**
- * Check if the path contains path traversal sequences or is an absolute path.
+ * Check if the path contains path traversal sequences.
  * Returns 1 if the path is safe (no traversal), 0 if unsafe.
+ * Absolute paths are allowed on Unix systems.
  */
 static int is_path_safe(const char *path) {
   if (!path || path[0] == '\0') {
     return 0;
   }
 
-  /* Reject absolute paths:
-   * - Unix: starts with '/'
-   * - Windows: starts with 'X:\' or 'X:/' or '\\' (UNC)
-   */
-  if (path[0] == '/' || path[0] == '\\') {
+#ifdef LOG_PLATFORM_WINDOWS
+  /* Reject absolute paths on Windows */
+  if (path[0] == '\\') {
     return 0;
   }
-#ifdef LOG_PLATFORM_WINDOWS
   if (path[1] == ':') {
     return 0;
   }
@@ -1447,10 +1452,9 @@ static void stats_snapshot(log *ctx, log_stats *stats) {
   }
   stats->queue_drops = tl_stats.queue_drops;
   stats->queue_blocked = tl_stats.queue_blocked;
+  stats->rotation_count = tl_stats.rotation_count;
   stats->async_writes = tl_stats.async_writes;
   stats->sync_writes = tl_stats.sync_writes;
-  stats->rotation_count = 0;
-  stats->avg_queue_latency_ms = 0.0;
 }
 
 void log_get_perf_stats(log *ctx, log_stats *stats) {
@@ -1597,15 +1601,30 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
     if (pushed) {
       STAT_INC(async_writes);
     } else {
-      STAT_INC(queue_drops);
-      if (ctx->queue_policy != LOG_QUEUE_DROP) {
+      if (ctx->queue_policy == LOG_QUEUE_DROP) {
+        STAT_INC(queue_drops);
+      } else {
+        /* FALLBACK_SYNC or BLOCK: write synchronously, no drop */
         va_start(ev.ap, fmt);
+        char *pre_fmt_fb = NULL;
+        va_list args_copy_fb;
+        va_copy(args_copy_fb, ev.ap);
+        int pflen_fb = vsnprintf(NULL, 0, fmt, args_copy_fb);
+        va_end(args_copy_fb);
+        if (pflen_fb >= 0) {
+          pre_fmt_fb = malloc((size_t)pflen_fb + 1);
+          if (pre_fmt_fb) {
+            vsnprintf(pre_fmt_fb, (size_t)pflen_fb + 1, fmt, ev.ap);
+            ev.raw_msg = pre_fmt_fb;
+          }
+        }
         for (int i = 0; i < ctx->handler_count; i++) {
           if (ctx->handlers[i].active && ctx->handlers[i].fn && level >= ctx->handlers[i].level) {
             ev.udata = ctx->handlers[i].udata;
             ctx->handlers[i].fn(ctx, &ev);
           }
         }
+        free(pre_fmt_fb);
         va_end(ev.ap);
         STAT_INC(sync_writes);
       }
@@ -1613,12 +1632,25 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
   } else {
     STAT_INC(sync_writes);
     va_start(ev.ap, fmt);
+    char *pre_fmt = NULL;
+    va_list args_copy;
+    va_copy(args_copy, ev.ap);
+    int pflen = vsnprintf(NULL, 0, fmt, args_copy);
+    va_end(args_copy);
+    if (pflen >= 0) {
+      pre_fmt = malloc((size_t)pflen + 1);
+      if (pre_fmt) {
+        vsnprintf(pre_fmt, (size_t)pflen + 1, fmt, ev.ap);
+        ev.raw_msg = pre_fmt;
+      }
+    }
     for (int i = 0; i < ctx->handler_count; i++) {
       if (ctx->handlers[i].active && ctx->handlers[i].fn && level >= ctx->handlers[i].level) {
         ev.udata = ctx->handlers[i].udata;
         ctx->handlers[i].fn(ctx, &ev);
       }
     }
+    free(pre_fmt);
     va_end(ev.ap);
   }
 
