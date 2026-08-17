@@ -6,10 +6,24 @@
 #include "test_harness.h"
 #include "log.h"
 
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#define INTEGRITY_THREAD_T HANDLE
+#define INTEGRITY_THREAD_CREATE(t, f, a) ((t) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(f), (a), 0, NULL))
+#define INTEGRITY_THREAD_JOIN(t) (WaitForSingleObject((t), INFINITE), CloseHandle((t)))
+static CRITICAL_SECTION g_bitmap_lock;
+static bool g_bitmap_lock_initialized = false;
+#else
+#include <pthread.h>
+#define INTEGRITY_THREAD_T pthread_t
+#define INTEGRITY_THREAD_CREATE(t, f, a) pthread_create(&(t), NULL, (f), (a))
+#define INTEGRITY_THREAD_JOIN(t) pthread_join((t), NULL)
+static pthread_mutex_t g_bitmap_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 #define INTEGRITY_THREADS 8
 #define INTEGRITY_MSGS_PER_THREAD 50000
@@ -18,7 +32,14 @@
 /* Bitmap to track which sequence numbers were received */
 static uint8_t *g_bitmap = NULL;
 static int g_bitmap_size = 0;
-static pthread_mutex_t g_bitmap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#if defined(_WIN32) || defined(_WIN64)
+#define INTEGRITY_TMPFILE "test_integrity.log"
+#define INTEGRITY_TMPFILE_ASYNC "test_integrity_async.log"
+#else
+#define INTEGRITY_TMPFILE "/tmp/test_integrity.log"
+#define INTEGRITY_TMPFILE_ASYNC "/tmp/test_integrity_async.log"
+#endif
 
 typedef struct {
     log *ctx;
@@ -39,7 +60,7 @@ static void* integrity_writer(void *arg) {
 }
 
 static void test_integrity_sync(void) {
-    const char *tmpfile = "/tmp/test_integrity.log";
+    const char *tmpfile = INTEGRITY_TMPFILE;
     remove(tmpfile);
 
     log *ctx = log_create();
@@ -51,7 +72,7 @@ static void test_integrity_sync(void) {
     g_bitmap = (uint8_t*)calloc(g_bitmap_size, 1);
     TEST_ASSERT_NOT_NULL(g_bitmap, "calloc bitmap");
 
-    pthread_t threads[INTEGRITY_THREADS];
+    INTEGRITY_THREAD_T threads[INTEGRITY_THREADS];
     integrity_arg args[INTEGRITY_THREADS];
 
     for (int i = 0; i < INTEGRITY_THREADS; i++) {
@@ -59,11 +80,11 @@ static void test_integrity_sync(void) {
         args[i].thread_id = i;
         args[i].start_seq = i * INTEGRITY_MSGS_PER_THREAD;
         args[i].count = INTEGRITY_MSGS_PER_THREAD;
-        pthread_create(&threads[i], NULL, integrity_writer, &args[i]);
+        INTEGRITY_THREAD_CREATE(threads[i], integrity_writer, &args[i]);
     }
 
     for (int i = 0; i < INTEGRITY_THREADS; i++) {
-        pthread_join(threads[i], NULL);
+        INTEGRITY_THREAD_JOIN(threads[i]);
     }
 
     log_destroy(ctx);
@@ -115,7 +136,7 @@ static void test_integrity_async(void) {
     const int ASYNC_THREADS = 4;
     const int ASYNC_PER_THREAD = ASYNC_TOTAL / ASYNC_THREADS;
 
-    const char *tmpfile = "/tmp/test_integrity_async.log";
+    const char *tmpfile = INTEGRITY_TMPFILE_ASYNC;
     remove(tmpfile);
 
     log *ctx = log_create();
@@ -128,7 +149,7 @@ static void test_integrity_async(void) {
     g_bitmap = (uint8_t*)calloc(g_bitmap_size, 1);
     TEST_ASSERT_NOT_NULL(g_bitmap, "calloc bitmap");
 
-    pthread_t threads[4];
+    INTEGRITY_THREAD_T threads[4];
     integrity_arg args[4];
 
     for (int i = 0; i < ASYNC_THREADS; i++) {
@@ -136,11 +157,11 @@ static void test_integrity_async(void) {
         args[i].thread_id = i;
         args[i].start_seq = i * ASYNC_PER_THREAD;
         args[i].count = ASYNC_PER_THREAD;
-        pthread_create(&threads[i], NULL, integrity_writer, &args[i]);
+        INTEGRITY_THREAD_CREATE(threads[i], integrity_writer, &args[i]);
     }
 
     for (int i = 0; i < ASYNC_THREADS; i++) {
-        pthread_join(threads[i], NULL);
+        INTEGRITY_THREAD_JOIN(threads[i]);
     }
 
     /* Stop async to flush queue */

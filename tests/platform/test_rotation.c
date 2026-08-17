@@ -63,6 +63,34 @@ static void test_rotation_multiple(void) {
 }
 
 static void test_rotation_manual(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    /* On Windows, log_rotate must close+reopen the file to rename it,
+     * so we use log_add_file (owns_file=true) to avoid double-close. */
+    log *ctx = log_create();
+    log_set_file_prefix(ctx, "test_rot");
+    /* Use large max size to avoid auto-rotation during writes */
+    log_set_max_file_size(ctx, 1024 * 1024);
+
+    int idx = log_add_file(ctx, "test_rot", LOG_INFO);
+    TEST_ASSERT(idx >= 0, "log_add_file succeeds");
+    if (idx >= 0) ctx->handlers[0].active = false;
+
+    for (int i = 0; i < 50; i++) {
+        log_ctx_info(ctx, "before rotation %d", i);
+    }
+
+    log_rotate(ctx);
+
+    for (int i = 0; i < 50; i++) {
+        log_ctx_info(ctx, "after rotation %d", i);
+    }
+
+    log_destroy(ctx);
+
+    FILE *f = fopen("test_rot.1", "r");
+    TEST_ASSERT_NOT_NULL(f, "manual rotation creates file");
+    if (f) fclose(f);
+#else
     log *ctx = log_create();
     log_set_file_prefix(ctx, "test_rot");
     log_set_max_file_size(ctx, 1024);
@@ -86,6 +114,7 @@ static void test_rotation_manual(void) {
     FILE *f = fopen("test_rot.1", "r");
     TEST_ASSERT_NOT_NULL(f, "manual rotation creates file");
     if (f) fclose(f);
+#endif
 
     remove("test_rot");
     remove("test_rot.1");

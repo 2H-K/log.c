@@ -7,7 +7,7 @@
 #include "log.h"
 
 static void test_handler_add_fp(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -39,8 +39,8 @@ static void test_handler_add_null_file(void) {
 }
 
 static void test_handler_remove(void) {
-    FILE *fp1 = fopen("/dev/null", "w");
-    FILE *fp2 = fopen("/dev/null", "w");
+    FILE *fp1 = fopen(TEST_DEV_NULL, "w");
+    FILE *fp2 = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp1 && fp2, "fopen");
 
     log *ctx = log_create();
@@ -102,7 +102,7 @@ static void test_handler_max_capacity(void) {
     int added = 0;
 
     for (int i = 0; i < 40; i++) {
-        FILE *fp = fopen("/dev/null", "w");
+        FILE *fp = fopen(TEST_DEV_NULL, "w");
         int idx = log_add_fp(ctx, fp, LOG_INFO);
         if (idx < 0) {
             fclose(fp);

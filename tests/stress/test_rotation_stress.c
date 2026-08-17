@@ -9,19 +9,31 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if !defined(_WIN32) && !defined(_WIN64)
 #include <dirent.h>
 #include <sys/stat.h>
+#endif
 
+#if defined(_WIN32) || defined(_WIN64)
+#define ROTATION_TEST_DIR "log_rotation_test"
+#else
 #define ROTATION_TEST_DIR "/tmp/log_rotation_test"
+#endif
 #define ROTATION_FILE_SIZE 1024  /* 1KB per file to trigger many rotations */
 #define ROTATION_MSG_COUNT 5000  /* Write 5000 messages */
 
 static void create_test_dir(void) {
     char cmd[256];
+#if defined(_WIN32) || defined(_WIN64)
+    snprintf(cmd, sizeof(cmd), "rmdir /s /q %s 2>nul & mkdir %s", ROTATION_TEST_DIR, ROTATION_TEST_DIR);
+#else
     snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", ROTATION_TEST_DIR, ROTATION_TEST_DIR);
+#endif
     system(cmd);
 }
 
+#if !defined(_WIN32) && !defined(_WIN64)
 static int count_rotation_files(void) {
     DIR *dp = opendir(ROTATION_TEST_DIR);
     if (!dp) return 0;
@@ -33,6 +45,26 @@ static int count_rotation_files(void) {
     closedir(dp);
     return count;
 }
+#else
+static int count_rotation_files(void) {
+    /* Windows: count by trying to open each possible rotation file */
+    int count = 0;
+    for (int i = 0; i <= 5; i++) {
+        char fname[256];
+        if (i == 0) {
+            snprintf(fname, sizeof(fname), "%s/stress_rotate.log", ROTATION_TEST_DIR);
+        } else {
+            snprintf(fname, sizeof(fname), "%s/stress_rotate.log.%d", ROTATION_TEST_DIR, i);
+        }
+        FILE *f = fopen(fname, "r");
+        if (f) {
+            count++;
+            fclose(f);
+        }
+    }
+    return count;
+}
+#endif
 
 static void test_rotation_many_files(void) {
     create_test_dir();
@@ -176,11 +208,22 @@ static void test_rotation_manual_trigger(void) {
     char path[256];
     snprintf(path, sizeof(path), "%s/manual_rotate.log", ROTATION_TEST_DIR);
 
+#if defined(_WIN32) || defined(_WIN64)
+    /* On Windows, log_rotate must close+reopen the file to rename it,
+     * so we use log_add_file (owns_file=true) to avoid double-close. */
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen manual rotation file");
+    if (fp) fclose(fp);
+
+    log *ctx = log_create();
+    int idx = log_add_file(ctx, path, LOG_INFO);
+#else
     FILE *fp = fopen(path, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen manual rotation file");
 
     log *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
+#endif
     TEST_ASSERT(idx >= 0, "add handler");
 
     log_set_file_prefix(ctx, path);
@@ -199,7 +242,9 @@ static void test_rotation_manual_trigger(void) {
     }
 
     log_destroy(ctx);
+#if !defined(_WIN32) && !defined(_WIN64)
     fclose(fp);
+#endif
 
     /* Verify both sets of messages exist */
     int before_count = 0, after_count = 0;

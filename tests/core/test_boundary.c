@@ -49,7 +49,7 @@ static void test_boundary_empty_prefix(void) {
 
 static void test_very_long_message(void) {
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Create a very long message (16KB) */
@@ -69,7 +69,7 @@ static void test_very_long_message(void) {
 
 static void test_very_long_format(void) {
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Format string with many arguments */
@@ -84,7 +84,7 @@ static void test_very_long_format(void) {
 
 static void test_max_level(void) {
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Test all valid levels */
@@ -102,7 +102,7 @@ static void test_max_level(void) {
 
 static void test_negative_level(void) {
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Set level to negative value - should clamp or reject */
@@ -191,7 +191,7 @@ static void test_max_handlers(void) {
 
 static void test_remove_invalid_handler(void) {
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Remove with invalid index - should not crash */
@@ -208,7 +208,7 @@ static void test_remove_invalid_handler(void) {
 
 static void test_destroy_while_logging(void) {
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Write some messages */
@@ -226,7 +226,7 @@ static void test_recreate_after_destroy(void) {
     /* Create and destroy multiple times */
     for (int i = 0; i < 100; i++) {
         log *ctx = log_create();
-        FILE *fp = fopen("/dev/null", "w");
+        FILE *fp = fopen(TEST_DEV_NULL, "w");
         log_add_fp(ctx, fp, LOG_INFO);
         log_ctx_info(ctx, "iteration %d", i);
         log_destroy(ctx);
@@ -239,7 +239,7 @@ static void test_recreate_after_destroy(void) {
 
 static void test_format_percent(void) {
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Message with percent signs */
@@ -254,7 +254,7 @@ static void test_format_percent(void) {
 
 static void test_format_null_args(void) {
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Log with NULL format - should handle gracefully */
@@ -270,7 +270,7 @@ static void test_format_null_args(void) {
 
 static void test_very_small_queue_size(void) {
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Set a small queue size */

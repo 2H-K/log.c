@@ -40,7 +40,7 @@ static void* concurrent_writer(void *arg) {
 }
 
 static void test_config_change_during_write(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -75,7 +75,7 @@ static void test_config_change_during_write(void) {
 }
 
 static void test_handler_change_during_write(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -94,7 +94,7 @@ static void test_handler_change_during_write(void) {
     }
 
     for (int i = 0; i < 20; i++) {
-        FILE *fp2 = fopen("/dev/null", "w");
+        FILE *fp2 = fopen(TEST_DEV_NULL, "w");
         int hidx = log_add_fp(ctx, fp2, LOG_DEBUG);
         if (hidx >= 0) {
             log_remove_handler(ctx, hidx);

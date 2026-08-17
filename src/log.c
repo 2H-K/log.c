@@ -51,12 +51,14 @@ _Static_assert(sizeof(int) >= 4, "int must be at least 32 bits");
 
 /* ==================== Platform-specific helpers ==================== */
 
+#ifdef LOG_PLATFORM_POSIX
 static int clock_id_map[] = {
   CLOCK_REALTIME,
   CLOCK_REALTIME_COARSE,
   CLOCK_MONOTONIC,
   CLOCK_MONOTONIC_COARSE,
 };
+#endif
 
 /* Get timestamp using configured clock source */
 static double get_timestamp_with_clock(int clock_source) {
@@ -84,10 +86,10 @@ static double get_timestamp(void) {
 
 #ifdef LOG_USE_MSVC_ATOMIC
 
-#define atomic_store(p, v) InterlockedExchange((volatile LONG*)(p), (LONG)(v))
-#define atomic_load(p) ((volatile LONG)(*(p)))
-#define atomic_fetch_add(p, v) InterlockedExchangeAdd((volatile LONG*)(p), (LONG)(v))
-#define atomic_fetch_sub(p, v) InterlockedExchangeAdd((volatile LONG*)(p), -(LONG)(v))
+#define atomic_store(p, v) InterlockedExchange64((volatile LONG64*)(p), (LONG64)(v))
+#define atomic_load(p) ((size_t)InterlockedOr64((volatile LONG64*)(p), 0))
+#define atomic_fetch_add(p, v) InterlockedExchangeAdd64((volatile LONG64*)(p), (LONG64)(v))
+#define atomic_fetch_sub(p, v) InterlockedExchangeAdd64((volatile LONG64*)(p), -(LONG64)(v))
 
 static inline bool atomic_compare_exchange_strong(volatile void* obj, void* expected, void* desired) {
   return InterlockedCompareExchangePointer((volatile PVOID*)obj, desired, *(PVOID*)expected) == *(PVOID*)expected;
@@ -137,7 +139,12 @@ static void aggregate_stats(log *ctx) {
 }
 
 static log *DEFAULT_LOG = NULL;
+#if defined(LOG_PLATFORM_POSIX)
 static pthread_mutex_t default_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+#else
+static CRITICAL_SECTION default_log_mutex;
+static bool default_log_mutex_initialized = false;
+#endif
 
 static const char *level_strings[] = {
   "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"
@@ -241,24 +248,47 @@ static void mpool_free(log_mpool *mp, log_queue_entry *entry) {
 }
 
 static LOG_THREAD_LOCAL log_arena *tl_arena = NULL;
+#if defined(LOG_PLATFORM_POSIX)
 static pthread_key_t arena_key;
 static pthread_once_t arena_key_once = PTHREAD_ONCE_INIT;
+#else
+static DWORD arena_fls_key = 0;
+static bool arena_fls_initialized = false;
+#endif
 
 static void arena_destroy(void);
+#if defined(LOG_PLATFORM_POSIX)
 static void arena_destroy_wrapper(void *val) {
   (void)val;
   arena_destroy();
 }
-
 static void arena_key_create(void) {
   pthread_key_create(&arena_key, arena_destroy_wrapper);
 }
+#else
+static void NTAPI arena_fls_callback(PVOID p) {
+  (void)p;
+  arena_destroy();
+}
+#endif
 
 static void* arena_alloc(size_t size) {
+#if defined(LOG_PLATFORM_POSIX)
   pthread_once(&arena_key_once, arena_key_create);
   if (!tl_arena) {
     pthread_setspecific(arena_key, (void*)1);
   }
+#else
+  if (!arena_fls_initialized) {
+    DWORD fls = FlsAlloc(arena_fls_callback);
+    if (fls == FLS_OUT_OF_INDEXES) return NULL;
+    arena_fls_key = fls;
+    arena_fls_initialized = true;
+  }
+  if (!tl_arena) {
+    FlsSetValue(arena_fls_key, (PVOID)1);
+  }
+#endif
   if (!tl_arena || tl_arena->offset + size > tl_arena->capacity) {
     size_t cap = ARENA_BLOCK_SIZE;
     if (size > cap) cap = size * 2;
@@ -1378,12 +1408,24 @@ void log_destroy(log *ctx) {
 }
 
 log* log_default(void) {
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&default_log_mutex);
+#else
+  if (!default_log_mutex_initialized) {
+    InitializeCriticalSection(&default_log_mutex);
+    default_log_mutex_initialized = true;
+  }
+  EnterCriticalSection(&default_log_mutex);
+#endif
   if (!DEFAULT_LOG) {
     DEFAULT_LOG = log_create();
   }
   log *result = DEFAULT_LOG;
+#if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_unlock(&default_log_mutex);
+#else
+  LeaveCriticalSection(&default_log_mutex);
+#endif
   return result;
 }
 
@@ -1693,7 +1735,7 @@ void log_remove_handler(log *ctx, int idx) {
 }
 
 void log_log(log *ctx, int level, const char *file, int line, const char *fmt, ...) {
-  if (!ctx) return;
+  if (!ctx || !fmt) return;
 
   rwlock_read_lock(&ctx->rwlock);
 
@@ -1799,31 +1841,32 @@ void log_rotate(log *ctx) {
   if (!ctx || !ctx->file_prefix) return;
 
   rwlock_write_lock(&ctx->rwlock);
-  rotate_file(ctx, ctx->file_prefix);
 
-  /* Update all file handlers that use this prefix */
+  /* On Windows, rename fails on open files; flush and close before rotating. */
   for (int i = 0; i < ctx->handler_count; i++) {
     if (!ctx->handlers[i].fp) continue;
-
+    if (ctx->handlers[i].fp == stderr || ctx->handlers[i].fp == stdout) continue;
+    fflush(ctx->handlers[i].fp);
     if (ctx->handlers[i].owns_file) {
-      /* Handler owns the file: close old, open new */
-      fflush(ctx->handlers[i].fp);
-      if (ctx->handlers[i].fp != stderr && ctx->handlers[i].fp != stdout) {
-        fclose(ctx->handlers[i].fp);
-      }
-      ctx->handlers[i].fp = fopen(ctx->file_prefix, "a");
-      if (ctx->handlers[i].fp) {
-        ctx->handlers[i].udata = ctx->handlers[i].fp;
-        ctx->handlers[i].file_size = 0;
-      }
-    } else {
-      /* Handler doesn't own the file: flush old, open new (caller must close old) */
-      fflush(ctx->handlers[i].fp);
-      ctx->handlers[i].fp = fopen(ctx->file_prefix, "a");
-      if (ctx->handlers[i].fp) {
-        ctx->handlers[i].udata = ctx->handlers[i].fp;
-        ctx->handlers[i].file_size = 0;
-      }
+      fclose(ctx->handlers[i].fp);
+      ctx->handlers[i].fp = NULL;
+    }
+  }
+
+  rotate_file(ctx, ctx->file_prefix);
+
+  /* Reopen handlers at the new path */
+  for (int i = 0; i < ctx->handler_count; i++) {
+    if (!ctx->handlers[i].udata) continue;
+    /* Skip stdout/stderr handlers (they have no real file) */
+    if (ctx->handlers[i].fp == stdout || ctx->handlers[i].fp == stderr) continue;
+
+    ctx->handlers[i].fp = fopen(ctx->file_prefix, "a");
+    if (ctx->handlers[i].fp) {
+      ctx->handlers[i].udata = ctx->handlers[i].fp;
+      ctx->handlers[i].file_size = 0;
+      /* Library opened the new file, so it now owns it */
+      ctx->handlers[i].owns_file = true;
     }
   }
   rwlock_write_unlock(&ctx->rwlock);

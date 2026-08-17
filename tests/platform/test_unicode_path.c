@@ -10,7 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <locale.h>
+
+#if !defined(_WIN32) && !defined(_WIN64)
 #include <dirent.h>
+#endif
 
 static void test_chinese_path(void) {
     const char *path = "/tmp/测试日志_ログ_test.log";
@@ -139,10 +142,13 @@ static void test_unicode_json_content(void) {
 static void test_long_path(void) {
     /* Create a deep directory path */
     char path[512];
+#if defined(_WIN32) || defined(_WIN64)
+    snprintf(path, sizeof(path), "test_very\\long\\nested\\path\\to\\log\\files\\application.log");
+    system("mkdir test_very\\long\\nested\\path\\to\\log\\files 2>nul");
+#else
     snprintf(path, sizeof(path), "/tmp/very/long/nested/path/to/log/files/application.log");
-
-    /* Create directories */
     system("mkdir -p /tmp/very/long/nested/path/to/log/files");
+#endif
     remove(path);
 
     FILE *fp = fopen(path, "w");
@@ -175,7 +181,11 @@ static void test_long_path(void) {
 
     /* Cleanup */
     remove(path);
+#if defined(_WIN32) || defined(_WIN64)
+    system("rmdir /s /q test_very 2>nul");
+#else
     system("rm -rf /tmp/very");
+#endif
     TEST_PASS("Long nested path");
 }
 

@@ -50,6 +50,27 @@
   #error "C11 or later with stdatomic.h required, or MSVC"
 #endif
 
+/* Cross-platform alignment macro */
+#if defined(_MSC_VER)
+  #define LOG_ALIGN_64 __declspec(align(64))
+#elif defined(__GNUC__) || defined(__clang__)
+  #define LOG_ALIGN_64 __attribute__((aligned(64)))
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+  #define LOG_ALIGN_64 _Alignas(64)
+#else
+  #define LOG_ALIGN_64
+#endif
+
+/* Cross-platform atomic size type */
+#if defined(LOG_USE_STDATOMIC)
+  #include <stdatomic.h>
+  typedef atomic_size_t log_atomic_size_t;
+#elif defined(LOG_USE_MSVC_ATOMIC)
+  typedef volatile size_t log_atomic_size_t;
+#else
+  typedef volatile size_t log_atomic_size_t;
+#endif
+
 #if defined(LOG_PLATFORM_POSIX)
   #include <pthread.h>
   #include <unistd.h>
@@ -58,7 +79,7 @@
   #define LOG_THREAD_CREATE(t, f, a) pthread_create(&(t), NULL, (f), (a))
   #define LOG_THREAD_JOIN(t) pthread_join((t), NULL)
   #define LOG_THREAD_ID_T unsigned long
-  #define LOG_GET_THREAD_ID() ((LOG_THREAD_ID_T)pthread_self())
+  #define LOG_GET_THREAD_ID() ((LOG_THREAD_ID_T)pthread_self__)
 #endif
 
 #ifdef LOG_PLATFORM_WINDOWS
@@ -355,7 +376,7 @@ typedef struct log_thread_stats {
   uint64_t async_writes;
   uint64_t sync_writes;
   uint64_t padding[4];
-} __attribute__((aligned(64))) log_thread_stats;
+} LOG_ALIGN_64 log_thread_stats;
 
 /**
  * @brief Log queue entry for async mode
@@ -423,8 +444,8 @@ typedef struct log_ring_queue {
   CONDITION_VARIABLE cond;
   CONDITION_VARIABLE space_cond;
 #endif
-  atomic_size_t head;
-  atomic_size_t tail;
+  log_atomic_size_t head;
+  log_atomic_size_t tail;
   bool closed;
 } log_ring_queue;
 

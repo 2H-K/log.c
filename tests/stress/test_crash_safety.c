@@ -2,6 +2,8 @@
  * test_crash_safety.c - Crash safety test
  * Forks a child process that writes logs then aborts.
  * Parent verifies that flushed logs are preserved.
+ *
+ * NOTE: fork()/waitpid() are POSIX-only; on Windows this test is skipped.
  */
 
 #include "test_harness.h"
@@ -10,10 +12,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>
 #include <sys/wait.h>
+#endif
 
 static void test_crash_after_fsync(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    TEST_SKIP("crash_after_fsync requires fork() (POSIX only)");
+    return;
+#else
     const char *tmpfile = "/tmp/test_crash_fsync.log";
     remove(tmpfile);
 
@@ -73,9 +82,14 @@ static void test_crash_after_fsync(void) {
 
     remove(tmpfile);
     TEST_PASS("crash after fsync");
+#endif
 }
 
 static void test_crash_no_flush(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    TEST_SKIP("crash_no_flush requires fork() (POSIX only)");
+    return;
+#else
     const char *tmpfile = "/tmp/test_crash_noflush.log";
     remove(tmpfile);
 
@@ -118,9 +132,14 @@ static void test_crash_no_flush(void) {
 
     remove(tmpfile);
     TEST_PASS("crash without flush");
+#endif
 }
 
 static void test_crash_async_mode(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    TEST_SKIP("crash_async_mode requires fork() (POSIX only)");
+    return;
+#else
     const char *tmpfile = "/tmp/test_crash_async.log";
     remove(tmpfile);
 
@@ -167,6 +186,7 @@ static void test_crash_async_mode(void) {
 
     remove(tmpfile);
     TEST_PASS("crash in async mode");
+#endif
 }
 
 void test_crash_safety_register(void) {

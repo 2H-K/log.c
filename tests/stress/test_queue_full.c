@@ -7,7 +7,7 @@
 #include "log.h"
 
 static void test_queue_drop_policy(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -34,7 +34,7 @@ static void test_queue_drop_policy(void) {
 }
 
 static void test_queue_fallback_sync_policy(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -60,7 +60,7 @@ static void test_queue_fallback_sync_policy(void) {
 }
 
 static void test_queue_block_policy(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();

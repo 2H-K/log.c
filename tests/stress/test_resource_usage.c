@@ -1,6 +1,9 @@
 /**
  * test_resource_usage.c - Resource usage measurement
  * Measures CPU time, memory (RSS), file descriptors, and threads
+ *
+ * NOTE: Uses /proc/self, getrusage(), etc. — POSIX-only.
+ *       On Windows all tests are skipped.
  */
 
 #include "test_harness.h"
@@ -9,11 +12,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ==================== Resource Measurement Helpers ==================== */
+
+#if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>
 #include <sys/resource.h>
 #include <dirent.h>
-
-/* ==================== Resource Measurement Helpers ==================== */
 
 static long get_kb_rss(void) {
     FILE *fp = fopen("/proc/self/status", "r");
@@ -71,7 +76,7 @@ static void test_memory_baseline(void) {
 
     /* Create a log context */
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     long rss_after = get_kb_rss();
@@ -93,7 +98,7 @@ static void test_memory_stability(void) {
     /* Create and destroy many contexts */
     for (int i = 0; i < 10000; i++) {
         log *ctx = log_create();
-        FILE *fp = fopen("/dev/null", "w");
+        FILE *fp = fopen(TEST_DEV_NULL, "w");
         log_add_fp(ctx, fp, LOG_INFO);
         log_destroy(ctx);
         fclose(fp);
@@ -116,7 +121,7 @@ static void test_fd_leak(void) {
     /* Create and destroy many file handlers */
     for (int i = 0; i < 100; i++) {
         log *ctx = log_create();
-        FILE *fp = fopen("/dev/null", "w");
+        FILE *fp = fopen(TEST_DEV_NULL, "w");
         log_add_fp(ctx, fp, LOG_INFO);
         log_destroy(ctx);
         fclose(fp);
@@ -138,7 +143,7 @@ static void test_thread_leak_sync(void) {
 
     /* Sync mode should not create extra threads */
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
     for (int i = 0; i < 1000; i++) {
@@ -163,7 +168,7 @@ static void test_thread_leak_async(void) {
 
     /* Async mode creates one background thread */
     log *ctx = log_create();
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
     log_set_async(ctx, true);
 
@@ -195,7 +200,7 @@ static void test_thread_leak_async(void) {
 }
 
 static void test_cpu_overhead_sync(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     log *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -257,3 +262,21 @@ void test_resource_usage_register(void) {
     test_add(test_cpu_overhead_sync, "cpu_overhead_sync");
     test_add(test_handle_limit, "handle_limit");
 }
+
+#else /* Windows - all tests skipped */
+
+static void test_resource_skip(void) {
+    TEST_SKIP("resource usage tests require /proc/self, getrusage() (POSIX only)");
+}
+
+void test_resource_usage_register(void) {
+    test_add(test_resource_skip, "memory_baseline");
+    test_add(test_resource_skip, "memory_stability");
+    test_add(test_resource_skip, "fd_leak");
+    test_add(test_resource_skip, "thread_leak_sync");
+    test_add(test_resource_skip, "thread_leak_async");
+    test_add(test_resource_skip, "cpu_overhead_sync");
+    test_add(test_resource_skip, "handle_limit");
+}
+
+#endif

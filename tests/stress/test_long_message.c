@@ -89,7 +89,7 @@ static void test_long_message_json(void) {
 }
 
 static void test_long_message_async(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();

@@ -168,8 +168,10 @@ static int test_run_all(void) {
 
 #if defined(_WIN32) || defined(_WIN64)
   #define TEST_PLATFORM TEST_PLATFORM_WINDOWS
+  #define TEST_DEV_NULL "NUL"
 #else
   #define TEST_PLATFORM TEST_PLATFORM_POSIX
+  #define TEST_DEV_NULL "/dev/null"
 #endif
 
 #define TEST_ON_POSIX() (TEST_PLATFORM == TEST_PLATFORM_POSIX)

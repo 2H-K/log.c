@@ -24,7 +24,7 @@ static void* async_writer(void *arg) {
 }
 
 static void test_mt_async_basic(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -56,7 +56,7 @@ static void test_mt_async_basic(void) {
 }
 
 static void test_mt_async_ring_queue(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -87,7 +87,7 @@ static void test_mt_async_ring_queue(void) {
 }
 
 static void test_mt_async_no_crash_stress(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();

@@ -7,7 +7,7 @@
 #include "log.h"
 
 static void test_level_filter_all_pass(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -30,7 +30,7 @@ static void test_level_filter_all_pass(void) {
 }
 
 static void test_level_filter_warn_and_above(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -56,7 +56,7 @@ static void test_level_filter_warn_and_above(void) {
 }
 
 static void test_level_filter_quiet_mode(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -78,7 +78,7 @@ static void test_level_filter_quiet_mode(void) {
 }
 
 static void test_level_counts_accuracy(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();

@@ -5,6 +5,9 @@
  * Technique: Use __malloc_hook to intercept malloc calls during logging.
  * Note: __malloc_hook is deprecated but still works on glibc.
  * For production, use strace or LD_PRELOAD instead.
+ *
+ * NOTE: Uses dlsym(), __malloc_hook (glibc), /dev/null — POSIX/Linux-only.
+ *       On Windows all tests are skipped.
  */
 
 #include "test_harness.h"
@@ -13,6 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if !defined(_WIN32) && !defined(_WIN64)
 #include <dlfcn.h>
 
 /* Counter for malloc calls */
@@ -53,7 +58,7 @@ static size_t get_malloc_count(void) {
 /* ==================== Tests ==================== */
 
 static void test_malloc_sync_short_message(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -86,7 +91,7 @@ static void test_malloc_sync_short_message(void) {
 }
 
 static void test_malloc_sync_long_message(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -123,7 +128,7 @@ static void test_malloc_sync_long_message(void) {
 }
 
 static void test_malloc_async_short_message(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -158,7 +163,7 @@ static void test_malloc_async_short_message(void) {
 
 static void test_malloc_formatter_direct(void) {
     /* Test the formatting function directly */
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -204,7 +209,7 @@ static void *mt_malloc_writer(void *arg) {
 }
 
 static void test_malloc_multithread(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -255,3 +260,19 @@ void test_malloc_detection_register(void) {
     test_add(test_malloc_formatter_direct, "malloc_formatter");
     test_add(test_malloc_multithread, "malloc_multithread");
 }
+
+#else /* Windows - all tests skipped */
+
+static void test_malloc_skip(void) {
+    TEST_SKIP("malloc detection tests require dlsym/__malloc_hook (POSIX/Linux only)");
+}
+
+void test_malloc_detection_register(void) {
+    test_add(test_malloc_skip, "malloc_sync_short");
+    test_add(test_malloc_skip, "malloc_sync_long");
+    test_add(test_malloc_skip, "malloc_async_short");
+    test_add(test_malloc_skip, "malloc_formatter");
+    test_add(test_malloc_skip, "malloc_multithread");
+}
+
+#endif

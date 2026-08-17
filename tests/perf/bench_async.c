@@ -8,7 +8,7 @@
 #include "perf/bench_common.h"
 
 static void test_bench_async_single(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(DEV_NULL_PATH, "w");
     log *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
     ctx->handlers[0].active = false;
@@ -29,7 +29,7 @@ static void test_bench_async_single(void) {
 }
 
 static void test_bench_async_multi(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(DEV_NULL_PATH, "w");
     log *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
     ctx->handlers[0].active = false;
@@ -63,7 +63,7 @@ static void test_bench_async_multi(void) {
 }
 
 static void test_bench_async_latency(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(DEV_NULL_PATH, "w");
     log *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
     ctx->handlers[0].active = false;
@@ -89,7 +89,7 @@ static void test_bench_async_latency(void) {
 }
 
 static void test_bench_async_ring_queue(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(DEV_NULL_PATH, "w");
     log *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
     ctx->handlers[0].active = false;

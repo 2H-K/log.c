@@ -7,7 +7,7 @@
 #include "log.h"
 
 static void test_stats_total_count(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -29,7 +29,7 @@ static void test_stats_total_count(void) {
 }
 
 static void test_stats_level_counts(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -57,7 +57,7 @@ static void test_stats_level_counts(void) {
 }
 
 static void test_stats_filtered_count(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();
@@ -81,7 +81,7 @@ static void test_stats_filtered_count(void) {
 }
 
 static void test_stats_async_counts(void) {
-    FILE *fp = fopen("/dev/null", "w");
+    FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
     log *ctx = log_create();

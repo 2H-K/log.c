@@ -11,11 +11,13 @@
 #define THREAD_T HANDLE
 #define THREAD_CREATE(t, f, a) ((t) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(f), (a), 0, NULL))
 #define THREAD_JOIN(t) (WaitForSingleObject((t), INFINITE), CloseHandle((t)))
+#define DEV_NULL_PATH "NUL"
 #else
 #include <pthread.h>
 #define THREAD_T pthread_t
 #define THREAD_CREATE(t, f, a) pthread_create(&(t), NULL, (f), (a))
 #define THREAD_JOIN(t) pthread_join((t), NULL)
+#define DEV_NULL_PATH "/dev/null"
 #endif
 
 #define BENCH_N 500000
