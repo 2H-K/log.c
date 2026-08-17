@@ -41,31 +41,30 @@ if(NOT WIN32)
     target_link_libraries(logc PUBLIC Threads::Threads)
 endif()
 
-# Optional: Build examples
-# option(BUILD_EXAMPLES "Build example programs" OFF)
-# if(BUILD_EXAMPLES)
-#     add_executable(example src/example.c)
-#     target_link_libraries(example PRIVATE logc)
-# 
-#     add_executable(example_thread_safety src/example_thread_safety.c)
-#     target_link_libraries(example_thread_safety PRIVATE logc)
-#     
-#     add_executable(performance_test src/performance_test.c)
-#     target_link_libraries(performance_test PRIVATE logc)
-# endif()
-
 # Tests
 option(BUILD_TESTS "Build test suite" ON)
 if(BUILD_TESTS)
     enable_testing()
-    add_executable(test_suite test/test_suite.c)
-    target_link_libraries(test_suite PRIVATE logc)
-    add_test(NAME test_suite COMMAND test_suite)
+
+    add_executable(benchmark tests/benchmark.c)
+    target_link_libraries(benchmark PRIVATE logc)
+    add_test(NAME benchmark COMMAND benchmark)
+
+    add_executable(feature_test tests/feature_test.c)
+    target_link_libraries(feature_test PRIVATE logc)
+    add_test(NAME feature_test COMMAND feature_test)
+
+    add_executable(thread_test tests/thread_test.c)
+    target_link_libraries(thread_test PRIVATE logc)
+    add_test(NAME thread_test COMMAND thread_test)
 endif()
 
-# Fixes test
-# add_executable(test_fixes src/test_fixes.c)
-# target_link_libraries(test_fixes PRIVATE logc)
+# Examples
+option(BUILD_EXAMPLES "Build example programs" ON)
+if(BUILD_EXAMPLES)
+    add_executable(example tests/example.c)
+    target_link_libraries(example PRIVATE logc)
+endif()
 
 # Installation
 install(TARGETS logc

@@ -293,7 +293,8 @@ static void format_timestamp(double ts, char *buf, size_t size, bool use_cache) 
   if (use_cache) {
     if (cache->cached_string[0] != '\0' && cache->last_timestamp == (double)t) {
       cache->cache_hits++;
-      snprintf(buf, size, "%s.%03d", cache->cached_string, (int)((ts - (double)t) * 1000));
+      int ms = (int)((ts - (double)t) * 1000);
+      snprintf(buf, size, "%s.%03d", cache->cached_string, ms);
       return;
     }
 #if defined(LOG_PLATFORM_POSIX)
@@ -305,7 +306,8 @@ static void format_timestamp(double ts, char *buf, size_t size, bool use_cache) 
       strftime(cache->cached_string, sizeof(cache->cached_string), "%Y-%m-%dT%H:%M:%S", tm_info);
       cache->last_timestamp = (double)t;
       cache->cache_misses++;
-      snprintf(buf, size, "%s.%03d", cache->cached_string, (int)((ts - (double)t) * 1000));
+      int ms = (int)((ts - (double)t) * 1000);
+      snprintf(buf, size, "%s.%03d", cache->cached_string, ms);
       return;
     }
     cache->cached_string[0] = '\0';
@@ -320,7 +322,10 @@ static void format_timestamp(double ts, char *buf, size_t size, bool use_cache) 
   if (tm_info) {
     strftime(buf, size, "%Y-%m-%dT%H:%M:%S", tm_info);
     int ms = (int)((ts - (double)t) * 1000);
-    snprintf(buf + strlen(buf), size - strlen(buf), ".%03d", ms);
+    size_t len = strlen(buf);
+    if (len + 5 <= size) {
+      snprintf(buf + len, size - len, ".%03d", ms);
+    }
   } else {
     buf[0] = '\0';
   }
@@ -755,6 +760,115 @@ static bool ring_queue_push(log_ring_queue *rq, const char *msg, const char *fil
   return true;
 }
 
+/* Format directly into ring buffer slot - eliminates malloc + memcpy for small messages */
+static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap,
+                                 const char *file, int level, int line,
+                                 double timestamp, bool blocking) {
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&rq->mtx);
+#else
+  EnterCriticalSection(&rq->mtx);
+#endif
+  if (rq->closed) {
+#if defined(LOG_PLATFORM_POSIX)
+    pthread_mutex_unlock(&rq->mtx);
+#else
+    LeaveCriticalSection(&rq->mtx);
+#endif
+    return false;
+  }
+  size_t head = atomic_load(&rq->head);
+  size_t tail = atomic_load(&rq->tail);
+  while (tail - head >= rq->capacity) {
+    if (!blocking) {
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&rq->mtx);
+#else
+      LeaveCriticalSection(&rq->mtx);
+#endif
+      return false;
+    }
+    tl_stats.queue_blocked++;
+#if defined(LOG_PLATFORM_POSIX)
+    pthread_cond_wait(&rq->space_cond, &rq->mtx);
+#else
+    SleepConditionVariableCS(&rq->space_cond, &rq->mtx, INFINITE);
+#endif
+    if (rq->closed) {
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&rq->mtx);
+#else
+      LeaveCriticalSection(&rq->mtx);
+#endif
+      return false;
+    }
+    head = atomic_load(&rq->head);
+    tail = atomic_load(&rq->tail);
+  }
+  log_ring_entry *entry = &rq->buffer[tail & rq->mask];
+
+  va_list ap_copy;
+  va_copy(ap_copy, ap);
+  int msg_len = vsnprintf(entry->msg, sizeof(entry->msg), fmt, ap_copy);
+  va_end(ap_copy);
+
+  if (msg_len < 0) {
+    entry->has_large_msg = false;
+    entry->msg[0] = '\0';
+  } else if ((size_t)msg_len >= sizeof(entry->msg)) {
+    entry->has_large_msg = true;
+    char *large = malloc((size_t)msg_len + 1);
+    if (!large) {
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&rq->mtx);
+#else
+      LeaveCriticalSection(&rq->mtx);
+#endif
+      return false;
+    }
+    va_list ap_copy2;
+    va_copy(ap_copy2, ap);
+    vsnprintf(large, (size_t)msg_len + 1, fmt, ap_copy2);
+    va_end(ap_copy2);
+    *(char**)entry->msg = large;
+  } else {
+    entry->has_large_msg = false;
+  }
+
+  size_t file_len = file ? strlen(file) : 0;
+  if (file_len >= sizeof(entry->file)) {
+    entry->has_large_file = true;
+    char *large = malloc(file_len + 1);
+    if (!large) {
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&rq->mtx);
+#else
+      LeaveCriticalSection(&rq->mtx);
+#endif
+      return false;
+    }
+    if (file) memcpy(large, file, file_len + 1);
+    else large[0] = '\0';
+    *(char**)entry->file = large;
+  } else {
+    entry->has_large_file = false;
+    if (file) memcpy(entry->file, file, file_len + 1);
+    else entry->file[0] = '\0';
+  }
+  entry->level = level;
+  entry->line = line;
+  entry->timestamp = timestamp;
+  atomic_store(&rq->tail, tail + 1);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_cond_signal(&rq->cond);
+  pthread_mutex_unlock(&rq->mtx);
+#else
+  WakeConditionVariable(&rq->cond);
+  LeaveCriticalSection(&rq->mtx);
+#endif
+  return true;
+}
+
 static bool ring_queue_pop(log_ring_queue *rq, log_ring_entry *entry, char **msg_ptr, char **file_ptr) {
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&rq->mtx);
@@ -842,7 +956,7 @@ static int format_prefix(log *ctx, log_event *ev, char *buf, size_t buf_size,
     int n = ctx->format_fn(ctx, ev, buf, buf_size);
     return n < 0 ? 0 : n;
   }
-  char time_buf[32];
+  char time_buf[64];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf),
                    ctx && ctx->enable_ts_cache);
 #ifdef LOG_USE_COLOR
@@ -995,7 +1109,7 @@ static void json_handler(log *ctx, log_event *ev) {
   char *msg = format_message(ev);
   if (!msg) return;
 
-  char time_buf[32];
+  char time_buf[64];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf),
                    ctx && ctx->enable_ts_cache);
 
@@ -1175,10 +1289,10 @@ log* log_create(void) {
 
   mpool_init(&ctx->mpool, LOG_MPOOL_MAX_CHUNKS * LOG_MPOOL_CHUNK_SIZE);
   ctx->enable_ts_cache = true;
-  ctx->enable_mpool = false;
+  ctx->enable_mpool = true;
 
   ring_queue_init(&ctx->ring_queue, DEFAULT_QUEUE_SIZE);
-  ctx->use_ring_queue = false;
+  ctx->use_ring_queue = true;
   ctx->clock_source = LOG_CLOCK_REALTIME_COARSE;
 
   log_add_handler(ctx, stdout_handler, stderr, LOG_TRACE);
@@ -1255,12 +1369,14 @@ const char* log_level_string(int level) {
 }
 
 void log_set_level(log *ctx, int level) {
+  if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->level = level;
   rwlock_write_unlock(&ctx->rwlock);
 }
 
 void log_set_quiet(log *ctx, bool enable) {
+  if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->quiet = enable;
   rwlock_write_unlock(&ctx->rwlock);
@@ -1570,26 +1686,17 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
   if (ctx->async_enabled) {
     bool pushed;
     if (ctx->use_ring_queue) {
-      char *msg = NULL;
       va_start(ev.ap, fmt);
-      int msg_len = vsnprintf(NULL, 0, fmt, ev.ap);
+      pushed = ring_queue_push_vfmt(&ctx->ring_queue, fmt, ev.ap, file, level, line,
+                                    ev.timestamp, ctx->queue_policy == LOG_QUEUE_BLOCK);
       va_end(ev.ap);
-      if (msg_len >= 0) {
-        msg = malloc(msg_len + 1);
-        if (msg) {
-          va_start(ev.ap, fmt);
-          vsnprintf(msg, msg_len + 1, fmt, ev.ap);
-          va_end(ev.ap);
+      if (!pushed) {
+        if (ctx->queue_policy == LOG_QUEUE_DROP) {
+          STAT_INC(queue_drops);
         }
-      }
-      if (!msg) {
-        STAT_INC(queue_drops);
         rwlock_read_unlock(&ctx->rwlock);
         return;
       }
-      pushed = ring_queue_push(&ctx->ring_queue, msg, file, level, line, ev.timestamp,
-                               ctx->queue_policy == LOG_QUEUE_BLOCK);
-      if (!pushed) free(msg);
     } else {
       va_start(ev.ap, fmt);
       log_queue_entry *entry = queue_entry_create(ctx, &ev);
@@ -1675,7 +1782,7 @@ int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size) {
   char *msg = format_message(ev);
   if (!msg) return 0;
 
-  char time_buf[32];
+  char time_buf[64];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf),
                    ctx && ctx->enable_ts_cache);
 
