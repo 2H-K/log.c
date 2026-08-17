@@ -85,6 +85,102 @@
 #define LOG_MAX_ROTATION_FILES 5
 #define LOG_DEFAULT_MAX_SIZE (10 * 1024 * 1024)
 
+/* ======================================================================== */
+/* Compile-time feature flags                                               */
+/* Define these BEFORE including log.h to disable features                  */
+/* ======================================================================== */
+
+/* Disable JSON formatting support (saves ~2KB binary) */
+#ifndef LOG_DISABLE_JSON
+  #define LOG_FEATURE_JSON 1
+#else
+  #define LOG_FEATURE_JSON 0
+#endif
+
+/* Disable Syslog support (POSIX only, saves ~1KB binary) */
+#ifndef LOG_DISABLE_SYSLOG
+  #define LOG_FEATURE_SYSLOG 1
+#else
+  #define LOG_FEATURE_SYSLOG 0
+#endif
+
+/* Disable async logging support (saves ~3KB binary) */
+#ifndef LOG_DISABLE_ASYNC
+  #define LOG_FEATURE_ASYNC 1
+#else
+  #define LOG_FEATURE_ASYNC 0
+#endif
+
+/* Disable memory pool for queue entries (saves ~1KB binary) */
+#ifndef LOG_DISABLE_MPOOL
+  #define LOG_FEATURE_MPOOL 1
+#else
+  #define LOG_FEATURE_MPOOL 0
+#endif
+
+/* Disable ring buffer queue (saves ~2KB binary) */
+#ifndef LOG_DISABLE_RING_QUEUE
+  #define LOG_FEATURE_RING_QUEUE 1
+#else
+  #define LOG_FEATURE_RING_QUEUE 0
+#endif
+
+/* Disable performance statistics (saves ~0.5KB binary) */
+#ifndef LOG_DISABLE_STATS
+  #define LOG_FEATURE_STATS 1
+#else
+  #define LOG_FEATURE_STATS 0
+#endif
+
+/* Disable file operations (rotation, file handlers) (saves ~3KB binary) */
+#ifndef LOG_DISABLE_FILE_OPS
+  #define LOG_FEATURE_FILE_OPS 1
+#else
+  #define LOG_FEATURE_FILE_OPS 0
+#endif
+
+/* Disable thread ID support (saves ~0.3KB binary) */
+#ifndef LOG_DISABLE_THREAD_ID
+  #define LOG_FEATURE_THREAD_ID 1
+#else
+  #define LOG_FEATURE_THREAD_ID 0
+#endif
+
+/* Disable timestamp cache (saves ~0.2KB binary) */
+#ifndef LOG_DISABLE_TS_CACHE
+  #define LOG_FEATURE_TS_CACHE 1
+#else
+  #define LOG_FEATURE_TS_CACHE 0
+#endif
+
+/* Convenience: Disable all optional features for minimal build */
+#ifdef LOG_MINIMAL
+  #ifndef LOG_DISABLE_JSON
+    #define LOG_DISABLE_JSON
+  #endif
+  #ifndef LOG_DISABLE_SYSLOG
+    #define LOG_DISABLE_SYSLOG
+  #endif
+  #ifndef LOG_DISABLE_ASYNC
+    #define LOG_DISABLE_ASYNC
+  #endif
+  #ifndef LOG_DISABLE_MPOOL
+    #define LOG_DISABLE_MPOOL
+  #endif
+  #ifndef LOG_DISABLE_RING_QUEUE
+    #define LOG_DISABLE_RING_QUEUE
+  #endif
+  #ifndef LOG_DISABLE_STATS
+    #define LOG_DISABLE_STATS
+  #endif
+  #ifndef LOG_DISABLE_THREAD_ID
+    #define LOG_DISABLE_THREAD_ID
+  #endif
+  #ifndef LOG_DISABLE_TS_CACHE
+    #define LOG_DISABLE_TS_CACHE
+  #endif
+#endif
+
 enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL, LOG_LEVELS };
 
 #define LOG_SYSLOG_EMERG   0
@@ -189,6 +285,36 @@ struct log_event {
   int level;
   double timestamp;  /* High-precision timestamp in seconds */
 };
+
+/* ==================== Stubs for disabled features ==================== */
+
+#if !LOG_FEATURE_JSON
+static inline int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size) {
+  (void)ctx; (void)ev; (void)buf; (void)buf_size; return 0;
+}
+static inline void log_enable_json_format(log* ctx) { (void)ctx; }
+#endif
+
+#if !LOG_FEATURE_THREAD_ID
+static inline void log_enable_thread_id(log *ctx, int handler_idx, bool enable) {
+  (void)ctx; (void)handler_idx; (void)enable;
+}
+#endif
+
+#if !LOG_FEATURE_TS_CACHE
+static inline void log_enable_ts_cache(log *ctx, bool enable) { (void)ctx; (void)enable; }
+#endif
+
+#if !LOG_FEATURE_STATS
+static inline void log_get_perf_stats(log *ctx, log_stats *stats) { (void)ctx; (void)stats; }
+#endif
+
+#if !LOG_FEATURE_SYSLOG
+static inline int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level) {
+  (void)ctx; (void)ident; (void)facility; (void)level; return -1;
+}
+static inline int log_level_to_syslog(int level) { (void)level; return 6; }
+#endif
 
 /**
  * @brief Logger configuration

@@ -13,6 +13,7 @@
 #include "core/test_format.c"
 #include "core/test_null.c"
 #include "core/test_stats.c"
+#include "core/test_boundary.c"
 
 /* Thread tests */
 #include "thread/test_mt_sync.c"
@@ -30,6 +31,8 @@
 #include "stress/test_integrity.c"
 #include "stress/test_crash_safety.c"
 #include "stress/test_resource_usage.c"
+#include "stress/test_rotation_stress.c"
+#include "stress/test_malloc_detection.c"
 
 /* Perf tests */
 #include "perf/bench_sync.c"
@@ -42,6 +45,7 @@ int main(void) {
     extern void test_format_register(void);
     extern void test_null_register(void);
     extern void test_stats_register(void);
+    extern void test_boundary_register(void);
 
     /* Thread */
     extern void test_mt_sync_register(void);
@@ -59,6 +63,8 @@ int main(void) {
     extern void test_integrity_register(void);
     extern void test_crash_safety_register(void);
     extern void test_resource_usage_register(void);
+    extern void test_rotation_stress_register(void);
+    extern void test_malloc_detection_register(void);
 
     /* Perf */
     extern void bench_sync_register(void);
@@ -69,6 +75,7 @@ int main(void) {
     test_format_register();
     test_null_register();
     test_stats_register();
+    test_boundary_register();
 
     test_mt_sync_register();
     test_mt_async_register();
@@ -83,6 +90,8 @@ int main(void) {
     test_integrity_register();
     test_crash_safety_register();
     test_resource_usage_register();
+    test_rotation_stress_register();
+    test_malloc_detection_register();
 
     bench_sync_register();
     bench_async_register();

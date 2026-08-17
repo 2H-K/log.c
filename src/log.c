@@ -109,21 +109,31 @@ static inline bool atomic_compare_exchange_weak(volatile void* obj, void* expect
 
 static LOG_THREAD_LOCAL log_thread_stats tl_stats = {0};
 
+#if LOG_FEATURE_STATS
 #define STAT_INC(f) (tl_stats.f++)
 #define STAT_LOAD(f) (tl_stats.f)
 #define STAT_STORE(f, v) (tl_stats.f = (v))
+#else
+#define STAT_INC(f) ((void)0)
+#define STAT_LOAD(f) (0)
+#define STAT_STORE(f, v) ((void)(v))
+#endif
 
 static void reset_thread_stats(void) {
+#if LOG_FEATURE_STATS
   memset(&tl_stats, 0, sizeof(tl_stats));
+#endif
 }
 
 static void aggregate_stats(log *ctx) {
+#if LOG_FEATURE_STATS
   ctx->stats.total_count = tl_stats.total_count;
   for (int i = 0; i < LOG_LEVELS; i++) {
     ctx->stats.level_counts[i] = tl_stats.level_counts[i];
   }
   ctx->stats.queue_drops = tl_stats.queue_drops;
   ctx->stats.sync_writes = tl_stats.sync_writes;
+#endif
 }
 
 static log *DEFAULT_LOG = NULL;
@@ -138,6 +148,8 @@ static const char *level_colors[] = {
   "\x1b[90m", "\x1b[36m", "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[91m"
 };
 #endif
+
+#if LOG_FEATURE_MPOOL
 
 static void mpool_init(log_mpool *mp, size_t max_size) {
   mp->free_list = NULL;
@@ -209,6 +221,8 @@ static log_queue_entry* mpool_alloc(log_mpool *mp) {
 #endif
   return entry;
 }
+
+#endif /* LOG_FEATURE_MPOOL */
 
 static void mpool_free(log_mpool *mp, log_queue_entry *entry) {
   if (!entry) return;
@@ -288,8 +302,9 @@ static LOG_THREAD_LOCAL log_ts_cache ts_cache_local;
  * whole-second value does not change (avoids localtime + strftime). */
 static void format_timestamp(double ts, char *buf, size_t size, bool use_cache) {
   time_t t = (time_t)ts;
-  log_ts_cache *cache = &ts_cache_local;
   struct tm tm_buf;
+#if LOG_FEATURE_TS_CACHE
+  log_ts_cache *cache = &ts_cache_local;
   if (use_cache) {
     if (cache->cached_string[0] != '\0' && cache->last_timestamp == (double)t) {
       cache->cache_hits++;
@@ -314,6 +329,9 @@ static void format_timestamp(double ts, char *buf, size_t size, bool use_cache) 
     buf[0] = '\0';
     return;
   }
+#else
+  (void)use_cache;
+#endif /* LOG_FEATURE_TS_CACHE */
 #if defined(LOG_PLATFORM_POSIX)
   struct tm *tm_info = localtime_r(&t, &tm_buf);
 #else
@@ -631,6 +649,8 @@ static void queue_destroy(log_queue *q) {
 
 /* ==================== Ring Buffer Implementation ==================== */
 
+#if LOG_FEATURE_RING_QUEUE
+
 static void ring_queue_init(log_ring_queue *rq, size_t capacity) {
   size_t cap = 1;
   while (cap < capacity) cap <<= 1;
@@ -932,6 +952,8 @@ static void ring_queue_shutdown(log_ring_queue *rq) {
 #endif
 }
 
+#endif /* LOG_FEATURE_RING_QUEUE */
+
 /* Format helpers: the message is formatted exactly once, then shared by all handlers. */
 static char* format_message(log_event *ev) {
   if (ev->raw_msg) {
@@ -1105,6 +1127,7 @@ static void file_handler_wrapper(log *ctx, log_event *ev) {
   }
 }
 
+#if LOG_FEATURE_JSON
 static void json_handler(log *ctx, log_event *ev) {
   char *msg = format_message(ev);
   if (!msg) return;
@@ -1179,8 +1202,10 @@ static void json_handler(log *ctx, log_event *ev) {
   free(escaped_msg);
   free(buf);
 }
+#endif /* LOG_FEATURE_JSON */
 
 /* Async writer thread */
+#if LOG_FEATURE_ASYNC
 #if defined(LOG_PLATFORM_POSIX)
 static void* async_writer_thread(void *arg) {
 #else
@@ -1249,6 +1274,7 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
   return 0;
 #endif
 }
+#endif /* LOG_FEATURE_ASYNC */
 
 /* API Implementation */
 log* log_create(void) {
@@ -1509,6 +1535,7 @@ void log_enable_mpool(log *ctx, bool enable) {
 #endif
 }
 
+#if LOG_FEATURE_TS_CACHE
 void log_enable_ts_cache(log *ctx, bool enable) {
   if (!ctx) return;
 #if defined(LOG_PLATFORM_POSIX)
@@ -1532,6 +1559,7 @@ void log_enable_ts_cache(log *ctx, bool enable) {
   LeaveCriticalSection(&ctx->mutex);
 #endif
 }
+#endif /* LOG_FEATURE_TS_CACHE */
 
 void log_set_queue_policy(log *ctx, int policy) {
   if (!ctx || policy < LOG_QUEUE_FALLBACK_SYNC || policy > LOG_QUEUE_BLOCK) return;
@@ -1769,9 +1797,35 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
 
 void log_rotate(log *ctx) {
   if (!ctx || !ctx->file_prefix) return;
-  
+
   rwlock_write_lock(&ctx->rwlock);
   rotate_file(ctx, ctx->file_prefix);
+
+  /* Update all file handlers that use this prefix */
+  for (int i = 0; i < ctx->handler_count; i++) {
+    if (!ctx->handlers[i].fp) continue;
+
+    if (ctx->handlers[i].owns_file) {
+      /* Handler owns the file: close old, open new */
+      fflush(ctx->handlers[i].fp);
+      if (ctx->handlers[i].fp != stderr && ctx->handlers[i].fp != stdout) {
+        fclose(ctx->handlers[i].fp);
+      }
+      ctx->handlers[i].fp = fopen(ctx->file_prefix, "a");
+      if (ctx->handlers[i].fp) {
+        ctx->handlers[i].udata = ctx->handlers[i].fp;
+        ctx->handlers[i].file_size = 0;
+      }
+    } else {
+      /* Handler doesn't own the file: flush old, open new (caller must close old) */
+      fflush(ctx->handlers[i].fp);
+      ctx->handlers[i].fp = fopen(ctx->file_prefix, "a");
+      if (ctx->handlers[i].fp) {
+        ctx->handlers[i].udata = ctx->handlers[i].fp;
+        ctx->handlers[i].file_size = 0;
+      }
+    }
+  }
   rwlock_write_unlock(&ctx->rwlock);
 }
 
@@ -1781,6 +1835,7 @@ int log_get_stats(log *ctx, log_stats *stats) {
   return 0;
 }
 
+#if LOG_FEATURE_JSON
 int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size) {
   char *msg = format_message(ev);
   if (!msg) return 0;
@@ -1822,6 +1877,7 @@ int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size) {
   free(escaped_msg);
   return n;
 }
+#endif /* LOG_FEATURE_JSON */
 
 void log_handler_set_level(log *ctx, int handler_idx, int new_level) {
   if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return;
@@ -1869,6 +1925,7 @@ void log_enable_text_format(log* ctx) {
   rwlock_write_unlock(&ctx->rwlock);
 }
 
+#if LOG_FEATURE_JSON
 void log_enable_json_format(log* ctx) {
   if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
@@ -1879,8 +1936,10 @@ void log_enable_json_format(log* ctx) {
   }
   rwlock_write_unlock(&ctx->rwlock);
 }
+#endif /* LOG_FEATURE_JSON */
 
 /* Thread ID support implementation */
+#if LOG_FEATURE_THREAD_ID
 void log_enable_thread_id(log *ctx, int handler_idx, bool enable) {
   if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return;
 
@@ -1888,9 +1947,10 @@ void log_enable_thread_id(log *ctx, int handler_idx, bool enable) {
   ctx->handlers[handler_idx].show_thread_id = enable;
   rwlock_write_unlock(&ctx->rwlock);
 }
+#endif /* LOG_FEATURE_THREAD_ID */
 
 /* Syslog support implementation */
-#if LOG_HAVE_SYSLOG
+#if LOG_HAVE_SYSLOG && LOG_FEATURE_SYSLOG
 int log_level_to_syslog(int level) {
   switch (level) {
     case LOG_TRACE: return 7; /* LOG_DEBUG */
