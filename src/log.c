@@ -68,6 +68,7 @@ static double get_timestamp_with_clock(int clock_source) {
   clock_gettime(cid, &ts);
   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 #elif defined(LOG_PLATFORM_WINDOWS)
+  (void)clock_source;
   FILETIME ft;
   GetSystemTimePreciseAsFileTime(&ft);
   ULARGE_INTEGER uli;
@@ -76,10 +77,6 @@ static double get_timestamp_with_clock(int clock_source) {
   /* Convert from 100ns intervals since 1601 to seconds since 1970 */
   return (double)(uli.QuadPart - 116444736000000000LL) / 10000000.0;
 #endif
-}
-
-static double get_timestamp(void) {
-  return get_timestamp_with_clock(LOG_CLOCK_REALTIME);
 }
 
 /* ==================== Atomic operation wrappers ==================== */
@@ -107,8 +104,6 @@ static inline bool atomic_compare_exchange_weak(volatile void* obj, void* expect
 #define LOG_MPOOL_CHUNK_SIZE 64
 #define LOG_MPOOL_MAX_CHUNKS 64
 
-#define ARENA_BLOCK_SIZE (64 * 1024)
-
 static LOG_THREAD_LOCAL log_thread_stats tl_stats = {0};
 
 #if LOG_FEATURE_STATS
@@ -124,17 +119,6 @@ static LOG_THREAD_LOCAL log_thread_stats tl_stats = {0};
 static void reset_thread_stats(void) {
 #if LOG_FEATURE_STATS
   memset(&tl_stats, 0, sizeof(tl_stats));
-#endif
-}
-
-static void aggregate_stats(log *ctx) {
-#if LOG_FEATURE_STATS
-  ctx->stats.total_count = tl_stats.total_count;
-  for (int i = 0; i < LOG_LEVELS; i++) {
-    ctx->stats.level_counts[i] = tl_stats.level_counts[i];
-  }
-  ctx->stats.queue_drops = tl_stats.queue_drops;
-  ctx->stats.sync_writes = tl_stats.sync_writes;
 #endif
 }
 
@@ -247,84 +231,6 @@ static void mpool_free(log_mpool *mp, log_queue_entry *entry) {
 #endif
 }
 
-static LOG_THREAD_LOCAL log_arena *tl_arena = NULL;
-#if defined(LOG_PLATFORM_POSIX)
-static pthread_key_t arena_key;
-static pthread_once_t arena_key_once = PTHREAD_ONCE_INIT;
-#else
-static DWORD arena_fls_key = 0;
-static bool arena_fls_initialized = false;
-#endif
-
-static void arena_destroy(void);
-#if defined(LOG_PLATFORM_POSIX)
-static void arena_destroy_wrapper(void *val) {
-  (void)val;
-  arena_destroy();
-}
-static void arena_key_create(void) {
-  pthread_key_create(&arena_key, arena_destroy_wrapper);
-}
-#else
-static void NTAPI arena_fls_callback(PVOID p) {
-  (void)p;
-  arena_destroy();
-}
-#endif
-
-static void* arena_alloc(size_t size) {
-#if defined(LOG_PLATFORM_POSIX)
-  pthread_once(&arena_key_once, arena_key_create);
-  if (!tl_arena) {
-    pthread_setspecific(arena_key, (void*)1);
-  }
-#else
-  if (!arena_fls_initialized) {
-    DWORD fls = FlsAlloc(arena_fls_callback);
-    if (fls == FLS_OUT_OF_INDEXES) return NULL;
-    arena_fls_key = fls;
-    arena_fls_initialized = true;
-  }
-  if (!tl_arena) {
-    FlsSetValue(arena_fls_key, (PVOID)1);
-  }
-#endif
-  if (!tl_arena || tl_arena->offset + size > tl_arena->capacity) {
-    size_t cap = ARENA_BLOCK_SIZE;
-    if (size > cap) cap = size * 2;
-    log_arena *a = malloc(sizeof(log_arena));
-    if (!a) return NULL;
-    a->buffer = malloc(cap);
-    if (!a->buffer) { free(a); return NULL; }
-    a->offset = 0;
-    a->capacity = cap;
-    a->next = tl_arena;
-    tl_arena = a;
-  }
-  char *ptr = tl_arena->buffer + tl_arena->offset;
-  tl_arena->offset += size;
-  return ptr;
-}
-
-static void arena_reset(void) {
-  log_arena *a = tl_arena;
-  while (a) {
-    a->offset = 0;
-    a = a->next;
-  }
-}
-
-static void arena_destroy(void) {
-  log_arena *a = tl_arena;
-  while (a) {
-    log_arena *next = a->next;
-    free(a->buffer);
-    free(a);
-    a = next;
-  }
-  tl_arena = NULL;
-}
-
 static LOG_THREAD_LOCAL log_ts_cache ts_cache_local;
 
 /* Format a high-precision timestamp. When use_cache is set, the
@@ -400,6 +306,8 @@ static void rwlock_init(log_rwlock *lock) {
 static void rwlock_destroy(log_rwlock *lock) {
 #if defined(LOG_PLATFORM_POSIX)
   pthread_rwlock_destroy(&lock->lock);
+#else
+  (void)lock;
 #endif
 }
 
@@ -712,102 +620,6 @@ static void ring_queue_destroy(log_ring_queue *rq) {
 #else
   DeleteCriticalSection(&rq->mtx);
 #endif
-}
-
-static bool ring_queue_push(log_ring_queue *rq, const char *msg, const char *file,
-                            int level, int line, double timestamp, bool blocking) {
-#if defined(LOG_PLATFORM_POSIX)
-  pthread_mutex_lock(&rq->mtx);
-#else
-  EnterCriticalSection(&rq->mtx);
-#endif
-  if (rq->closed) {
-#if defined(LOG_PLATFORM_POSIX)
-    pthread_mutex_unlock(&rq->mtx);
-#else
-    LeaveCriticalSection(&rq->mtx);
-#endif
-    return false;
-  }
-  size_t head = atomic_load(&rq->head);
-  size_t tail = atomic_load(&rq->tail);
-  while (tail - head >= rq->capacity) {
-    if (!blocking) {
-#if defined(LOG_PLATFORM_POSIX)
-      pthread_mutex_unlock(&rq->mtx);
-#else
-      LeaveCriticalSection(&rq->mtx);
-#endif
-      return false;
-    }
-    tl_stats.queue_blocked++;
-#if defined(LOG_PLATFORM_POSIX)
-    pthread_cond_wait(&rq->space_cond, &rq->mtx);
-#else
-    SleepConditionVariableCS(&rq->space_cond, &rq->mtx, INFINITE);
-#endif
-    if (rq->closed) {
-#if defined(LOG_PLATFORM_POSIX)
-      pthread_mutex_unlock(&rq->mtx);
-#else
-      LeaveCriticalSection(&rq->mtx);
-#endif
-      return false;
-    }
-    head = atomic_load(&rq->head);
-    tail = atomic_load(&rq->tail);
-  }
-  log_ring_entry *entry = &rq->buffer[tail & rq->mask];
-  size_t msg_len = strlen(msg);
-  if (msg_len >= sizeof(entry->msg)) {
-    entry->has_large_msg = true;
-    char *large = malloc(msg_len + 1);
-    if (!large) {
-#if defined(LOG_PLATFORM_POSIX)
-      pthread_mutex_unlock(&rq->mtx);
-#else
-      LeaveCriticalSection(&rq->mtx);
-#endif
-      return false;
-    }
-    memcpy(large, msg, msg_len + 1);
-    *(char**)entry->msg = large;
-  } else {
-    entry->has_large_msg = false;
-    memcpy(entry->msg, msg, msg_len + 1);
-  }
-  size_t file_len = file ? strlen(file) : 0;
-  if (file_len >= sizeof(entry->file)) {
-    entry->has_large_file = true;
-    char *large = malloc(file_len + 1);
-    if (!large) {
-#if defined(LOG_PLATFORM_POSIX)
-      pthread_mutex_unlock(&rq->mtx);
-#else
-      LeaveCriticalSection(&rq->mtx);
-#endif
-      return false;
-    }
-    if (file) memcpy(large, file, file_len + 1);
-    else large[0] = '\0';
-    *(char**)entry->file = large;
-  } else {
-    entry->has_large_file = false;
-    if (file) memcpy(entry->file, file, file_len + 1);
-    else entry->file[0] = '\0';
-  }
-  entry->level = level;
-  entry->line = line;
-  entry->timestamp = timestamp;
-  atomic_store(&rq->tail, tail + 1);
-#if defined(LOG_PLATFORM_POSIX)
-  pthread_cond_signal(&rq->cond);
-  pthread_mutex_unlock(&rq->mtx);
-#else
-  WakeConditionVariable(&rq->cond);
-  LeaveCriticalSection(&rq->mtx);
-#endif
-  return true;
 }
 
 /* Format directly into ring buffer slot - eliminates malloc + memcpy for small messages */
@@ -1250,7 +1062,6 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
       if (!ring_queue_pop(&ctx->ring_queue, &ring_entry, &msg, &file)) {
         break;
       }
-      double queue_latency = (get_timestamp_with_clock(ctx->clock_source) - ring_entry.timestamp) * 1000.0;
       log_event ev = {0};
       ev.level = ring_entry.level;
       ev.file = file;
@@ -1274,7 +1085,6 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
       if (!entry) {
         break;
       }
-      double queue_latency = (get_timestamp_with_clock(ctx->clock_source) - entry->timestamp) * 1000.0;
       log_event ev = {0};
       ev.level = entry->level;
       ev.file = entry->file;
@@ -1635,6 +1445,7 @@ void log_set_queue_size(log *ctx, size_t size) {
 
 /* Snapshot stats from thread-local storage into a plain struct */
 static void stats_snapshot(log *ctx, log_stats *stats) {
+  (void)ctx;
   stats->total_count = tl_stats.total_count;
   for (int i = 0; i < LOG_LEVELS; i++) {
     stats->level_counts[i] = tl_stats.level_counts[i];

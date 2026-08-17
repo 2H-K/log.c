@@ -26,7 +26,7 @@ static void test_queue_drop_policy(void) {
     log_stats stats;
     log_get_stats(ctx, &stats);
     TEST_ASSERT(stats.queue_drops > 0, "should have drops");
-    printf("    (drops: %lu)", stats.queue_drops);
+    printf("    (drops: %llu)", (unsigned long long)stats.queue_drops);
 
     log_destroy(ctx);
     fclose(fp);

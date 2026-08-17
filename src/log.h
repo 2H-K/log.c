@@ -406,16 +406,6 @@ typedef struct log_mpool {
 } log_mpool;
 
 /**
- * @brief Per-thread arena allocator (bump allocator, zero contention)
- */
-typedef struct log_arena {
-  char *buffer;
-  size_t offset;
-  size_t capacity;
-  struct log_arena *next;
-} log_arena;
-
-/**
  * @brief Ring buffer entry (pre-allocated, cache-friendly)
  */
 typedef struct log_ring_entry {
