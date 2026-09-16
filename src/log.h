@@ -53,12 +53,16 @@
 /* Cross-platform alignment macro */
 #if defined(_MSC_VER)
   #define LOG_ALIGN_64 __declspec(align(64))
+  #define LOG_MEMBER_ALIGN_64
 #elif defined(__GNUC__) || defined(__clang__)
   #define LOG_ALIGN_64 __attribute__((aligned(64)))
+  #define LOG_MEMBER_ALIGN_64
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-  #define LOG_ALIGN_64 _Alignas(64)
+  #define LOG_ALIGN_64
+  #define LOG_MEMBER_ALIGN_64 _Alignas(64)
 #else
   #define LOG_ALIGN_64
+  #define LOG_MEMBER_ALIGN_64
 #endif
 
 /* Cross-platform atomic size type */
@@ -79,7 +83,7 @@
   #define LOG_THREAD_CREATE(t, f, a) pthread_create(&(t), NULL, (f), (a))
   #define LOG_THREAD_JOIN(t) pthread_join((t), NULL)
   #define LOG_THREAD_ID_T unsigned long
-  #define LOG_GET_THREAD_ID() ((LOG_THREAD_ID_T)pthread_self__)
+  #define LOG_GET_THREAD_ID() ((LOG_THREAD_ID_T)pthread_self())
 #endif
 
 #ifdef LOG_PLATFORM_WINDOWS
@@ -368,7 +372,7 @@ typedef struct log_stats {
  * @brief Per-thread statistics (cache-line aligned to prevent false sharing)
  */
 typedef struct log_thread_stats {
-  uint64_t total_count;
+  LOG_MEMBER_ALIGN_64 uint64_t total_count;
   uint64_t level_counts[LOG_LEVELS];
   uint64_t queue_drops;
   uint64_t queue_blocked;
