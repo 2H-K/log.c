@@ -14,6 +14,7 @@
 #include <string.h>
 
 #if !defined(_WIN32) && !defined(_WIN64)
+#include <signal.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #endif
