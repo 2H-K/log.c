@@ -23,11 +23,20 @@
 
 /* Platform defines must come before any system headers */
 #if !defined(_WIN32) && !defined(_WIN64)
+  /*
+   * Maximise system-header exposure across glibc, musl and Darwin.
+   * _GNU_SOURCE is unknown to Darwin, so _DARWIN_C_SOURCE is required there,
+   * and POSIX.1-2008 is the minimum level that exposes pthread_rwlock_t
+   * (used by log.h) as well as strdup.
+   */
   #if !defined(_GNU_SOURCE)
     #define _GNU_SOURCE
   #endif
+  #if !defined(_DARWIN_C_SOURCE)
+    #define _DARWIN_C_SOURCE
+  #endif
   #if !defined(_POSIX_C_SOURCE)
-    #define _POSIX_C_SOURCE 199309L
+    #define _POSIX_C_SOURCE 200809L
   #endif
 #endif
 

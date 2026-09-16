@@ -73,6 +73,7 @@ static double get_cpu_time_ms(void) {
 
 static void test_memory_baseline(void) {
     long rss_before = get_kb_rss();
+    if (rss_before < 0) { TEST_SKIP("RSS unavailable (no /proc)"); return; }
 
     /* Create a log context */
     log *ctx = log_create();
@@ -94,6 +95,7 @@ static void test_memory_baseline(void) {
 
 static void test_memory_stability(void) {
     long rss_before = get_kb_rss();
+    if (rss_before < 0) { TEST_SKIP("RSS unavailable (no /proc)"); return; }
 
     /* Create and destroy many contexts */
     for (int i = 0; i < 10000; i++) {
@@ -117,6 +119,7 @@ static void test_memory_stability(void) {
 
 static void test_fd_leak(void) {
     int fds_before = count_open_fds();
+    if (fds_before < 0) { TEST_SKIP("fd count unavailable (no /proc)"); return; }
 
     /* Create and destroy many file handlers */
     for (int i = 0; i < 100; i++) {
@@ -140,6 +143,7 @@ static void test_fd_leak(void) {
 
 static void test_thread_leak_sync(void) {
     int threads_before = count_threads();
+    if (threads_before < 0) { TEST_SKIP("thread count unavailable (no /proc)"); return; }
 
     /* Sync mode should not create extra threads */
     log *ctx = log_create();
@@ -165,6 +169,7 @@ static void test_thread_leak_sync(void) {
 
 static void test_thread_leak_async(void) {
     int threads_before = count_threads();
+    if (threads_before < 0) { TEST_SKIP("thread count unavailable (no /proc)"); return; }
 
     /* Async mode creates one background thread */
     log *ctx = log_create();

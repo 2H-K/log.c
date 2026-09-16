@@ -159,7 +159,8 @@ static void test_crash_async_mode(void) {
         }
 
         /* Small delay to let some messages be processed */
-        usleep(10000);  /* 10ms */
+        struct timespec delay = { 0, 10 * 1000 * 1000 };  /* 10ms */
+        nanosleep(&delay, NULL);
 
         /* Crash - async queue messages will be lost */
         abort();
