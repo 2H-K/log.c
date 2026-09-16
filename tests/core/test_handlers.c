@@ -41,7 +41,7 @@ static void test_handler_add_null_file(void) {
 static void test_handler_remove(void) {
     FILE *fp1 = fopen(TEST_DEV_NULL, "w");
     FILE *fp2 = fopen(TEST_DEV_NULL, "w");
-    TEST_ASSERT_NOT_NULL(fp1 && fp2, "fopen");
+    TEST_ASSERT(fp1 && fp2, "fopen");
 
     log *ctx = log_create();
     /* Disable default stderr handler */

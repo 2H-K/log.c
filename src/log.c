@@ -52,6 +52,14 @@ _Static_assert(sizeof(int) >= 4, "int must be at least 32 bits");
 /* ==================== Platform-specific helpers ==================== */
 
 #ifdef LOG_PLATFORM_POSIX
+/* CLOCK_*_COARSE are Linux-specific; fall back to the plain clocks elsewhere */
+#ifndef CLOCK_REALTIME_COARSE
+  #define CLOCK_REALTIME_COARSE CLOCK_REALTIME
+#endif
+#ifndef CLOCK_MONOTONIC_COARSE
+  #define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
+#endif
+
 static int clock_id_map[] = {
   CLOCK_REALTIME,
   CLOCK_REALTIME_COARSE,
