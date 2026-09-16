@@ -74,24 +74,24 @@ test_all$(TEST_EXT): $(TEST_DIR)/all.c $(wildcard $(TEST_DIR)/*/*.c) $(SRC_DIR)/
 run-tests: test_core test_thread test_stress test_platform test_perf
 	@echo ""
 	@echo "=== Core Tests ==="
-	-./test_core$(TEST_EXT)
+	./test_core$(TEST_EXT)
 	@echo ""
 	@echo "=== Thread Tests ==="
-	-./test_thread$(TEST_EXT)
+	./test_thread$(TEST_EXT)
 	@echo ""
 	@echo "=== Stress Tests ==="
-	-./test_stress$(TEST_EXT)
+	./test_stress$(TEST_EXT)
 	@echo ""
 	@echo "=== Platform Tests ==="
-	-./test_platform$(TEST_EXT)
+	./test_platform$(TEST_EXT)
 	@echo ""
 	@echo "=== Performance Benchmarks ==="
-	-./test_perf$(TEST_EXT)
+	./test_perf$(TEST_EXT)
 
 run-all: test_all
 	@echo ""
 	@echo "=== Running All Tests ==="
-	-./test_all$(TEST_EXT)
+	./test_all$(TEST_EXT)
 
 # ----- Clean -----
 clean:

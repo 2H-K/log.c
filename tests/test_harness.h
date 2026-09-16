@@ -181,6 +181,13 @@ static int test_run_all(void) {
 
 #define TEST_TMP_FILE "test_tmp.log"
 
+/* Platform-agnostic temp directory prefix for test output files */
+#ifdef _WIN32
+  #define TEST_TMP_DIR "./"
+#else
+  #define TEST_TMP_DIR "/tmp/"
+#endif
+
 static void test_cleanup_files(void) {
     remove(TEST_TMP_FILE);
     remove("test_rot");

@@ -226,7 +226,9 @@ enum {
   LOG_QUEUE_BLOCK               /* Queue full -> block until space is available */
 };
 
-#define LOG_USE_COLOR
+#ifndef LOG_USE_COLOR
+  #define LOG_USE_COLOR
+#endif
 
 #if defined(LOG_PLATFORM_POSIX)
   #include <syslog.h>
@@ -281,7 +283,18 @@ extern "C" {
 #endif
 
 /* Forward declarations */
-typedef struct log log;
+typedef struct log_t log_t;
+/*
+ * In C, MSVC's /Oi (implied by /O2) exposes the builtin math function `log`,
+ * which forbids introducing `log` as an ordinary identifier.  Alias the handle
+ * type there so existing source written as `log *ctx` keeps compiling.  C++ is
+ * unaffected (the builtin lives in namespace std), so it keeps the typedef.
+ */
+#if defined(_MSC_VER) && !defined(__cplusplus)
+  #define log log_t
+#else
+  typedef struct log_t log;
+#endif
 typedef struct log_event log_event;
 typedef void (*log_LogFn)(log *ctx, log_event *ev);
 typedef void (*log_LockFn)(bool lock, void *udata);
@@ -521,7 +534,7 @@ typedef struct log_handler {
   int kind;
   bool owns_file;
 } log_handler;
-struct log {
+struct log_t {
   log_rwlock rwlock;
 
   void *udata;

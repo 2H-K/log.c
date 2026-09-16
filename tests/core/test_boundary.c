@@ -141,7 +141,7 @@ static void test_boundary_long_path(void) {
 static void test_path_with_special_chars(void) {
     log *ctx = log_create();
 
-    const char *path = "/tmp/test-file_name.123.log";
+    const char *path = TEST_TMP_DIR "test-file_name.123.log";
     int idx = log_add_file(ctx, path, LOG_INFO);
     TEST_ASSERT(idx >= 0, "add_file with special chars in path");
 
@@ -163,7 +163,7 @@ static void test_max_handlers(void) {
     /* Add handlers until we hit the limit */
     for (int i = 0; i < 50; i++) {
         char fname[64];
-        snprintf(fname, sizeof(fname), "/tmp/test_handler_%d.log", i);
+        snprintf(fname, sizeof(fname), TEST_TMP_DIR "test_handler_%d.log", i);
         FILE *fp = fopen(fname, "w");
         if (!fp) break;
         int idx = log_add_fp(ctx, fp, LOG_INFO);
@@ -181,7 +181,7 @@ static void test_max_handlers(void) {
     /* Cleanup */
     for (int i = 0; i < count; i++) {
         char fname[64];
-        snprintf(fname, sizeof(fname), "/tmp/test_handler_%d.log", i);
+        snprintf(fname, sizeof(fname), TEST_TMP_DIR "test_handler_%d.log", i);
         remove(fname);
     }
 

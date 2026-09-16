@@ -16,7 +16,7 @@
 #endif
 
 static void test_chinese_path(void) {
-    const char *path = "/tmp/测试日志_ログ_test.log";
+    const char *path = TEST_TMP_DIR "测试日志_ログ_test.log";
     remove(path);
 
     FILE *fp = fopen(path, "w");
@@ -51,7 +51,7 @@ static void test_chinese_path(void) {
 }
 
 static void test_special_chars_path(void) {
-    const char *path = "/tmp/test file (with) [special] {chars} & spaces.log";
+    const char *path = TEST_TMP_DIR "test file (with) [special] {chars} & spaces.log";
     remove(path);
 
     FILE *fp = fopen(path, "w");
@@ -86,7 +86,7 @@ static void test_special_chars_path(void) {
 }
 
 static void test_unicode_json_content(void) {
-    const char *path = "/tmp/test_unicode_content.log";
+    const char *path = TEST_TMP_DIR "test_unicode_content.log";
     remove(path);
 
     FILE *fp = fopen(path, "w");

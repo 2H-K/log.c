@@ -29,11 +29,9 @@ target_include_directories(logc PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-# Platform-specific libraries
-if(NOT WIN32)
-    find_package(Threads REQUIRED)
-    target_link_libraries(logc PUBLIC Threads::Threads)
-endif()
+# Threads: POSIX = pthread, Windows = Win32 threads (empty interface target)
+find_package(Threads REQUIRED)
+target_link_libraries(logc PUBLIC Threads::Threads)
 
 # Test framework
 add_library(test_harness STATIC tests/test_harness.c)
@@ -68,6 +66,13 @@ if(BUILD_TESTS)
     add_executable(test_perf tests/perf.c)
     target_link_libraries(test_perf PRIVATE logc test_harness Threads::Threads)
     add_test(NAME test_perf COMMAND test_perf)
+endif()
+
+# MSVC public header guard: /Oi (implied by /O2) makes `log` a builtin function
+if(MSVC)
+    add_executable(msvc_oi_smoke tests/compile/msvc_oi_smoke.c)
+    target_link_libraries(msvc_oi_smoke PRIVATE logc)
+    target_compile_options(msvc_oi_smoke PRIVATE /WX)
 endif()
 
 # Examples
