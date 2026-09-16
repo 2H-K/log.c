@@ -1,6 +1,6 @@
 # Enhanced Log Library API Documentation
 
-Version 2.0.0
+Version 3.0.0
 
 ## Table of Contents
 
@@ -54,7 +54,7 @@ Creates a new logger context.
 
 **Prototype:**
 ```c
-log* log_create(void);
+log_handle* log_create(void);
 ```
 
 **Returns:**
@@ -62,7 +62,7 @@ log* log_create(void);
 
 **Example:**
 ```c
-log *ctx = log_create();
+log_handle *ctx = log_create();
 if (!ctx) {
     fprintf(stderr, "Failed to create logger\n");
     exit(1);
@@ -82,7 +82,7 @@ Destroys a logger context and releases resources.
 
 **Prototype:**
 ```c
-void log_destroy(log *ctx);
+void log_destroy(log_handle *ctx);
 ```
 
 **Parameters:**
@@ -107,7 +107,7 @@ Returns or creates the global default logger.
 
 **Prototype:**
 ```c
-log* log_default(void);
+log_handle* log_default(void);
 ```
 
 **Returns:**
@@ -115,7 +115,7 @@ log* log_default(void);
 
 **Example:**
 ```c
-log *default = log_default();
+log_handle *default = log_default();
 log_info("Using default logger");
 ```
 
@@ -132,7 +132,7 @@ Core logging function that all macros call.
 
 **Prototype:**
 ```c
-void log_log(log *ctx, int level, const char *file, int line, const char *fmt, ...);
+void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...);
 ```
 
 **Parameters:**
@@ -164,7 +164,7 @@ Sets the minimum log level to output.
 
 **Prototype:**
 ```c
-void log_set_level(log *ctx, int level);
+void log_set_level(log_handle *ctx, int level);
 ```
 
 **Parameters:**
@@ -188,7 +188,7 @@ Enables or disables quiet mode.
 
 **Prototype:**
 ```c
-void log_set_quiet(log *ctx, bool enable);
+void log_set_quiet(log_handle *ctx, bool enable);
 ```
 
 **Parameters:**
@@ -213,7 +213,7 @@ Sets a custom format function.
 
 **Prototype:**
 ```c
-void log_set_format(log *ctx, log_FormatFn fn);
+void log_set_format(log_handle *ctx, log_FormatFn fn);
 ```
 
 **Parameters:**
@@ -222,12 +222,12 @@ void log_set_format(log *ctx, log_FormatFn fn);
 
 **Format Function Signature:**
 ```c
-typedef int (*log_FormatFn)(log *ctx, log_Event *ev, char *buf, size_t buf_size);
+typedef int (*log_FormatFn)(log_handle *ctx, log_Event *ev, char *buf, size_t buf_size);
 ```
 
 **Example:**
 ```c
-int custom_format(log *ctx, log_Event *ev, char *buf, size_t buf_size) {
+int custom_format(log_handle *ctx, log_Event *ev, char *buf, size_t buf_size) {
     return snprintf(buf, buf_size, "[%s] %s:%d - ",
                    log_level_string(ev->level), ev->file, ev->line);
 }
@@ -243,7 +243,7 @@ Enables or disables asynchronous logging.
 
 **Prototype:**
 ```c
-int log_set_async(log *ctx, bool enable);
+int log_set_async(log_handle *ctx, bool enable);
 ```
 
 **Parameters:**
@@ -274,7 +274,7 @@ Sets the maximum file size for rotation.
 
 **Prototype:**
 ```c
-void log_set_max_file_size(log *ctx, size_t size);
+void log_set_max_file_size(log_handle *ctx, size_t size);
 ```
 
 **Parameters:**
@@ -298,7 +298,7 @@ Sets the file prefix for log rotation.
 
 **Prototype:**
 ```c
-void log_set_file_prefix(log *ctx, const char *prefix);
+void log_set_file_prefix(log_handle *ctx, const char *prefix);
 ```
 
 **Parameters:**
@@ -324,7 +324,7 @@ Adds a custom handler function.
 
 **Prototype:**
 ```c
-int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
+int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level);
 ```
 
 **Parameters:**
@@ -338,12 +338,12 @@ int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
 
 **Handler Function Signature:**
 ```c
-typedef void (*log_LogFn)(log *ctx, log_Event *ev);
+typedef void (*log_LogFn)(log_handle *ctx, log_Event *ev);
 ```
 
 **Example:**
 ```c
-void my_handler(log *ctx, log_Event *ev) {
+void my_handler(log_handle *ctx, log_Event *ev) {
     fprintf((FILE*)ev->udata, "CUSTOM: %s\n", ev->fmt);
 }
 
@@ -358,7 +358,7 @@ Adds a file pointer as a handler.
 
 **Prototype:**
 ```c
-int log_add_fp(log *ctx, FILE *fp, int level);
+int log_add_fp(log_handle *ctx, FILE *fp, int level);
 ```
 
 **Parameters:**
@@ -387,7 +387,7 @@ Removes a handler by index.
 
 **Prototype:**
 ```c
-void log_remove_handler(log *ctx, int idx);
+void log_remove_handler(log_handle *ctx, int idx);
 ```
 
 **Parameters:**
@@ -407,7 +407,7 @@ Changes a handler's minimum level.
 
 **Prototype:**
 ```c
-void log_handler_set_level(log *ctx, int handler_idx, int new_level);
+void log_handler_set_level(log_handle *ctx, int handler_idx, int new_level);
 ```
 
 **Parameters:**
@@ -429,7 +429,7 @@ Changes a handler's format function.
 
 **Prototype:**
 ```c
-void log_handler_set_formatter(log *ctx, int handler_idx, log_FormatFn new_fn);
+void log_handler_set_formatter(log_handle *ctx, int handler_idx, log_FormatFn new_fn);
 ```
 
 **Parameters:**
@@ -452,7 +452,7 @@ Formats a log event as a full JSON line.
 
 **Prototype:**
 ```c
-int log_format_json(log *ctx, log_Event *ev, char *buf, size_t buf_size);
+int log_format_json(log_handle *ctx, log_Event *ev, char *buf, size_t buf_size);
 ```
 
 **Parameters:**
@@ -492,7 +492,7 @@ Enables text format mode.
 
 **Prototype:**
 ```c
-void log_enable_text_format(log* ctx);
+void log_enable_text_format(log_handle* ctx);
 ```
 
 **Parameters:**
@@ -511,7 +511,7 @@ Enables JSON format mode.
 
 **Prototype:**
 ```c
-void log_enable_json_format(log* ctx);
+void log_enable_json_format(log_handle* ctx);
 ```
 
 **Parameters:**
@@ -532,7 +532,7 @@ Enables or disables thread ID in log output.
 
 **Prototype:**
 ```c
-void log_enable_thread_id(log *ctx, int handler_idx, bool enable);
+void log_enable_thread_id(log_handle *ctx, int handler_idx, bool enable);
 ```
 
 **Parameters:**
@@ -594,7 +594,7 @@ Adds a syslog handler.
 
 **Prototype:**
 ```c
-int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level);
+int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int level);
 ```
 
 **Parameters:**
@@ -625,7 +625,7 @@ Enables syslog for an existing handler.
 
 **Prototype:**
 ```c
-void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable);
+void log_handler_enable_syslog(log_handle *ctx, int handler_idx, bool enable);
 ```
 
 **Parameters:**
@@ -649,7 +649,7 @@ Retrieves performance statistics.
 
 **Prototype:**
 ```c
-int log_get_stats(log *ctx, log_stats *stats);
+int log_get_stats(log_handle *ctx, log_stats *stats);
 ```
 
 **Parameters:**
@@ -688,7 +688,7 @@ Manually triggers log rotation.
 
 **Prototype:**
 ```c
-void log_rotate(log *ctx);
+void log_rotate(log_handle *ctx);
 ```
 
 **Parameters:**
@@ -757,7 +757,7 @@ log_ctx_info(ctx, "Processing item %d", i);
 #include "log.h"
 
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     log_ctx_trace(ctx, "Detailed debug info");
     log_ctx_debug(ctx, "Debug information");
@@ -777,7 +777,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // Configure rotation
     log_set_file_prefix(ctx, "app.log");
@@ -805,7 +805,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // Set JSON format
     log_enable_json_format(ctx);
@@ -831,7 +831,7 @@ int main(void) {
 #include <pthread.h>
 
 void* worker_thread(void *arg) {
-    log *ctx = (log*)arg;
+    log_handle *ctx = (log_handle*)arg;
     for (int i = 0; i < 100; i++) {
         log_ctx_info(ctx, "Thread %lu: Message %d",
                     pthread_self(), i);
@@ -840,7 +840,7 @@ void* worker_thread(void *arg) {
 }
 
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // Enable thread ID for file handler
     FILE *fp = fopen("thread.log", "w");
@@ -870,7 +870,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // Enable async mode
     log_set_async(ctx, true);
@@ -904,7 +904,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // Add syslog handler
     int idx = log_add_syslog_handler(ctx, "myapp", LOG_USER, LOG_INFO);
@@ -926,7 +926,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // Console handler (all levels)
     // Already added by log_create()
@@ -966,7 +966,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     FILE *fp = fopen("app.log", "w");
     int idx = log_add_fp(ctx, fp, LOG_INFO);
@@ -1025,5 +1025,6 @@ MIT License - See LICENSE file for details.
 
 ## Version History
 
+- **3.0.0** (2026): Breaking - opaque handle type renamed `log` -> `log_handle`
 - **2.0.0** (2026): Added async logging, JSON format, thread ID, syslog support
 - **1.0.0** (2020): Original implementation by rxi

@@ -61,7 +61,7 @@ static void test_malloc_sync_short_message(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Warm up - let any initialization allocations happen */
@@ -94,7 +94,7 @@ static void test_malloc_sync_long_message(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Warm up */
@@ -131,7 +131,7 @@ static void test_malloc_async_short_message(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
     log_set_async(ctx, true);
 
@@ -166,7 +166,7 @@ static void test_malloc_formatter_direct(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Warm up */
@@ -195,7 +195,7 @@ static void test_malloc_formatter_direct(void) {
 }
 
 typedef struct {
-    log *ctx;
+    log_handle *ctx;
     int thread_id;
     int count;
 } mt_malloc_arg;
@@ -212,7 +212,7 @@ static void test_malloc_multithread(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
 
     /* Warm up */

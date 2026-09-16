@@ -22,7 +22,7 @@ static void test_chinese_path(void) {
     FILE *fp = fopen(path, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen with Chinese path");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     TEST_ASSERT(idx >= 0, "add handler with Chinese path");
 
@@ -57,7 +57,7 @@ static void test_special_chars_path(void) {
     FILE *fp = fopen(path, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen with special chars path");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     TEST_ASSERT(idx >= 0, "add handler with special chars path");
 
@@ -92,7 +92,7 @@ static void test_unicode_json_content(void) {
     FILE *fp = fopen(path, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     log_enable_json_format(ctx);
     TEST_ASSERT(idx >= 0, "add handler for JSON");
@@ -154,7 +154,7 @@ static void test_long_path(void) {
     FILE *fp = fopen(path, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen with long nested path");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     TEST_ASSERT(idx >= 0, "add handler with long path");
 

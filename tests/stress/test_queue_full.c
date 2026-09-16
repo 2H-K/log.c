@@ -10,7 +10,7 @@ static void test_queue_drop_policy(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -37,7 +37,7 @@ static void test_queue_fallback_sync_policy(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -63,7 +63,7 @@ static void test_queue_block_policy(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -82,7 +82,7 @@ static void test_queue_block_policy(void) {
 }
 
 static void test_queue_policy_bounds_check(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     log_set_queue_policy(ctx, -1);
     log_set_queue_policy(ctx, 99);

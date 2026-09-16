@@ -10,7 +10,7 @@ static void test_level_filter_all_pass(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -33,7 +33,7 @@ static void test_level_filter_warn_and_above(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -59,7 +59,7 @@ static void test_level_filter_quiet_mode(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -81,7 +81,7 @@ static void test_level_counts_accuracy(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     if (idx >= 0) ctx->handlers[0].active = false;
 

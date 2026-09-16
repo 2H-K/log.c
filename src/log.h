@@ -105,7 +105,7 @@
   #define LOG_THREAD_LOCAL
 #endif
 
-#define LOG_VERSION "2.0.1"
+#define LOG_VERSION "3.0.0"
 #define LOG_MAX_QUEUE_SIZE 4096
 #define LOG_MAX_ROTATION_FILES 5
 #define LOG_DEFAULT_MAX_SIZE (10 * 1024 * 1024)
@@ -283,20 +283,9 @@ extern "C" {
 #endif
 
 /* Forward declarations */
-typedef struct log_t log_t;
-/*
- * In C, MSVC's /Oi (implied by /O2) exposes the builtin math function `log`,
- * which forbids introducing `log` as an ordinary identifier.  Alias the handle
- * type there so existing source written as `log *ctx` keeps compiling.  C++ is
- * unaffected (the builtin lives in namespace std), so it keeps the typedef.
- */
-#if defined(_MSC_VER) && !defined(__cplusplus)
-  #define log log_t
-#else
-  typedef struct log_t log;
-#endif
+typedef struct log_handle log_handle;
 typedef struct log_event log_event;
-typedef void (*log_LogFn)(log *ctx, log_event *ev);
+typedef void (*log_LogFn)(log_handle *ctx, log_event *ev);
 typedef void (*log_LockFn)(bool lock, void *udata);
 
 /**
@@ -307,7 +296,7 @@ typedef void (*log_LockFn)(bool lock, void *udata);
  * @param buf_size Buffer size
  * @return Number of characters written (excluding null terminator)
  */
-typedef int (*log_FormatFn)(log *ctx, log_event *ev, char *buf, size_t buf_size);
+typedef int (*log_FormatFn)(log_handle *ctx, log_event *ev, char *buf, size_t buf_size);
 
 /**
  * @brief Log event structure
@@ -327,28 +316,28 @@ struct log_event {
 /* ==================== Stubs for disabled features ==================== */
 
 #if !LOG_FEATURE_JSON
-static inline int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size) {
+static inline int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size) {
   (void)ctx; (void)ev; (void)buf; (void)buf_size; return 0;
 }
-static inline void log_enable_json_format(log* ctx) { (void)ctx; }
+static inline void log_enable_json_format(log_handle* ctx) { (void)ctx; }
 #endif
 
 #if !LOG_FEATURE_THREAD_ID
-static inline void log_enable_thread_id(log *ctx, int handler_idx, bool enable) {
+static inline void log_enable_thread_id(log_handle *ctx, int handler_idx, bool enable) {
   (void)ctx; (void)handler_idx; (void)enable;
 }
 #endif
 
 #if !LOG_FEATURE_TS_CACHE
-static inline void log_enable_ts_cache(log *ctx, bool enable) { (void)ctx; (void)enable; }
+static inline void log_enable_ts_cache(log_handle *ctx, bool enable) { (void)ctx; (void)enable; }
 #endif
 
 #if !LOG_FEATURE_STATS
-static inline void log_get_perf_stats(log *ctx, log_stats *stats) { (void)ctx; (void)stats; }
+static inline void log_get_perf_stats(log_handle *ctx, log_stats *stats) { (void)ctx; (void)stats; }
 #endif
 
 #if !LOG_FEATURE_SYSLOG
-static inline int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level) {
+static inline int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int level) {
   (void)ctx; (void)ident; (void)facility; (void)level; return -1;
 }
 static inline int log_level_to_syslog(int level) { (void)level; return 6; }
@@ -534,7 +523,7 @@ typedef struct log_handler {
   int kind;
   bool owns_file;
 } log_handler;
-struct log_t {
+struct log_handle {
   log_rwlock rwlock;
 
   void *udata;
@@ -581,48 +570,48 @@ struct log_t {
 };
 
 /* Core functions */
-log* log_create(void);
-void log_destroy(log *ctx);
+log_handle* log_create(void);
+void log_destroy(log_handle *ctx);
 
-log* log_default(void);
+log_handle* log_default(void);
 
 const char* log_level_string(int level);
-void log_set_level(log *ctx, int level);
-void log_set_quiet(log *ctx, bool enable);
-void log_set_format(log *ctx, log_FormatFn fn);
-int log_set_async(log *ctx, bool enable);
-void log_set_queue_policy(log *ctx, int policy);
-void log_set_max_file_size(log *ctx, size_t size);
-void log_set_file_prefix(log *ctx, const char *prefix);
+void log_set_level(log_handle *ctx, int level);
+void log_set_quiet(log_handle *ctx, bool enable);
+void log_set_format(log_handle *ctx, log_FormatFn fn);
+int log_set_async(log_handle *ctx, bool enable);
+void log_set_queue_policy(log_handle *ctx, int policy);
+void log_set_max_file_size(log_handle *ctx, size_t size);
+void log_set_file_prefix(log_handle *ctx, const char *prefix);
 /* Performance optimization functions */
-void log_enable_mpool(log *ctx, bool enable);
-void log_enable_ts_cache(log *ctx, bool enable);
-void log_get_perf_stats(log *ctx, log_stats *stats);
-void log_enable_ring_queue(log *ctx, bool enable);
-void log_set_clock_source(log *ctx, int clock_source);
-void log_set_queue_size(log *ctx, size_t size);
+void log_enable_mpool(log_handle *ctx, bool enable);
+void log_enable_ts_cache(log_handle *ctx, bool enable);
+void log_get_perf_stats(log_handle *ctx, log_stats *stats);
+void log_enable_ring_queue(log_handle *ctx, bool enable);
+void log_set_clock_source(log_handle *ctx, int clock_source);
+void log_set_queue_size(log_handle *ctx, size_t size);
 
-int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
-int log_add_fp(log *ctx, FILE *fp, int level);
-int log_add_file(log *ctx, const char *filename, int level);
-void log_remove_handler(log *ctx, int idx);
+int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level);
+int log_add_fp(log_handle *ctx, FILE *fp, int level);
+int log_add_file(log_handle *ctx, const char *filename, int level);
+void log_remove_handler(log_handle *ctx, int idx);
 
 /* Thread ID and Syslog support */
-void log_enable_thread_id(log *ctx, int handler_idx, bool enable);
-int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level);
-void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable);
+void log_enable_thread_id(log_handle *ctx, int handler_idx, bool enable);
+int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int level);
+void log_handler_enable_syslog(log_handle *ctx, int handler_idx, bool enable);
 int log_level_to_syslog(int level);
 
-void log_handler_set_level(log *ctx, int handler_idx, int new_level);
-void log_handler_set_formatter(log *ctx, int handler_idx, log_FormatFn new_fn);
-void log_enable_text_format(log* ctx);
-void log_enable_json_format(log* ctx);
+void log_handler_set_level(log_handle *ctx, int handler_idx, int new_level);
+void log_handler_set_formatter(log_handle *ctx, int handler_idx, log_FormatFn new_fn);
+void log_enable_text_format(log_handle* ctx);
+void log_enable_json_format(log_handle* ctx);
 
-void log_log(log *ctx, int level, const char *file, int line, const char *fmt, ...);
-void log_rotate(log *ctx);
+void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...);
+void log_rotate(log_handle *ctx);
 
-int log_get_stats(log *ctx, log_stats *stats);
-int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size);
+int log_get_stats(log_handle *ctx, log_stats *stats);
+int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size);
 
 /* Advanced pipeline configuration (must be called with no active async logging) */
 typedef struct {
@@ -630,7 +619,7 @@ typedef struct {
   log_LogFn output;
   void* context;
 } log_stage_function;
-void log_configure_pipeline(log* ctx, log_stage_function* stages, int stage_count);
+void log_configure_pipeline(log_handle* ctx, log_stage_function* stages, int stage_count);
 
 /* Default context macros */
 #define log_trace(...) log_log(log_default(), LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)

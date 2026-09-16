@@ -22,7 +22,7 @@
 #define MSGS_PER_THREAD 1000
 
 typedef struct {
-    log *ctx;
+    log_handle *ctx;
     int thread_id;
     int count;
 } thread_arg;

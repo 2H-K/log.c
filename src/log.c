@@ -130,7 +130,7 @@ static void reset_thread_stats(void) {
 #endif
 }
 
-static log *DEFAULT_LOG = NULL;
+static log_handle *DEFAULT_LOG = NULL;
 #if defined(LOG_PLATFORM_POSIX)
 static pthread_mutex_t default_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 #else
@@ -352,7 +352,7 @@ static void rwlock_write_unlock(log_rwlock *lock) {
 }
 
 /* Lock-free Queue Implementation */
-static log_queue_entry* queue_entry_create(log *ctx, log_event *ev) {
+static log_queue_entry* queue_entry_create(log_handle *ctx, log_event *ev) {
   log_mpool *mp = &ctx->mpool;
   bool use_mpool = ctx->enable_mpool;
   log_queue_entry *entry = use_mpool ? mpool_alloc(mp) : malloc(sizeof(log_queue_entry));
@@ -410,7 +410,7 @@ fail:
   return NULL;
 }
 
-static void queue_entry_destroy(log *ctx, log_queue_entry *entry) {
+static void queue_entry_destroy(log_handle *ctx, log_queue_entry *entry) {
   if (!entry) return;
   if (ctx->enable_mpool) {
     mpool_free(&ctx->mpool, entry);
@@ -438,7 +438,7 @@ static void queue_init(log_queue *q, size_t max_size) {
 #endif
 }
 
-static bool queue_push(log *ctx, log_queue_entry *entry, bool blocking) {
+static bool queue_push(log_handle *ctx, log_queue_entry *entry, bool blocking) {
   log_queue *q = &ctx->queue;
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&q->mtx);
@@ -822,7 +822,7 @@ static char* format_message(log_event *ev) {
 
 /* Build the line prefix (time, level, optional thread id, file:line, custom formatter).
  * Returns the number of characters written into buf (excluding NUL). */
-static int format_prefix(log *ctx, log_event *ev, char *buf, size_t buf_size,
+static int format_prefix(log_handle *ctx, log_event *ev, char *buf, size_t buf_size,
                          bool show_tid, bool use_color) {
   if (ctx && ctx->format_fn) {
     int n = ctx->format_fn(ctx, ev, buf, buf_size);
@@ -856,7 +856,7 @@ static int format_prefix(log *ctx, log_event *ev, char *buf, size_t buf_size,
 }
 
 /* File rotation */
-static void rotate_file(log *ctx, const char *filename) {
+static void rotate_file(log_handle *ctx, const char *filename) {
   if (!ctx->file_prefix) return;
   
   char old_path[512];
@@ -878,7 +878,7 @@ static void rotate_file(log *ctx, const char *filename) {
 }
 
 /* Output handlers */
-static void stdout_handler(log *ctx, log_event *ev) {
+static void stdout_handler(log_handle *ctx, log_event *ev) {
   char *msg = format_message(ev);
   if (!msg) return;
 
@@ -904,7 +904,7 @@ static void stdout_handler(log *ctx, log_event *ev) {
   free(msg);
 }
 
-static void file_handler_internal(log *ctx, log_event *ev, int handler_idx) {
+static void file_handler_internal(log_handle *ctx, log_event *ev, int handler_idx) {
   char *msg = format_message(ev);
   if (!msg) return;
 
@@ -960,7 +960,7 @@ static void file_handler_internal(log *ctx, log_event *ev, int handler_idx) {
   free(msg);
 }
 
-static void file_handler_wrapper(log *ctx, log_event *ev) {
+static void file_handler_wrapper(log_handle *ctx, log_event *ev) {
   FILE *target_fp = ev->udata;
 
   for (int i = 0; i < ctx->handler_count; i++) {
@@ -978,7 +978,7 @@ static void file_handler_wrapper(log *ctx, log_event *ev) {
 }
 
 #if LOG_FEATURE_JSON
-static void json_handler(log *ctx, log_event *ev) {
+static void json_handler(log_handle *ctx, log_event *ev) {
   char *msg = format_message(ev);
   if (!msg) return;
 
@@ -1061,7 +1061,7 @@ static void* async_writer_thread(void *arg) {
 #else
 static DWORD WINAPI async_writer_thread(LPVOID arg) {
 #endif
-  log *ctx = (log*)arg;
+  log_handle *ctx = (log_handle*)arg;
 
   if (ctx->use_ring_queue) {
     while (true) {
@@ -1125,8 +1125,8 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
 #endif /* LOG_FEATURE_ASYNC */
 
 /* API Implementation */
-log* log_create(void) {
-  log *ctx = calloc(1, sizeof(log));
+log_handle* log_create(void) {
+  log_handle *ctx = calloc(1, sizeof(log_handle));
   reset_thread_stats();
   if (!ctx) return NULL;
 
@@ -1178,7 +1178,7 @@ log* log_create(void) {
   return ctx;
 }
 
-void log_destroy(log *ctx) {
+void log_destroy(log_handle *ctx) {
   if (!ctx) return;
 
   if (ctx->async_enabled) {
@@ -1225,7 +1225,7 @@ void log_destroy(log *ctx) {
   free(ctx);
 }
 
-log* log_default(void) {
+log_handle* log_default(void) {
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&default_log_mutex);
 #else
@@ -1238,7 +1238,7 @@ log* log_default(void) {
   if (!DEFAULT_LOG) {
     DEFAULT_LOG = log_create();
   }
-  log *result = DEFAULT_LOG;
+  log_handle *result = DEFAULT_LOG;
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_unlock(&default_log_mutex);
 #else
@@ -1254,28 +1254,28 @@ const char* log_level_string(int level) {
   return level_strings[level];
 }
 
-void log_set_level(log *ctx, int level) {
+void log_set_level(log_handle *ctx, int level) {
   if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->level = level;
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_set_quiet(log *ctx, bool enable) {
+void log_set_quiet(log_handle *ctx, bool enable) {
   if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->quiet = enable;
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_set_format(log *ctx, log_FormatFn fn) {
+void log_set_format(log_handle *ctx, log_FormatFn fn) {
   if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->format_fn = fn;
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-int log_set_async(log *ctx, bool enable) {
+int log_set_async(log_handle *ctx, bool enable) {
   if (!ctx) return -1;
   if (enable && !ctx->async_enabled) {
     queue_reopen(&ctx->queue);
@@ -1304,7 +1304,7 @@ int log_set_async(log *ctx, bool enable) {
   return 0;
 }
 
-void log_set_max_file_size(log *ctx, size_t size) {
+void log_set_max_file_size(log_handle *ctx, size_t size) {
   if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->max_file_size = size;
@@ -1347,7 +1347,7 @@ static int is_path_safe(const char *path) {
   return 1;
 }
 
-void log_set_file_prefix(log *ctx, const char *prefix) {
+void log_set_file_prefix(log_handle *ctx, const char *prefix) {
   if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
 
@@ -1367,7 +1367,7 @@ void log_set_file_prefix(log *ctx, const char *prefix) {
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_enable_mpool(log *ctx, bool enable) {
+void log_enable_mpool(log_handle *ctx, bool enable) {
   if (!ctx) return;
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&ctx->mutex);
@@ -1396,7 +1396,7 @@ void log_enable_mpool(log *ctx, bool enable) {
 }
 
 #if LOG_FEATURE_TS_CACHE
-void log_enable_ts_cache(log *ctx, bool enable) {
+void log_enable_ts_cache(log_handle *ctx, bool enable) {
   if (!ctx) return;
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&ctx->mutex);
@@ -1421,28 +1421,28 @@ void log_enable_ts_cache(log *ctx, bool enable) {
 }
 #endif /* LOG_FEATURE_TS_CACHE */
 
-void log_set_queue_policy(log *ctx, int policy) {
+void log_set_queue_policy(log_handle *ctx, int policy) {
   if (!ctx || policy < LOG_QUEUE_FALLBACK_SYNC || policy > LOG_QUEUE_BLOCK) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->queue_policy = policy;
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_enable_ring_queue(log *ctx, bool enable) {
+void log_enable_ring_queue(log_handle *ctx, bool enable) {
   if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->use_ring_queue = enable;
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_set_clock_source(log *ctx, int clock_source) {
+void log_set_clock_source(log_handle *ctx, int clock_source) {
   if (!ctx || clock_source < LOG_CLOCK_REALTIME || clock_source > LOG_CLOCK_MONOTONIC_COARSE) return;
   rwlock_write_lock(&ctx->rwlock);
   ctx->clock_source = clock_source;
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_set_queue_size(log *ctx, size_t size) {
+void log_set_queue_size(log_handle *ctx, size_t size) {
   if (!ctx || size < 2) return;
   rwlock_write_lock(&ctx->rwlock);
   ring_queue_destroy(&ctx->ring_queue);
@@ -1452,7 +1452,7 @@ void log_set_queue_size(log *ctx, size_t size) {
 }
 
 /* Snapshot stats from thread-local storage into a plain struct */
-static void stats_snapshot(log *ctx, log_stats *stats) {
+static void stats_snapshot(log_handle *ctx, log_stats *stats) {
   (void)ctx;
   stats->total_count = tl_stats.total_count;
   for (int i = 0; i < LOG_LEVELS; i++) {
@@ -1465,12 +1465,12 @@ static void stats_snapshot(log *ctx, log_stats *stats) {
   stats->sync_writes = tl_stats.sync_writes;
 }
 
-void log_get_perf_stats(log *ctx, log_stats *stats) {
+void log_get_perf_stats(log_handle *ctx, log_stats *stats) {
   if (!ctx || !stats) return;
   stats_snapshot(ctx, stats);
 }
 
-int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level) {
+int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level) {
   if (!fn || !ctx || ctx->handler_count >= ctx->handler_capacity) {
     return -1;
   }
@@ -1494,7 +1494,7 @@ int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level) {
   return ctx->handler_count - 1;
 }
 
-int log_add_fp(log *ctx, FILE *fp, int level) {
+int log_add_fp(log_handle *ctx, FILE *fp, int level) {
   if (!ctx || !fp) return -1;
   if (ctx->handler_count >= ctx->handler_capacity) return -1;
 
@@ -1518,7 +1518,7 @@ int log_add_fp(log *ctx, FILE *fp, int level) {
   return ctx->handler_count - 1;
 }
 
-int log_add_file(log *ctx, const char *filename, int level) {
+int log_add_file(log_handle *ctx, const char *filename, int level) {
   if (!ctx || !filename) return -1;
   if (ctx->handler_count >= ctx->handler_capacity) return -1;
 
@@ -1545,7 +1545,7 @@ int log_add_file(log *ctx, const char *filename, int level) {
   return ctx->handler_count - 1;
 }
 
-void log_remove_handler(log *ctx, int idx) {
+void log_remove_handler(log_handle *ctx, int idx) {
   if (!ctx || idx < 0 || idx >= ctx->handler_count) return;
   
   rwlock_write_lock(&ctx->rwlock);
@@ -1553,7 +1553,7 @@ void log_remove_handler(log *ctx, int idx) {
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_log(log *ctx, int level, const char *file, int line, const char *fmt, ...) {
+void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...) {
   if (!ctx || !fmt) return;
 
   rwlock_read_lock(&ctx->rwlock);
@@ -1656,7 +1656,7 @@ void log_log(log *ctx, int level, const char *file, int line, const char *fmt, .
   rwlock_read_unlock(&ctx->rwlock);
 }
 
-void log_rotate(log *ctx) {
+void log_rotate(log_handle *ctx) {
   if (!ctx || !ctx->file_prefix) return;
 
   rwlock_write_lock(&ctx->rwlock);
@@ -1691,14 +1691,14 @@ void log_rotate(log *ctx) {
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-int log_get_stats(log *ctx, log_stats *stats) {
+int log_get_stats(log_handle *ctx, log_stats *stats) {
   if (!ctx || !stats) return -1;
   stats_snapshot(ctx, stats);
   return 0;
 }
 
 #if LOG_FEATURE_JSON
-int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size) {
+int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size) {
   char *msg = format_message(ev);
   if (!msg) return 0;
 
@@ -1741,7 +1741,7 @@ int log_format_json(log *ctx, log_event *ev, char *buf, size_t buf_size) {
 }
 #endif /* LOG_FEATURE_JSON */
 
-void log_handler_set_level(log *ctx, int handler_idx, int new_level) {
+void log_handler_set_level(log_handle *ctx, int handler_idx, int new_level) {
   if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return;
   
   rwlock_write_lock(&ctx->rwlock);
@@ -1749,7 +1749,7 @@ void log_handler_set_level(log *ctx, int handler_idx, int new_level) {
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_handler_set_formatter(log *ctx, int handler_idx, log_FormatFn new_fn) {
+void log_handler_set_formatter(log_handle *ctx, int handler_idx, log_FormatFn new_fn) {
   rwlock_write_lock(&ctx->rwlock);
   if (handler_idx >= 0 && handler_idx < ctx->handler_count) {
     ctx->handlers[handler_idx].fn = NULL; /* mark for kind-based resolution */
@@ -1758,7 +1758,7 @@ void log_handler_set_formatter(log *ctx, int handler_idx, log_FormatFn new_fn) {
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_configure_pipeline(log* ctx, log_stage_function* stages, int stage_count) {
+void log_configure_pipeline(log_handle* ctx, log_stage_function* stages, int stage_count) {
   rwlock_write_lock(&ctx->rwlock);
 
   for (int i = 0; i < stage_count && i < ctx->handler_count; i++) {
@@ -1774,7 +1774,7 @@ void log_configure_pipeline(log* ctx, log_stage_function* stages, int stage_coun
   rwlock_write_unlock(&ctx->rwlock);
 }
 
-void log_enable_text_format(log* ctx) {
+void log_enable_text_format(log_handle* ctx) {
   if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   for (int i = 0; i < ctx->handler_count; i++) {
@@ -1788,7 +1788,7 @@ void log_enable_text_format(log* ctx) {
 }
 
 #if LOG_FEATURE_JSON
-void log_enable_json_format(log* ctx) {
+void log_enable_json_format(log_handle* ctx) {
   if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   for (int i = 0; i < ctx->handler_count; i++) {
@@ -1802,7 +1802,7 @@ void log_enable_json_format(log* ctx) {
 
 /* Thread ID support implementation */
 #if LOG_FEATURE_THREAD_ID
-void log_enable_thread_id(log *ctx, int handler_idx, bool enable) {
+void log_enable_thread_id(log_handle *ctx, int handler_idx, bool enable) {
   if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return;
 
   rwlock_write_lock(&ctx->rwlock);
@@ -1825,7 +1825,7 @@ int log_level_to_syslog(int level) {
   }
 }
 
-static void syslog_handler(log *ctx, log_event *ev) {
+static void syslog_handler(log_handle *ctx, log_event *ev) {
   if (!ctx) return;
 
   int priority = LOG_USER | log_level_to_syslog(ev->level);
@@ -1851,7 +1851,7 @@ static void syslog_handler(log *ctx, log_event *ev) {
   free(msg);
 }
 
-int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level) {
+int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int level) {
   if (!ctx) return -1;
 
   rwlock_write_lock(&ctx->rwlock);
@@ -1900,14 +1900,14 @@ int log_level_to_syslog(int level) {
   return 0;
 }
 
-int log_add_syslog_handler(log *ctx, const char *ident, int facility, int level) {
+int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int level) {
   (void)ctx; (void)ident; (void)facility; (void)level;
   return -1;
 }
 #endif
 
 #if LOG_HAVE_SYSLOG
-void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable) {
+void log_handler_enable_syslog(log_handle *ctx, int handler_idx, bool enable) {
   if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return;
 
   rwlock_write_lock(&ctx->rwlock);
@@ -1922,7 +1922,7 @@ void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable) {
   rwlock_write_unlock(&ctx->rwlock);
 }
 #else
-void log_handler_enable_syslog(log *ctx, int handler_idx, bool enable) {
+void log_handler_enable_syslog(log_handle *ctx, int handler_idx, bool enable) {
   (void)ctx; (void)handler_idx; (void)enable;
 }
 #endif

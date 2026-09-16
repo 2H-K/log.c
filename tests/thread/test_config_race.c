@@ -12,7 +12,7 @@ static DWORD WINAPI config_changer(LPVOID arg) {
 #else
 static void* config_changer(void *arg) {
 #endif
-    log *ctx = (log*)arg;
+    log_handle *ctx = (log_handle*)arg;
     for (int i = 0; i < 200; i++) {
         log_set_level(ctx, LOG_TRACE + (i % LOG_LEVELS));
     }
@@ -43,7 +43,7 @@ static void test_config_change_during_write(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_set_async(ctx, true);
@@ -78,7 +78,7 @@ static void test_handler_change_during_write(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_set_async(ctx, true);

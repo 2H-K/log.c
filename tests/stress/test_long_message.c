@@ -10,7 +10,7 @@ static void test_long_message_1k(void) {
     FILE *fp = fopen("test_tmp.log", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -37,7 +37,7 @@ static void test_long_message_4k(void) {
     FILE *fp = fopen("test_tmp.log", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -64,7 +64,7 @@ static void test_long_message_json(void) {
     FILE *fp = fopen("test_tmp.json", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_enable_json_format(ctx);
@@ -92,7 +92,7 @@ static void test_long_message_async(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_set_async(ctx, true);

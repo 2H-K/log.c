@@ -10,7 +10,7 @@ static void test_stats_total_count(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -32,7 +32,7 @@ static void test_stats_level_counts(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -60,7 +60,7 @@ static void test_stats_filtered_count(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     if (idx >= 0) ctx->handlers[0].active = false;
 
@@ -84,7 +84,7 @@ static void test_stats_async_counts(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     if (idx >= 0) ctx->handlers[0].active = false;
 

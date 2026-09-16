@@ -38,7 +38,7 @@ Benchmark results (Linux, GCC -O2):
 #include "log.h"
 
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     log_ctx_trace(ctx, "Detailed debug info");
     log_ctx_info(ctx, "Application started");
@@ -235,7 +235,7 @@ Six log levels from most to least verbose:
 ### 2. File Logging with Rotation
 
 ```c
-log *ctx = log_create();
+log_handle *ctx = log_create();
 
 // Configure rotation (10MB max size, 5 rotated files)
 log_set_file_prefix(ctx, "app.log");
@@ -258,7 +258,7 @@ log_destroy(ctx);
 ### 3. JSON Format Output
 
 ```c
-log *ctx = log_create();
+log_handle *ctx = log_create();
 
 // Set JSON format
 log_enable_json_format(ctx);
@@ -286,7 +286,7 @@ log_destroy(ctx);
 #include <pthread.h>
 
 void* worker_thread(void *arg) {
-    log *ctx = (log*)arg;
+    log_handle *ctx = (log_handle*)arg;
     for (int i = 0; i < 100; i++) {
         log_ctx_info(ctx, "Thread %lu: Message %d", pthread_self(), i);
     }
@@ -294,7 +294,7 @@ void* worker_thread(void *arg) {
 }
 
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // Enable thread ID for file handler
     FILE *fp = fopen("thread.log", "w");
@@ -328,7 +328,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // Enable async mode (ring buffer queue + dedicated writer thread)
     log_set_async(ctx, true);
@@ -365,7 +365,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // Add syslog handler (POSIX only)
     #ifdef LOG_PLATFORM_POSIX
@@ -388,32 +388,32 @@ For complete API documentation, see [API.md](API.md).
 ### Core Functions
 
 ```c
-log* log_create(void);
-void log_destroy(log *ctx);
-log* log_default(void);
-void log_log(log *ctx, int level, const char *file, int line, const char *fmt, ...);
+log_handle* log_create(void);
+void log_destroy(log_handle *ctx);
+log_handle* log_default(void);
+void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...);
 ```
 
 ### Configuration
 
 ```c
-void log_set_level(log *ctx, int level);
-void log_set_quiet(log *ctx, bool enable);
-void log_set_format(log *ctx, log_FormatFn fn);
-int log_set_async(log *ctx, bool enable);
-void log_set_queue_policy(log *ctx, int policy);
-void log_set_max_file_size(log *ctx, size_t size);
-void log_set_file_prefix(log *ctx, const char *prefix);
+void log_set_level(log_handle *ctx, int level);
+void log_set_quiet(log_handle *ctx, bool enable);
+void log_set_format(log_handle *ctx, log_FormatFn fn);
+int log_set_async(log_handle *ctx, bool enable);
+void log_set_queue_policy(log_handle *ctx, int policy);
+void log_set_max_file_size(log_handle *ctx, size_t size);
+void log_set_file_prefix(log_handle *ctx, const char *prefix);
 ```
 
 ### Handler Management
 
 ```c
-int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
-int log_add_fp(log *ctx, FILE *fp, int level);
-int log_add_file(log *ctx, const char *filename, int level);
-void log_remove_handler(log *ctx, int idx);
-void log_handler_set_level(log *ctx, int handler_idx, int new_level);
+int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level);
+int log_add_fp(log_handle *ctx, FILE *fp, int level);
+int log_add_file(log_handle *ctx, const char *filename, int level);
+void log_remove_handler(log_handle *ctx, int idx);
+void log_handler_set_level(log_handle *ctx, int handler_idx, int new_level);
 ```
 
 ## 📊 Performance Statistics
@@ -479,11 +479,41 @@ make run-tests    # Run all categories separately
 make run-all      # Run unified test suite
 ```
 
+## 🔄 Migrating from 2.x
+
+Version 3.0.0 renames the opaque handle type from `log` to `log_handle`:
+
+```c
+/* before (2.x) */
+log *ctx = log_create();
+
+/* after (3.0) */
+log_handle *ctx = log_create();
+```
+
+Only the type name changed. Every `log_*` function and `LOG_*` macro keeps its
+name, so a plain textual replacement of the standalone token `log` is enough:
+
+```sh
+sed -i 's/\blog\b/log_handle/g' your_source.c
+```
+
+Why the rename: `log` shares the ordinary identifier namespace with the C math
+function `log()`. MSVC enables that builtin under `/Oi` (implied by `/O2`), and
+`<math.h>`/`<cmath>` expose it on every platform, so a public type called `log`
+cannot coexist with them.
+
 ## 📄 License
 
 MIT License - See [LICENSE](LICENSE) for details.
 
 ## 📈 Version History
+
+- **3.0.0** (2026): Breaking - opaque handle type renamed from `log` to `log_handle`
+  - `log` collided with the math builtin `log` (MSVC `/Oi` via `/O2`, `<math.h>`, C++ `<cmath>`)
+  - All `log_*` functions and `LOG_*` macros are unchanged; only the type name moved
+  - Added GitHub Actions CI (Linux GCC/Clang, macOS Clang, Windows MSVC/MinGW)
+  - Added an MSVC `/O2 /Oi /WX` public-header regression guard
 
 - **2.0.1** (2026): Code quality improvements
   - Cleaned up compiler warnings (unused variables, format strings)

@@ -10,7 +10,7 @@ static void test_json_escape_double_quote(void) {
     FILE *fp = fopen("test_tmp.json", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_enable_json_format(ctx);
@@ -35,7 +35,7 @@ static void test_json_escape_newline(void) {
     FILE *fp = fopen("test_tmp.json", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_enable_json_format(ctx);
@@ -59,7 +59,7 @@ static void test_json_escape_backslash(void) {
     FILE *fp = fopen("test_tmp.json", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_enable_json_format(ctx);
@@ -83,7 +83,7 @@ static void test_json_escape_tab(void) {
     FILE *fp = fopen("test_tmp.json", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_enable_json_format(ctx);
@@ -107,7 +107,7 @@ static void test_json_structure_fields(void) {
     FILE *fp = fopen("test_tmp.json", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_enable_json_format(ctx);
@@ -135,7 +135,7 @@ static void test_json_thread_id_field(void) {
     FILE *fp = fopen("test_tmp.json", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) {
         ctx->handlers[0].active = false;
@@ -162,7 +162,7 @@ static void test_text_format_output(void) {
     FILE *fp = fopen("test_tmp.log", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
 

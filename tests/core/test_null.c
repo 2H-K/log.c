@@ -23,7 +23,7 @@ static void test_null_log_context(void) {
 }
 
 static void test_null_format_string(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     TEST_ASSERT_NOT_NULL(ctx, "log_create");
 
     log_ctx_info(ctx, NULL);
@@ -33,7 +33,7 @@ static void test_null_format_string(void) {
 }
 
 static void test_null_filename(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     TEST_ASSERT_NOT_NULL(ctx, "log_create");
 
     int idx = log_add_file(ctx, NULL, LOG_INFO);
@@ -44,7 +44,7 @@ static void test_null_filename(void) {
 }
 
 static void test_null_file_pointer(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     TEST_ASSERT_NOT_NULL(ctx, "log_create");
 
     int idx = log_add_fp(ctx, NULL, LOG_INFO);
@@ -55,7 +55,7 @@ static void test_null_file_pointer(void) {
 }
 
 static void test_null_handler_functions(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     TEST_ASSERT_NOT_NULL(ctx, "log_create");
 
     int idx = log_add_handler(ctx, NULL, NULL, LOG_INFO);
@@ -66,7 +66,7 @@ static void test_null_handler_functions(void) {
 }
 
 static void test_null_stats_pointer(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     TEST_ASSERT_NOT_NULL(ctx, "log_create");
 
     int ret = log_get_stats(ctx, NULL);
@@ -77,7 +77,7 @@ static void test_null_stats_pointer(void) {
 }
 
 static void test_null_prefix(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     TEST_ASSERT_NOT_NULL(ctx, "log_create");
 
     log_set_file_prefix(ctx, NULL);

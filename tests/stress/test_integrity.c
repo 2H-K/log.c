@@ -42,7 +42,7 @@ static int g_bitmap_size = 0;
 #endif
 
 typedef struct {
-    log *ctx;
+    log_handle *ctx;
     int thread_id;
     int start_seq;
     int count;
@@ -63,7 +63,7 @@ static void test_integrity_sync(void) {
     const char *tmpfile = INTEGRITY_TMPFILE;
     remove(tmpfile);
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(tmpfile, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
     log_add_fp(ctx, fp, LOG_INFO);
@@ -139,7 +139,7 @@ static void test_integrity_async(void) {
     const char *tmpfile = INTEGRITY_TMPFILE_ASYNC;
     remove(tmpfile);
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(tmpfile, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
     log_add_fp(ctx, fp, LOG_INFO);

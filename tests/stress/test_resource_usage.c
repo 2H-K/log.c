@@ -76,7 +76,7 @@ static void test_memory_baseline(void) {
     if (rss_before < 0) { TEST_SKIP("RSS unavailable (no /proc)"); return; }
 
     /* Create a log context */
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -99,7 +99,7 @@ static void test_memory_stability(void) {
 
     /* Create and destroy many contexts */
     for (int i = 0; i < 10000; i++) {
-        log *ctx = log_create();
+        log_handle *ctx = log_create();
         FILE *fp = fopen(TEST_DEV_NULL, "w");
         log_add_fp(ctx, fp, LOG_INFO);
         log_destroy(ctx);
@@ -123,7 +123,7 @@ static void test_fd_leak(void) {
 
     /* Create and destroy many file handlers */
     for (int i = 0; i < 100; i++) {
-        log *ctx = log_create();
+        log_handle *ctx = log_create();
         FILE *fp = fopen(TEST_DEV_NULL, "w");
         log_add_fp(ctx, fp, LOG_INFO);
         log_destroy(ctx);
@@ -146,7 +146,7 @@ static void test_thread_leak_sync(void) {
     if (threads_before < 0) { TEST_SKIP("thread count unavailable (no /proc)"); return; }
 
     /* Sync mode should not create extra threads */
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -172,7 +172,7 @@ static void test_thread_leak_async(void) {
     if (threads_before < 0) { TEST_SKIP("thread count unavailable (no /proc)"); return; }
 
     /* Async mode creates one background thread */
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
     log_set_async(ctx, true);
@@ -206,7 +206,7 @@ static void test_thread_leak_async(void) {
 
 static void test_cpu_overhead_sync(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
 
     double cpu_before = get_cpu_time_ms();
@@ -231,7 +231,7 @@ static void test_cpu_overhead_sync(void) {
 }
 
 static void test_handle_limit(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int count = 0;
 
     /* Add handlers until we hit the limit */

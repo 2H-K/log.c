@@ -27,7 +27,7 @@ static void test_mt_async_basic(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_set_async(ctx, true);
@@ -59,7 +59,7 @@ static void test_mt_async_ring_queue(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_enable_ring_queue(ctx, true);
@@ -90,7 +90,7 @@ static void test_mt_async_no_crash_stress(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_DEBUG);
     if (idx >= 0) ctx->handlers[0].active = false;
     log_set_async(ctx, true);

@@ -14,7 +14,7 @@
 /* ==================== NULL / Empty Input Tests ==================== */
 
 static void test_boundary_null_filename(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_file(ctx, NULL, LOG_INFO);
     TEST_ASSERT(idx < 0, "add_file with NULL filename returns error");
     log_destroy(ctx);
@@ -22,7 +22,7 @@ static void test_boundary_null_filename(void) {
 }
 
 static void test_boundary_empty_filename(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_file(ctx, "", LOG_INFO);
     TEST_ASSERT(idx < 0, "add_file with empty filename returns error");
     log_destroy(ctx);
@@ -30,7 +30,7 @@ static void test_boundary_empty_filename(void) {
 }
 
 static void test_boundary_null_prefix(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_set_file_prefix(ctx, NULL);
     /* Should not crash, should use default */
     log_destroy(ctx);
@@ -38,7 +38,7 @@ static void test_boundary_null_prefix(void) {
 }
 
 static void test_boundary_empty_prefix(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_set_file_prefix(ctx, "");
     /* Should not crash */
     log_destroy(ctx);
@@ -48,7 +48,7 @@ static void test_boundary_empty_prefix(void) {
 /* ==================== Extreme Value Tests ==================== */
 
 static void test_very_long_message(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -68,7 +68,7 @@ static void test_very_long_message(void) {
 }
 
 static void test_very_long_format(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -83,7 +83,7 @@ static void test_very_long_format(void) {
 }
 
 static void test_max_level(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -101,7 +101,7 @@ static void test_max_level(void) {
 }
 
 static void test_negative_level(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -117,7 +117,7 @@ static void test_negative_level(void) {
 /* ==================== Path Boundary Tests ==================== */
 
 static void test_boundary_long_path(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     /* Create a long path (but within typical limits) */
     char path[512];
@@ -139,7 +139,7 @@ static void test_boundary_long_path(void) {
 }
 
 static void test_path_with_special_chars(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     const char *path = TEST_TMP_DIR "test-file_name.123.log";
     int idx = log_add_file(ctx, path, LOG_INFO);
@@ -157,7 +157,7 @@ static void test_path_with_special_chars(void) {
 /* ==================== Handler Limit Tests ==================== */
 
 static void test_max_handlers(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int count = 0;
 
     /* Add handlers until we hit the limit */
@@ -190,7 +190,7 @@ static void test_max_handlers(void) {
 }
 
 static void test_remove_invalid_handler(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -207,7 +207,7 @@ static void test_remove_invalid_handler(void) {
 /* ==================== Concurrent Edge Cases ==================== */
 
 static void test_destroy_while_logging(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -225,7 +225,7 @@ static void test_destroy_while_logging(void) {
 static void test_recreate_after_destroy(void) {
     /* Create and destroy multiple times */
     for (int i = 0; i < 100; i++) {
-        log *ctx = log_create();
+        log_handle *ctx = log_create();
         FILE *fp = fopen(TEST_DEV_NULL, "w");
         log_add_fp(ctx, fp, LOG_INFO);
         log_ctx_info(ctx, "iteration %d", i);
@@ -238,7 +238,7 @@ static void test_recreate_after_destroy(void) {
 /* ==================== Format String Edge Cases ==================== */
 
 static void test_format_percent(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -253,7 +253,7 @@ static void test_format_percent(void) {
 }
 
 static void test_format_null_args(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 
@@ -269,7 +269,7 @@ static void test_format_null_args(void) {
 }
 
 static void test_very_small_queue_size(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     log_add_fp(ctx, fp, LOG_INFO);
 

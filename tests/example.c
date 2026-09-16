@@ -11,7 +11,7 @@
 #include <string.h>
 
 /* Custom log formatter: writes only the level and message */
-static int custom_formatter(log *ctx, log_event *ev, char *buf, size_t buf_size) {
+static int custom_formatter(log_handle *ctx, log_event *ev, char *buf, size_t buf_size) {
   (void)ctx;
   return snprintf(buf, buf_size, "[%s] ", log_level_string(ev->level));
 }
@@ -23,7 +23,7 @@ typedef struct {
   size_t capacity;
 } membuf_t;
 
-static void membuf_handler(log *ctx, log_event *ev) {
+static void membuf_handler(log_handle *ctx, log_event *ev) {
   (void)ctx;
   membuf_t *mb = (membuf_t *)ev->udata;
   char *msg = NULL;
@@ -66,7 +66,7 @@ int main(void) {
 
   /* 2. Custom logger context with file output */
   printf("\n--- 2. File output ---\n");
-  log *ctx = log_create();
+  log_handle *ctx = log_create();
   log_add_file(ctx, "example_output.log", LOG_DEBUG);
   log_ctx_info(ctx, "Logging to file: example_output.log");
   log_ctx_debug(ctx, "Debug value: %d", 42);

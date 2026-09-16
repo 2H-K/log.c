@@ -16,7 +16,7 @@
 #endif
 
 static void test_syslog_add_handler(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_syslog_handler(ctx, "test_logc", LOG_USER, LOG_DEBUG);
     TEST_ASSERT(idx >= 0, "syslog handler added");
     log_destroy(ctx);
@@ -24,7 +24,7 @@ static void test_syslog_add_handler(void) {
 }
 
 static void test_syslog_log_message(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_syslog_handler(ctx, "test_logc", LOG_USER, LOG_DEBUG);
     TEST_ASSERT(idx >= 0, "syslog handler added");
 

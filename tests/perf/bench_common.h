@@ -23,7 +23,7 @@
 #define BENCH_N 500000
 
 typedef struct {
-    log *ctx;
+    log_handle *ctx;
     int thread_id;
     int count;
     uint64_t elapsed_ns;

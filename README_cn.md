@@ -38,7 +38,7 @@
 #include "log.h"
 
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     log_ctx_trace(ctx, "详细调试信息");
     log_ctx_info(ctx, "应用程序已启动");
@@ -235,7 +235,7 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 ### 2. 文件日志与轮转
 
 ```c
-log *ctx = log_create();
+log_handle *ctx = log_create();
 
 // 配置轮转（最大 10MB，5 个轮转文件）
 log_set_file_prefix(ctx, "app.log");
@@ -258,7 +258,7 @@ log_destroy(ctx);
 ### 3. JSON 格式输出
 
 ```c
-log *ctx = log_create();
+log_handle *ctx = log_create();
 
 // 设置 JSON 格式
 log_enable_json_format(ctx);
@@ -286,7 +286,7 @@ log_destroy(ctx);
 #include <pthread.h>
 
 void* worker_thread(void *arg) {
-    log *ctx = (log*)arg;
+    log_handle *ctx = (log_handle*)arg;
     for (int i = 0; i < 100; i++) {
         log_ctx_info(ctx, "线程 %lu: 消息 %d", pthread_self(), i);
     }
@@ -294,7 +294,7 @@ void* worker_thread(void *arg) {
 }
 
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // 为文件处理器启用线程ID
     FILE *fp = fopen("thread.log", "w");
@@ -328,7 +328,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // 启用异步模式（环形缓冲区队列 + 专用写入线程）
     log_set_async(ctx, true);
@@ -365,7 +365,7 @@ int main(void) {
 
 ```c
 int main(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     // 添加 syslog 处理器（仅 POSIX）
     #ifdef LOG_PLATFORM_POSIX
@@ -388,32 +388,32 @@ int main(void) {
 ### 核心函数
 
 ```c
-log* log_create(void);
-void log_destroy(log *ctx);
-log* log_default(void);
-void log_log(log *ctx, int level, const char *file, int line, const char *fmt, ...);
+log_handle* log_create(void);
+void log_destroy(log_handle *ctx);
+log_handle* log_default(void);
+void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...);
 ```
 
 ### 配置
 
 ```c
-void log_set_level(log *ctx, int level);
-void log_set_quiet(log *ctx, bool enable);
-void log_set_format(log *ctx, log_FormatFn fn);
-int log_set_async(log *ctx, bool enable);
-void log_set_queue_policy(log *ctx, int policy);
-void log_set_max_file_size(log *ctx, size_t size);
-void log_set_file_prefix(log *ctx, const char *prefix);
+void log_set_level(log_handle *ctx, int level);
+void log_set_quiet(log_handle *ctx, bool enable);
+void log_set_format(log_handle *ctx, log_FormatFn fn);
+int log_set_async(log_handle *ctx, bool enable);
+void log_set_queue_policy(log_handle *ctx, int policy);
+void log_set_max_file_size(log_handle *ctx, size_t size);
+void log_set_file_prefix(log_handle *ctx, const char *prefix);
 ```
 
 ### 处理器管理
 
 ```c
-int log_add_handler(log *ctx, log_LogFn fn, void *udata, int level);
-int log_add_fp(log *ctx, FILE *fp, int level);
-int log_add_file(log *ctx, const char *filename, int level);
-void log_remove_handler(log *ctx, int idx);
-void log_handler_set_level(log *ctx, int handler_idx, int new_level);
+int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level);
+int log_add_fp(log_handle *ctx, FILE *fp, int level);
+int log_add_file(log_handle *ctx, const char *filename, int level);
+void log_remove_handler(log_handle *ctx, int idx);
+void log_handler_set_level(log_handle *ctx, int handler_idx, int new_level);
 ```
 
 ## 📊 性能统计
@@ -479,11 +479,37 @@ make run-tests    # 分别运行所有类别
 make run-all      # 运行统一测试套件
 ```
 
+## 🔄 从 2.x 迁移
+
+3.0.0 把不透明句柄类型从 `log` 改名为 `log_handle`：
+
+```c
+/* 2.x 之前的写法 */
+log *ctx = log_create();
+
+/* 3.0 的写法 */
+log_handle *ctx = log_create();
+```
+
+只改了类型名。所有 `log_*` 函数和 `LOG_*` 宏名称不变，所以对独立的 `log` 令牌做一次文本替换即可：
+
+```sh
+sed -i 's/\blog\b/log_handle/g' your_source.c
+```
+
+改名原因：`log` 与 C 数学函数 `log()` 共用 ordinary identifier 命名空间。MSVC 在 `/Oi`（由 `/O2` 隐含）下会启用该内置函数，而 `<math.h>`/`<cmath>` 在任何平台都会暴露它，因此名为 `log` 的公共类型无法与它们共存。
+
 ## 📄 许可证
 
 MIT 许可证 - 详情请参阅 [LICENSE](LICENSE)。
 
 ## 📈 版本历史
+
+- **3.0.0** (2026): 破坏性变更 —— 不透明句柄类型由 `log` 改名为 `log_handle`
+  - `log` 与数学内置函数 `log` 冲突（MSVC 经 `/O2` 隐含的 `/Oi`、`<math.h>`、C++ `<cmath>`）
+  - 所有 `log_*` 函数与 `LOG_*` 宏不变，仅类型名变更
+  - 新增 GitHub Actions CI（Linux GCC/Clang、macOS Clang、Windows MSVC/MinGW）
+  - 新增 MSVC `/O2 /Oi /WX` 公共头回归门禁
 
 - **2.0.1** (2026): 代码质量改进
   - 清理编译警告（未使用变量、格式字符串）

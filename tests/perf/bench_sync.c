@@ -9,7 +9,7 @@
 
 static void test_bench_sync_single(void) {
     FILE *fp = fopen(DEV_NULL_PATH, "w");
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
     ctx->handlers[0].active = false;
 
@@ -26,7 +26,7 @@ static void test_bench_sync_single(void) {
 
 static void test_bench_sync_multi(void) {
     FILE *fp = fopen(DEV_NULL_PATH, "w");
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
     ctx->handlers[0].active = false;
 
@@ -57,7 +57,7 @@ static void test_bench_sync_multi(void) {
 
 static void test_bench_sync_latency(void) {
     FILE *fp = fopen(DEV_NULL_PATH, "w");
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_add_fp(ctx, fp, LOG_INFO);
     ctx->handlers[0].active = false;
 

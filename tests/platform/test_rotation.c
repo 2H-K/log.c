@@ -7,7 +7,7 @@
 #include "log.h"
 
 static void test_rotation_basic(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_set_file_prefix(ctx, "test_rot");
     log_set_max_file_size(ctx, 1024);
 
@@ -35,7 +35,7 @@ static void test_rotation_basic(void) {
 }
 
 static void test_rotation_multiple(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_set_file_prefix(ctx, "test_rot");
     log_set_max_file_size(ctx, 512);
 
@@ -66,7 +66,7 @@ static void test_rotation_manual(void) {
 #if defined(_WIN32) || defined(_WIN64)
     /* On Windows, log_rotate must close+reopen the file to rename it,
      * so we use log_add_file (owns_file=true) to avoid double-close. */
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_set_file_prefix(ctx, "test_rot");
     /* Use large max size to avoid auto-rotation during writes */
     log_set_max_file_size(ctx, 1024 * 1024);
@@ -91,7 +91,7 @@ static void test_rotation_manual(void) {
     TEST_ASSERT_NOT_NULL(f, "manual rotation creates file");
     if (f) fclose(f);
 #else
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     log_set_file_prefix(ctx, "test_rot");
     log_set_max_file_size(ctx, 1024);
 
@@ -126,7 +126,7 @@ static void test_rotation_manual(void) {
 }
 
 static void test_rotation_invalid_prefix(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     log_rotate(ctx);
     log_set_file_prefix(ctx, "../etc/passwd");
@@ -136,7 +136,7 @@ static void test_rotation_invalid_prefix(void) {
 }
 
 static void test_path_traversal_rejection(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
 
     log_set_file_prefix(ctx, "../escape");
     log_set_file_prefix(ctx, "..\\escape");

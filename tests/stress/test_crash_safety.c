@@ -33,7 +33,7 @@ static void test_crash_after_fsync(void) {
         FILE *fp = fopen(tmpfile, "w");
         if (!fp) _exit(1);
 
-        log *ctx = log_create();
+        log_handle *ctx = log_create();
         log_add_fp(ctx, fp, LOG_INFO);
 
         /* Write some messages */
@@ -100,7 +100,7 @@ static void test_crash_no_flush(void) {
         FILE *fp = fopen(tmpfile, "w");
         if (!fp) _exit(1);
 
-        log *ctx = log_create();
+        log_handle *ctx = log_create();
         log_add_fp(ctx, fp, LOG_INFO);
 
         /* Write messages without explicit flush */
@@ -150,7 +150,7 @@ static void test_crash_async_mode(void) {
         FILE *fp = fopen(tmpfile, "w");
         if (!fp) _exit(1);
 
-        log *ctx = log_create();
+        log_handle *ctx = log_create();
         log_add_fp(ctx, fp, LOG_INFO);
         log_set_async(ctx, true);
 

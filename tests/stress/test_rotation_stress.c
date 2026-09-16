@@ -75,7 +75,7 @@ static void test_rotation_many_files(void) {
     FILE *fp = fopen(path, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen rotation test file");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     TEST_ASSERT(idx >= 0, "add handler for rotation test");
 
@@ -137,7 +137,7 @@ static void test_rotation_file_integrity(void) {
     FILE *fp = fopen(path, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen integrity rotation file");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
     TEST_ASSERT(idx >= 0, "add handler");
 
@@ -215,13 +215,13 @@ static void test_rotation_manual_trigger(void) {
     TEST_ASSERT_NOT_NULL(fp, "fopen manual rotation file");
     if (fp) fclose(fp);
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_file(ctx, path, LOG_INFO);
 #else
     FILE *fp = fopen(path, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen manual rotation file");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_INFO);
 #endif
     TEST_ASSERT(idx >= 0, "add handler");

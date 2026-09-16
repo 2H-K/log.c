@@ -10,7 +10,7 @@ static void test_handler_add_fp(void) {
     FILE *fp = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_DEBUG);
     TEST_ASSERT(idx >= 0, "log_add_fp returns valid index");
 
@@ -20,7 +20,7 @@ static void test_handler_add_fp(void) {
 }
 
 static void test_handler_add_file(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_file(ctx, TEST_TMP_FILE, LOG_INFO);
     TEST_ASSERT(idx >= 0, "log_add_file succeeds");
 
@@ -30,7 +30,7 @@ static void test_handler_add_file(void) {
 }
 
 static void test_handler_add_null_file(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_file(ctx, NULL, LOG_INFO);
     TEST_ASSERT_EQ(idx, -1, "NULL filename returns -1");
 
@@ -43,7 +43,7 @@ static void test_handler_remove(void) {
     FILE *fp2 = fopen(TEST_DEV_NULL, "w");
     TEST_ASSERT(fp1 && fp2, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     /* Disable default stderr handler */
     ctx->handlers[0].active = false;
     int idx1 = log_add_fp(ctx, fp1, LOG_DEBUG);
@@ -65,7 +65,7 @@ static void test_handler_set_level(void) {
     FILE *fp = fopen("test_h1.txt", "w");
     TEST_ASSERT_NOT_NULL(fp, "fopen");
 
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, fp, LOG_TRACE);
     /* Disable default stderr handler to isolate test */
     ctx->handlers[0].active = false;
@@ -96,7 +96,7 @@ static void test_handler_set_level(void) {
 }
 
 static void test_handler_max_capacity(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     /* Disable default handler to maximize available slots */
     ctx->handlers[0].active = false;
     int added = 0;
@@ -119,7 +119,7 @@ static void test_handler_max_capacity(void) {
 }
 
 static void test_handler_add_null_fp(void) {
-    log *ctx = log_create();
+    log_handle *ctx = log_create();
     int idx = log_add_fp(ctx, NULL, LOG_INFO);
     TEST_ASSERT_EQ(idx, -1, "NULL fp returns -1");
 
