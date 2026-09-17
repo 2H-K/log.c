@@ -182,6 +182,30 @@ static void test_text_format_output(void) {
     TEST_PASS("text format output");
 }
 
+static void test_json_escapes_file_and_controls(void) {
+    log_handle *ctx = log_create();
+    TEST_ASSERT_NOT_NULL(ctx, "log_create");
+
+    log_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.raw_msg = "ctrl \x01 char";
+    ev.file = "C:\\src\\log.c";
+    ev.line = 7;
+    ev.level = LOG_INFO;
+    ev.timestamp = 0.0;
+
+    char buf[512];
+    int n = log_format_json(ctx, &ev, buf, sizeof(buf));
+    TEST_ASSERT(n > 0, "log_format_json returns length");
+    TEST_ASSERT(strstr(buf, "\"file\": \"C:\\\\src\\\\log.c\"") != NULL,
+                "file backslashes escaped");
+    TEST_ASSERT(strstr(buf, "\\u0001") != NULL, "control char escaped as \\u0001");
+    TEST_ASSERT(strchr(buf, '\x01') == NULL, "no raw control byte in output");
+
+    log_destroy(ctx);
+    TEST_PASS("json file/control escaping");
+}
+
 void test_format_register(void) {
     test_add(test_json_escape_double_quote, "json_escape_double_quote");
     test_add(test_json_escape_newline, "json_escape_newline");
@@ -189,5 +213,6 @@ void test_format_register(void) {
     test_add(test_json_escape_tab, "json_escape_tab");
     test_add(test_json_structure_fields, "json_structure_fields");
     test_add(test_json_thread_id_field, "json_thread_id_field");
+    test_add(test_json_escapes_file_and_controls, "json_file_and_control_escaping");
     test_add(test_text_format_output, "text_format_output");
 }

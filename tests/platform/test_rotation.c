@@ -146,10 +146,46 @@ static void test_path_traversal_rejection(void) {
     TEST_PASS("path traversal rejection");
 }
 
+static void test_rotation_reopen_failure(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    const char *logfile = "./test_rot_reopen.log";
+    /* Directory deliberately does not exist: rotate/reopen must fail. */
+    const char *bad_prefix = "./logc_no_such_dir\\test_rot_reopen.log";
+#else
+    const char *logfile = "/tmp/test_rot_reopen.log";
+    const char *bad_prefix = "/tmp/logc_no_such_dir/test_rot_reopen.log";
+#endif
+    remove(logfile);
+
+    log_handle *ctx = log_create();
+    int idx = log_add_file(ctx, logfile, LOG_INFO);
+    TEST_ASSERT(idx >= 0, "log_add_file succeeds");
+    ctx->handlers[0].active = false;
+
+    log_set_file_prefix(ctx, bad_prefix);
+    log_set_max_file_size(ctx, 1);
+
+    log_ctx_info(ctx, "first message triggers rotation");
+
+    /* The reopen fails, so the handler must not keep a pointer to the
+     * FILE that was already closed during rotation. */
+    TEST_ASSERT_NULL(ctx->handlers[idx].fp, "fp cleared after failed reopen");
+    TEST_ASSERT_NULL(ctx->handlers[idx].udata, "udata cleared after failed reopen");
+
+    /* Must not dereference a closed/freed FILE for later messages. */
+    log_ctx_info(ctx, "second message after failed reopen");
+    log_ctx_info(ctx, "third message after failed reopen");
+
+    log_destroy(ctx);
+    remove(logfile);
+    TEST_PASS("rotation reopen failure");
+}
+
 void test_rotation_register(void) {
     test_add(test_rotation_basic, "rotation_basic");
     test_add(test_rotation_multiple, "rotation_multiple");
     test_add(test_rotation_manual, "rotation_manual");
     test_add(test_rotation_invalid_prefix, "rotation_invalid_prefix");
     test_add(test_path_traversal_rejection, "path_traversal_rejection");
+    test_add(test_rotation_reopen_failure, "rotation_reopen_failure");
 }

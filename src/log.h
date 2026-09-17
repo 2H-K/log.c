@@ -115,6 +115,39 @@
 /* Define these BEFORE including log.h to disable features                  */
 /* ======================================================================== */
 
+/* Convenience: Disable all optional features for a minimal build.
+ * This MUST run before the individual flags below are evaluated, otherwise
+ * it defines LOG_DISABLE_* too late and the features stay enabled. */
+#ifdef LOG_MINIMAL
+  #ifndef LOG_DISABLE_JSON
+    #define LOG_DISABLE_JSON
+  #endif
+  #ifndef LOG_DISABLE_SYSLOG
+    #define LOG_DISABLE_SYSLOG
+  #endif
+  #ifndef LOG_DISABLE_ASYNC
+    #define LOG_DISABLE_ASYNC
+  #endif
+  #ifndef LOG_DISABLE_MPOOL
+    #define LOG_DISABLE_MPOOL
+  #endif
+  #ifndef LOG_DISABLE_RING_QUEUE
+    #define LOG_DISABLE_RING_QUEUE
+  #endif
+  #ifndef LOG_DISABLE_STATS
+    #define LOG_DISABLE_STATS
+  #endif
+  #ifndef LOG_DISABLE_FILE_OPS
+    #define LOG_DISABLE_FILE_OPS
+  #endif
+  #ifndef LOG_DISABLE_THREAD_ID
+    #define LOG_DISABLE_THREAD_ID
+  #endif
+  #ifndef LOG_DISABLE_TS_CACHE
+    #define LOG_DISABLE_TS_CACHE
+  #endif
+#endif
+
 /* Disable JSON formatting support (saves ~2KB binary) */
 #ifndef LOG_DISABLE_JSON
   #define LOG_FEATURE_JSON 1
@@ -176,34 +209,6 @@
   #define LOG_FEATURE_TS_CACHE 1
 #else
   #define LOG_FEATURE_TS_CACHE 0
-#endif
-
-/* Convenience: Disable all optional features for minimal build */
-#ifdef LOG_MINIMAL
-  #ifndef LOG_DISABLE_JSON
-    #define LOG_DISABLE_JSON
-  #endif
-  #ifndef LOG_DISABLE_SYSLOG
-    #define LOG_DISABLE_SYSLOG
-  #endif
-  #ifndef LOG_DISABLE_ASYNC
-    #define LOG_DISABLE_ASYNC
-  #endif
-  #ifndef LOG_DISABLE_MPOOL
-    #define LOG_DISABLE_MPOOL
-  #endif
-  #ifndef LOG_DISABLE_RING_QUEUE
-    #define LOG_DISABLE_RING_QUEUE
-  #endif
-  #ifndef LOG_DISABLE_STATS
-    #define LOG_DISABLE_STATS
-  #endif
-  #ifndef LOG_DISABLE_THREAD_ID
-    #define LOG_DISABLE_THREAD_ID
-  #endif
-  #ifndef LOG_DISABLE_TS_CACHE
-    #define LOG_DISABLE_TS_CACHE
-  #endif
 #endif
 
 enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL, LOG_LEVELS };
@@ -312,36 +317,6 @@ struct log_event {
   int level;
   double timestamp;  /* High-precision timestamp in seconds */
 };
-
-/* ==================== Stubs for disabled features ==================== */
-
-#if !LOG_FEATURE_JSON
-static inline int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size) {
-  (void)ctx; (void)ev; (void)buf; (void)buf_size; return 0;
-}
-static inline void log_enable_json_format(log_handle* ctx) { (void)ctx; }
-#endif
-
-#if !LOG_FEATURE_THREAD_ID
-static inline void log_enable_thread_id(log_handle *ctx, int handler_idx, bool enable) {
-  (void)ctx; (void)handler_idx; (void)enable;
-}
-#endif
-
-#if !LOG_FEATURE_TS_CACHE
-static inline void log_enable_ts_cache(log_handle *ctx, bool enable) { (void)ctx; (void)enable; }
-#endif
-
-#if !LOG_FEATURE_STATS
-static inline void log_get_perf_stats(log_handle *ctx, log_stats *stats) { (void)ctx; (void)stats; }
-#endif
-
-#if !LOG_FEATURE_SYSLOG
-static inline int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int level) {
-  (void)ctx; (void)ident; (void)facility; (void)level; return -1;
-}
-static inline int log_level_to_syslog(int level) { (void)level; return 6; }
-#endif
 
 /**
  * @brief Logger configuration
@@ -569,6 +544,61 @@ struct log_handle {
   int clock_source;
 };
 
+/* ==================== Stubs for disabled features ==================== */
+/* These must come after all types they reference (log_stats, log_handle). */
+
+#if !LOG_FEATURE_JSON
+static inline int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size) {
+  (void)ctx; (void)ev; (void)buf; (void)buf_size; return 0;
+}
+static inline void log_enable_json_format(log_handle* ctx) { (void)ctx; }
+#endif
+
+#if !LOG_FEATURE_THREAD_ID
+static inline void log_enable_thread_id(log_handle *ctx, int handler_idx, bool enable) {
+  (void)ctx; (void)handler_idx; (void)enable;
+}
+#endif
+
+#if !LOG_FEATURE_TS_CACHE
+static inline void log_enable_ts_cache(log_handle *ctx, bool enable) { (void)ctx; (void)enable; }
+#endif
+
+#if !LOG_FEATURE_MPOOL
+static inline void log_enable_mpool(log_handle *ctx, bool enable) { (void)ctx; (void)enable; }
+#endif
+
+#if !LOG_FEATURE_RING_QUEUE
+static inline void log_enable_ring_queue(log_handle *ctx, bool enable) { (void)ctx; (void)enable; }
+#endif
+
+#if !LOG_FEATURE_STATS
+static inline void log_get_perf_stats(log_handle *ctx, log_stats *stats) { (void)ctx; (void)stats; }
+#endif
+
+#if !LOG_FEATURE_ASYNC
+static inline int log_set_async(log_handle *ctx, bool enable) { (void)ctx; (void)enable; return -1; }
+#endif
+
+#if !LOG_FEATURE_FILE_OPS
+static inline int log_add_file(log_handle *ctx, const char *filename, int level) {
+  (void)ctx; (void)filename; (void)level; return -1;
+}
+static inline void log_rotate(log_handle *ctx) { (void)ctx; }
+static inline void log_set_max_file_size(log_handle *ctx, size_t size) { (void)ctx; (void)size; }
+static inline void log_set_file_prefix(log_handle *ctx, const char *prefix) { (void)ctx; (void)prefix; }
+#endif
+
+#if !LOG_FEATURE_SYSLOG
+static inline int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int level) {
+  (void)ctx; (void)ident; (void)facility; (void)level; return -1;
+}
+static inline int log_level_to_syslog(int level) { (void)level; return 6; }
+static inline void log_handler_enable_syslog(log_handle *ctx, int handler_idx, bool enable) {
+  (void)ctx; (void)handler_idx; (void)enable;
+}
+#endif
+
 /* Core functions */
 log_handle* log_create(void);
 void log_destroy(log_handle *ctx);
@@ -579,39 +609,63 @@ const char* log_level_string(int level);
 void log_set_level(log_handle *ctx, int level);
 void log_set_quiet(log_handle *ctx, bool enable);
 void log_set_format(log_handle *ctx, log_FormatFn fn);
+#if LOG_FEATURE_ASYNC
 int log_set_async(log_handle *ctx, bool enable);
+#endif
 void log_set_queue_policy(log_handle *ctx, int policy);
+#if LOG_FEATURE_FILE_OPS
 void log_set_max_file_size(log_handle *ctx, size_t size);
 void log_set_file_prefix(log_handle *ctx, const char *prefix);
+#endif
 /* Performance optimization functions */
+#if LOG_FEATURE_MPOOL
 void log_enable_mpool(log_handle *ctx, bool enable);
+#endif
+#if LOG_FEATURE_TS_CACHE
 void log_enable_ts_cache(log_handle *ctx, bool enable);
+#endif
+#if LOG_FEATURE_STATS
 void log_get_perf_stats(log_handle *ctx, log_stats *stats);
+#endif
+#if LOG_FEATURE_RING_QUEUE
 void log_enable_ring_queue(log_handle *ctx, bool enable);
+#endif
 void log_set_clock_source(log_handle *ctx, int clock_source);
 void log_set_queue_size(log_handle *ctx, size_t size);
 
 int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level);
 int log_add_fp(log_handle *ctx, FILE *fp, int level);
+#if LOG_FEATURE_FILE_OPS
 int log_add_file(log_handle *ctx, const char *filename, int level);
+#endif
 void log_remove_handler(log_handle *ctx, int idx);
 
 /* Thread ID and Syslog support */
+#if LOG_FEATURE_THREAD_ID
 void log_enable_thread_id(log_handle *ctx, int handler_idx, bool enable);
+#endif
+#if LOG_FEATURE_SYSLOG
 int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int level);
 void log_handler_enable_syslog(log_handle *ctx, int handler_idx, bool enable);
 int log_level_to_syslog(int level);
+#endif
 
 void log_handler_set_level(log_handle *ctx, int handler_idx, int new_level);
 void log_handler_set_formatter(log_handle *ctx, int handler_idx, log_FormatFn new_fn);
 void log_enable_text_format(log_handle* ctx);
+#if LOG_FEATURE_JSON
 void log_enable_json_format(log_handle* ctx);
+#endif
 
 void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...);
+#if LOG_FEATURE_FILE_OPS
 void log_rotate(log_handle *ctx);
+#endif
 
 int log_get_stats(log_handle *ctx, log_stats *stats);
+#if LOG_FEATURE_JSON
 int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size);
+#endif
 
 /* Advanced pipeline configuration (must be called with no active async logging) */
 typedef struct {
