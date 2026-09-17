@@ -374,7 +374,11 @@ typedef struct log_config {
 } log_config;
 
 /**
- * @brief Performance statistics (atomic counters, safe for concurrent readers)
+ * @brief Performance statistics.
+ * Counters are kept per thread (contention-free writes) and aggregated
+ * across every thread that logged to the context when read via
+ * log_get_stats(), so any thread observes the same process-wide totals.
+ * Values are best-effort (plain aligned increments, not atomic).
  */
 typedef struct log_stats {
   uint64_t total_count;
@@ -382,7 +386,7 @@ typedef struct log_stats {
   uint64_t queue_drops;
   uint64_t queue_blocked;
   uint64_t rotation_count;
-  double avg_queue_latency_ms;
+  double avg_queue_latency_ms;  /* mean async enqueue->dequeue latency, ms */
   uint64_t async_writes;
   uint64_t sync_writes;
   uint64_t truncated_count;   /* messages truncated (static mode / size limits) */
@@ -390,6 +394,10 @@ typedef struct log_stats {
 
 /**
  * @brief Per-thread statistics (cache-line aligned to prevent false sharing)
+ * @note The counters are plain (non-atomic) and contention-free by design:
+ *       each thread only ever writes its own slot. Snapshots may observe a
+ *       torn intermediate value under concurrent writes — acceptable for
+ *       best-effort monitoring counters.
  */
 typedef struct log_thread_stats {
   LOG_MEMBER_ALIGN_64 uint64_t total_count;
@@ -400,8 +408,26 @@ typedef struct log_thread_stats {
   uint64_t async_writes;
   uint64_t sync_writes;
   uint64_t truncated_count;
-  uint64_t padding[3];
+  uint64_t queue_latency_count;       /* number of async messages with latency sampled */
+  double queue_latency_total_ms;      /* sum of enqueue->dequeue latency, ms */
+  uint64_t padding[2];
 } LOG_ALIGN_64 log_thread_stats;
+
+/**
+ * @brief Per-context pool of per-thread stats blocks.
+ * A logging thread claims a slot on its first call into a context and
+ * records counters there; log_get_stats() sums every claimed slot, so
+ * multi-threaded totals are correct regardless of which thread reads them.
+ * Bounded at LOG_STATS_MAX_SLOTS distinct registrations per context; beyond
+ * that a thread still counts locally but is not aggregated. Slots are owned
+ * by the context, so a snapshot never follows a dangling thread pointer.
+ * Guarded by log_handle::mutex.
+ */
+#define LOG_STATS_MAX_SLOTS 64
+typedef struct log_stats_registry {
+  log_thread_stats slots[LOG_STATS_MAX_SLOTS];
+  int count;
+} log_stats_registry;
 
 /**
  * @brief Log queue entry for async mode
@@ -546,6 +572,7 @@ typedef struct log_handler {
   unsigned flush_interval_ms;  /* for LOG_FLUSH_INTERVAL */
   bool flush_fsync;            /* fsync(_commit) after flush */
   double last_flush;           /* monotonic seconds, interval bookkeeping */
+  log_FormatFn format_fn;      /* per-handler formatter (overrides ctx->format_fn) */
 } log_handler;
 struct log_handle {
   log_rwlock rwlock;
@@ -587,6 +614,15 @@ struct log_handle {
   log_mpool mpool;
   bool enable_mpool;
   bool enable_ts_cache;
+
+#if LOG_FEATURE_STATS
+  log_stats_registry stats_registry;
+  uint64_t stats_epoch;   /* unique per context creation; disambiguates
+                             TLS registration hints after address reuse */
+  log_thread_stats async_writer_stats;  /* dedicated slot for the writer thread
+                                           (must not take ctx->mutex: the writer
+                                           is joined while that mutex is held) */
+#endif
 
   log_ring_queue ring_queue;
   bool use_ring_queue;

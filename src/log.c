@@ -133,23 +133,77 @@ static LOG_THREAD_LOCAL char tl_msg_buf[LOG_MSG_BUF_SIZE];
  * (log_add_file / rotation reopen). Fewer write() syscalls per message. */
 #define LOG_FILE_BUF_SIZE (256 * 1024)
 
-static LOG_THREAD_LOCAL log_thread_stats tl_stats = {0};
-
 #if LOG_FEATURE_STATS
-#define STAT_INC(f) (tl_stats.f++)
-#define STAT_LOAD(f) (tl_stats.f)
-#define STAT_STORE(f, v) (tl_stats.f = (v))
+/* Per-thread statistics pointer. Points at a slot in the current context's
+ * pool (stats_registry.slots), never at thread-local storage: slots outlive
+ * any thread, so snapshots never follow a dangling pointer. */
+static LOG_THREAD_LOCAL log_thread_stats *tl_stats = NULL;
+/* TLS hint: the ctx this thread last registered its stats slot with, plus
+ * that context's creation epoch. The epoch disambiguates reused addresses
+ * (log_create reuse and log_create_static's fixed storage): a stale hint
+ * can alias a brand-new context, so a plain pointer compare is not enough. */
+static LOG_THREAD_LOCAL log_handle *tl_stats_ctx = NULL;
+static LOG_THREAD_LOCAL uint64_t tl_stats_epoch = 0;
+static log_atomic_size_t g_stats_epoch = 0;
+
+#define STAT_INC(f) do { if (tl_stats) tl_stats->f++; } while (0)
+#define STAT_ADD(f, v) do { if (tl_stats) tl_stats->f += (v); } while (0)
+#define STAT_LOAD(f) (tl_stats ? tl_stats->f : 0)
+#define STAT_STORE(f, v) do { if (tl_stats) tl_stats->f = (v); } while (0)
+
+/* Claim a slot in ctx's pool for this thread. Guarded by ctx->mutex. A slot
+ * is claimed per (thread, context) registration; when a thread keeps using
+ * one context it claims exactly one. If the pool is exhausted (more than
+ * LOG_STATS_MAX_SLOTS distinct registrations), this thread counts locally
+ * but is not aggregated. */
+static void stats_register_slot_locked(log_handle *ctx) {
+  if (!ctx) return;
+  if (ctx->stats_registry.count < LOG_STATS_MAX_SLOTS) {
+    int idx = ctx->stats_registry.count++;
+    memset(&ctx->stats_registry.slots[idx], 0, sizeof(log_thread_stats));
+    tl_stats = &ctx->stats_registry.slots[idx];
+  } else {
+    tl_stats = NULL;
+  }
+  tl_stats_ctx = ctx;
+  tl_stats_epoch = ctx->stats_epoch;
+}
+
+/* Fast path first: most threads log to a single context. Only on a hint
+ * mismatch do we take ctx->mutex and (re)scan. MUST be called with no ctx
+ * locks held: log_enable_mpool()/log_enable_ts_cache() take ctx->mutex and
+ * then the rwlock, so taking ctx->mutex while holding the rwlock would
+ * deadlock. */
+static void stats_ensure_registered(log_handle *ctx) {
+  if (!ctx) return;
+  if (tl_stats_ctx == ctx && tl_stats_epoch == ctx->stats_epoch) return;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&ctx->mutex);
 #else
-#define STAT_INC(f) ((void)0)
-#define STAT_LOAD(f) (0)
-#define STAT_STORE(f, v) ((void)(v))
+  EnterCriticalSection(&ctx->mutex);
 #endif
-
-static void reset_thread_stats(void) {
-#if LOG_FEATURE_STATS
-  memset(&tl_stats, 0, sizeof(tl_stats));
+  stats_register_slot_locked(ctx);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&ctx->mutex);
+#else
+  LeaveCriticalSection(&ctx->mutex);
 #endif
 }
+
+static void stats_init_registry(log_handle *ctx) {
+  memset(&ctx->stats_registry, 0, sizeof(ctx->stats_registry));
+  ctx->stats_epoch = (uint64_t)atomic_fetch_add(&g_stats_epoch, (size_t)1) + 1;
+  /* Register the creating thread so single-threaded reads are correct. */
+  stats_ensure_registered(ctx);
+}
+#else /* !LOG_FEATURE_STATS */
+#define STAT_INC(f) ((void)0)
+#define STAT_ADD(f, v) ((void)(v))
+#define STAT_LOAD(f) (0)
+#define STAT_STORE(f, v) ((void)(v))
+static void stats_ensure_registered(log_handle *ctx) { (void)ctx; }
+static void stats_init_registry(log_handle *ctx) { (void)ctx; }
+#endif /* LOG_FEATURE_STATS */
 
 static log_handle *DEFAULT_LOG = NULL;
 #if defined(LOG_PLATFORM_POSIX)
@@ -749,7 +803,7 @@ static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap
 #endif
       return false;
     }
-    tl_stats.queue_blocked++;
+    STAT_INC(queue_blocked);
 #if defined(LOG_PLATFORM_POSIX)
     pthread_cond_wait(&rq->space_cond, &rq->mtx);
 #else
@@ -1003,26 +1057,38 @@ static char* format_message(log_event *ev, bool *heap_owned) {
   return msg;
 }
 
+/* Clamp a caller-supplied level into the valid range so that out-of-range
+ * values (buggy callers, hand-built events) can never index the
+ * level_strings/level_colors arrays. Negative -> TRACE, >= LOG_LEVELS -> FATAL. */
+static int clamp_level(int level) {
+  if (level < LOG_TRACE) return LOG_TRACE;
+  if (level > LOG_FATAL) return LOG_FATAL;
+  return level;
+}
+
 /* Build the line prefix (time, level, optional thread id, file:line, custom formatter).
+ * handler_fmt is the per-handler formatter (NULL = fall back to ctx->format_fn).
  * Returns the number of characters written into buf (excluding NUL). */
-static int format_prefix(log_handle *ctx, log_event *ev, char *buf, size_t buf_size,
-                         bool show_tid, bool use_color) {
-  if (ctx && ctx->format_fn) {
-    int n = ctx->format_fn(ctx, ev, buf, buf_size);
+static int format_prefix(log_handle *ctx, log_event *ev, log_FormatFn handler_fmt,
+                         char *buf, size_t buf_size, bool show_tid, bool use_color) {
+  log_FormatFn fmt = handler_fmt ? handler_fmt : (ctx ? ctx->format_fn : NULL);
+  if (fmt) {
+    int n = fmt(ctx, ev, buf, buf_size);
     return n < 0 ? 0 : n;
   }
   char time_buf[64];
   format_timestamp(ev->timestamp, time_buf, sizeof(time_buf),
                    ctx && ctx->enable_ts_cache);
+  int lvl = clamp_level(ev->level);
 #ifdef LOG_USE_COLOR
   if (use_color) {
     if (show_tid) {
       return snprintf(buf, buf_size, "%s %s%-5s\x1b[0m \x1b[90m[%lu] %s:%d:\x1b[0m ",
-                      time_buf, level_colors[ev->level], level_strings[ev->level],
+                      time_buf, level_colors[lvl], level_strings[lvl],
                       LOG_GET_THREAD_ID(), ev->file ? ev->file : "", ev->line);
     }
     return snprintf(buf, buf_size, "%s %s%-5s\x1b[0m \x1b[90m%s:%d:\x1b[0m ",
-                    time_buf, level_colors[ev->level], level_strings[ev->level],
+                    time_buf, level_colors[lvl], level_strings[lvl],
                     ev->file ? ev->file : "", ev->line);
   }
 #else
@@ -1030,11 +1096,11 @@ static int format_prefix(log_handle *ctx, log_event *ev, char *buf, size_t buf_s
 #endif
   if (show_tid) {
     return snprintf(buf, buf_size, "%s %-5s [%lu] %s:%d: ",
-                    time_buf, level_strings[ev->level], LOG_GET_THREAD_ID(),
+                    time_buf, level_strings[lvl], LOG_GET_THREAD_ID(),
                     ev->file ? ev->file : "", ev->line);
   }
   return snprintf(buf, buf_size, "%s %-5s %s:%d: ",
-                  time_buf, level_strings[ev->level],
+                  time_buf, level_strings[lvl],
                   ev->file ? ev->file : "", ev->line);
 }
 
@@ -1217,17 +1283,18 @@ static void stdout_handler(log_handle *ctx, log_event *ev) {
   if (!msg) return;
 
   bool show_tid = false;
+  log_FormatFn handler_fmt = NULL;
   if (ctx) {
     for (int i = 0; i < ctx->handler_count; i++) {
-      if (ctx->handlers[i].show_thread_id && ctx->handlers[i].active && ctx->handlers[i].udata == ev->udata) {
-        show_tid = true;
-        break;
-      }
+      if (!ctx->handlers[i].active || ctx->handlers[i].udata != ev->udata) continue;
+      if (ctx->handlers[i].show_thread_id) show_tid = true;
+      if (ctx->handlers[i].format_fn) handler_fmt = ctx->handlers[i].format_fn;
+      if (show_tid && handler_fmt) break;
     }
   }
 
   char prefix[512];
-  format_prefix(ctx, ev, prefix, sizeof(prefix), show_tid,
+  format_prefix(ctx, ev, handler_fmt, prefix, sizeof(prefix), show_tid,
 #ifdef LOG_USE_COLOR
                 true
 #else
@@ -1243,14 +1310,15 @@ static void file_handler_internal(log_handle *ctx, log_event *ev, int handler_id
   char *msg = format_message(ev, &heap_msg);
   if (!msg) return;
 
+  log_handler *h = &ctx->handlers[handler_idx];
   char prefix[512];
-  int prefix_len = format_prefix(ctx, ev, prefix, sizeof(prefix),
-                                 ctx->handlers[handler_idx].show_thread_id, false);
+  int prefix_len = format_prefix(ctx, ev, h->format_fn, prefix, sizeof(prefix),
+                                 h->show_thread_id, false);
   if (prefix_len < 0) { if (heap_msg) free(msg); return; }
   if ((size_t)prefix_len >= sizeof(prefix)) prefix_len = (int)sizeof(prefix) - 1;
 
   size_t msg_len = strlen(msg);
-  FILE *fp = ctx->handlers[handler_idx].fp;
+  FILE *fp = h->fp;
   /* Assemble prefix+msg+'\n' and write with a SINGLE fwrite: stdio holds
    * the stream lock for the whole line, so concurrent writers cannot tear
    * lines apart. The common case assembles into thread-local storage (no
@@ -1373,6 +1441,30 @@ static char* json_escape(const char *src) {
 }
 
 static void json_handler(log_handle *ctx, log_event *ev) {
+  /* Per-handler formatter wins; ctx-level formatter is fallback. */
+  if (ctx && ev->udata) {
+    for (int i = 0; i < ctx->handler_count; i++) {
+      log_handler *h = &ctx->handlers[i];
+      if (h->active && h->udata == ev->udata && h->format_fn) {
+        char prefix[512];
+        int n = h->format_fn(ctx, ev, prefix, sizeof(prefix));
+        if (n > 0) {
+          fprintf(ev->udata, "%s\n", prefix);
+          return;
+        }
+        break;
+      }
+    }
+  }
+  if (ctx && ctx->format_fn) {
+    char prefix[512];
+    int n = ctx->format_fn(ctx, ev, prefix, sizeof(prefix));
+    if (n > 0) {
+      fprintf(ev->udata, "%s\n", prefix);
+      return;
+    }
+  }
+
   bool heap_msg = false;
   char *msg = format_message(ev, &heap_msg);
   if (!msg) return;
@@ -1398,7 +1490,7 @@ static void json_handler(log_handle *ctx, log_event *ev) {
     }
   }
 
-  const char *lvl_str = level_strings[ev->level];
+  const char *lvl_str = level_strings[clamp_level(ev->level)];
   int line_val = ev->line;
 
   size_t needed = 0;
@@ -1440,6 +1532,13 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
 #endif
   log_handle *ctx = (log_handle*)arg;
 
+  /* The writer thread uses a dedicated context-owned slot and never takes
+   * ctx->mutex here: log_enable_mpool()/ts_cache() hold that mutex while
+   * joining this thread, so acquiring it during startup would deadlock. */
+#if LOG_FEATURE_STATS
+  tl_stats = &ctx->async_writer_stats;
+#endif
+
 #if LOG_FEATURE_RING_QUEUE
   if (ctx->use_ring_queue) {
     log_drain_batch batch;
@@ -1451,6 +1550,9 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
         log_flush_due_intervals(ctx);
         continue;
       }
+#if LOG_FEATURE_STATS
+      double now_ts = get_timestamp_with_clock(ctx->clock_source);
+#endif
       rwlock_read_lock(&ctx->rwlock);
       for (int k = 0; k < n; k++) {
         log_ring_entry *re = &batch.entries[k];
@@ -1467,6 +1569,12 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
             log_apply_flush(ctx, i);
           }
         }
+#if LOG_FEATURE_STATS
+        double lat = now_ts - re->timestamp;
+        if (lat < 0.0) lat = 0.0;   /* guard against clock steps */
+        STAT_ADD(queue_latency_total_ms, lat * 1000.0);
+        STAT_INC(queue_latency_count);
+#endif
       }
       rwlock_read_unlock(&ctx->rwlock);
       for (int k = 0; k < n; k++) {
@@ -1486,6 +1594,9 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
         log_flush_due_intervals(ctx);
         continue;
       }
+#if LOG_FEATURE_STATS
+      double now_ts = get_timestamp_with_clock(ctx->clock_source);
+#endif
       rwlock_read_lock(&ctx->rwlock);
       for (int k = 0; k < n; k++) {
         log_queue_entry *entry = entries[k];
@@ -1502,6 +1613,12 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
             log_apply_flush(ctx, i);
           }
         }
+#if LOG_FEATURE_STATS
+        double lat = now_ts - entry->timestamp;
+        if (lat < 0.0) lat = 0.0;   /* guard against clock steps */
+        STAT_ADD(queue_latency_total_ms, lat * 1000.0);
+        STAT_INC(queue_latency_count);
+#endif
       }
       rwlock_read_unlock(&ctx->rwlock);
       for (int k = 0; k < n; k++) {
@@ -1530,8 +1647,6 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
 /* Shared context initialization for log_create() and log_create_static().
  * Returns false on allocation failure (impossible in static mode). */
 static bool init_context(log_handle *ctx) {
-  reset_thread_stats();
-
   /* Pre-warm the timezone state once so that concurrent log calls never
    * race inside glibc's lazily-initialized tzset_internal. */
   tzset();
@@ -1597,6 +1712,8 @@ static bool init_context(log_handle *ctx) {
   ctx->use_ring_queue = false;
 #endif
   ctx->clock_source = LOG_CLOCK_REALTIME_COARSE;
+
+  stats_init_registry(ctx);
 
   log_add_handler(ctx, stdout_handler, stderr, LOG_TRACE);
   if (ctx->handler_count > 0) {
@@ -1757,6 +1874,9 @@ int log_set_async(log_handle *ctx, bool enable) {
 #endif
   if (enable && !ctx->async_enabled) {
     queue_reopen(&ctx->queue);
+#if LOG_FEATURE_STATS
+    memset(&ctx->async_writer_stats, 0, sizeof(ctx->async_writer_stats));
+#endif
     ctx->async_enabled = true;
 #ifdef LOG_PLATFORM_POSIX
     if (LOG_THREAD_CREATE(ctx->async_thread, async_writer_thread, ctx) != 0) {
@@ -1950,19 +2070,58 @@ void log_set_queue_size(log_handle *ctx, size_t size) {
 #endif
 }
 
-/* Snapshot stats from thread-local storage into a plain struct */
+/* Snapshot aggregate stats across every registered thread block. Guarded by
+ * ctx->mutex so the slot list cannot change mid-read; each block is read
+ * without its own lock (plain counters, best-effort monitoring). */
 static void stats_snapshot(log_handle *ctx, log_stats *stats) {
-  (void)ctx;
-  stats->total_count = tl_stats.total_count;
-  for (int i = 0; i < LOG_LEVELS; i++) {
-    stats->level_counts[i] = tl_stats.level_counts[i];
+#if LOG_FEATURE_STATS
+  if (!ctx || !stats) return;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&ctx->mutex);
+#else
+  EnterCriticalSection(&ctx->mutex);
+#endif
+  log_stats acc = {0};
+  uint64_t lat_count = 0;
+  double lat_total = 0.0;
+  for (int i = 0; i < ctx->stats_registry.count; i++) {
+    log_thread_stats *s = &ctx->stats_registry.slots[i];
+    acc.total_count += s->total_count;
+    for (int l = 0; l < LOG_LEVELS; l++) acc.level_counts[l] += s->level_counts[l];
+    acc.queue_drops += s->queue_drops;
+    acc.queue_blocked += s->queue_blocked;
+    acc.rotation_count += s->rotation_count;
+    acc.async_writes += s->async_writes;
+    acc.sync_writes += s->sync_writes;
+    acc.truncated_count += s->truncated_count;
+    lat_count += s->queue_latency_count;
+    lat_total += s->queue_latency_total_ms;
   }
-  stats->queue_drops = tl_stats.queue_drops;
-  stats->queue_blocked = tl_stats.queue_blocked;
-  stats->rotation_count = tl_stats.rotation_count;
-  stats->async_writes = tl_stats.async_writes;
-  stats->sync_writes = tl_stats.sync_writes;
-  stats->truncated_count = tl_stats.truncated_count;
+  {
+    /* Dedicated async writer slot (rotations + queue-latency samples). */
+    log_thread_stats *s = &ctx->async_writer_stats;
+    acc.total_count += s->total_count;
+    for (int l = 0; l < LOG_LEVELS; l++) acc.level_counts[l] += s->level_counts[l];
+    acc.queue_drops += s->queue_drops;
+    acc.queue_blocked += s->queue_blocked;
+    acc.rotation_count += s->rotation_count;
+    acc.async_writes += s->async_writes;
+    acc.sync_writes += s->sync_writes;
+    acc.truncated_count += s->truncated_count;
+    lat_count += s->queue_latency_count;
+    lat_total += s->queue_latency_total_ms;
+  }
+  acc.avg_queue_latency_ms = lat_count ? lat_total / (double)lat_count : 0.0;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&ctx->mutex);
+#else
+  LeaveCriticalSection(&ctx->mutex);
+#endif
+  *stats = acc;
+#else
+  (void)ctx;
+  if (stats) memset(stats, 0, sizeof(*stats));
+#endif
 }
 
 #if LOG_FEATURE_STATS
@@ -1995,6 +2154,7 @@ int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level) {
   h->flush_interval_ms = 0;
   h->flush_fsync = false;
   h->last_flush = 0.0;
+  h->format_fn = NULL;
 
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
@@ -2023,6 +2183,7 @@ int log_add_fp(log_handle *ctx, FILE *fp, int level) {
   h->flush_interval_ms = 0;
   h->flush_fsync = false;
   h->last_flush = 0.0;
+  h->format_fn = NULL;
 
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
@@ -2056,6 +2217,7 @@ int log_add_file(log_handle *ctx, const char *filename, int level) {
   h->flush_interval_ms = 0;
   h->flush_fsync = false;
   h->last_flush = 0.0;
+  h->format_fn = NULL;
 
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
@@ -2116,6 +2278,11 @@ static void sync_format_and_dispatch(log_handle *ctx, log_event *ev) {
 
 void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...) {
   if (!ctx || !fmt) return;
+
+  /* Register before taking the rwlock: log_enable_mpool()/ts_cache() hold
+   * ctx->mutex while acquiring the rwlock, so taking ctx->mutex under the
+   * rwlock would invert the lock order and deadlock. */
+  stats_ensure_registered(ctx);
 
   rwlock_read_lock(&ctx->rwlock);
 
@@ -2206,6 +2373,10 @@ void log_log(log_handle *ctx, int level, const char *file, int line, const char 
 void log_rotate(log_handle *ctx) {
   if (!ctx || !ctx->file_prefix) return;
 
+  /* A caller that never logged still triggers rotation_count; make sure its
+   * counters have a slot (no-op once registered). */
+  stats_ensure_registered(ctx);
+
   rwlock_write_lock(&ctx->rwlock);
 
   /* On Windows, rename fails on open files; flush and close before rotating. */
@@ -2280,7 +2451,7 @@ int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size) 
   (void)ctx;
   int n = snprintf(buf, buf_size,
     "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"}",
-    time_buf, level_strings[ev->level],
+    time_buf, level_strings[clamp_level(ev->level)],
     escaped_file, ev->line, escaped_msg);
   free(escaped_msg);
   free(escaped_file);
@@ -2375,11 +2546,11 @@ int log_install_crash_handler(log_handle *ctx) {
 #endif /* LOG_FEATURE_CRASH_MODE */
 
 void log_handler_set_formatter(log_handle *ctx, int handler_idx, log_FormatFn new_fn) {
+  if (!ctx) return;
   rwlock_write_lock(&ctx->rwlock);
   if (handler_idx >= 0 && handler_idx < ctx->handler_count) {
-    ctx->handlers[handler_idx].fn = NULL; /* mark for kind-based resolution */
+    ctx->handlers[handler_idx].format_fn = new_fn;
   }
-  ctx->format_fn = new_fn;
   rwlock_write_unlock(&ctx->rwlock);
 }
 
@@ -2440,7 +2611,7 @@ void log_enable_thread_id(log_handle *ctx, int handler_idx, bool enable) {
 #if LOG_FEATURE_SYSLOG
 #if LOG_HAVE_SYSLOG
 int log_level_to_syslog(int level) {
-  switch (level) {
+  switch (clamp_level(level)) {
     case LOG_TRACE: return 7; /* LOG_DEBUG */
     case LOG_DEBUG: return 7; /* LOG_DEBUG */
     case LOG_INFO:  return 6; /* LOG_INFO */
@@ -2511,6 +2682,12 @@ int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int
   h->syslog_facility = facility;
   h->show_thread_id = false;
   h->kind = HANDLER_SYSLOG;
+  h->format_fn = NULL;
+  h->flush_policy = LOG_FLUSH_NEVER;
+  h->flush_interval_ms = 0;
+  h->flush_fsync = false;
+  h->last_flush = 0.0;
+  h->owns_file = false;
 
   if (need_to_open_syslog) {
     openlog(ctx->syslog_ident, LOG_PID | LOG_NDELAY, facility);

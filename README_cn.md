@@ -24,14 +24,14 @@
 
 ## 📊 性能
 
-实测数字（2026-09，Linux x86_64，GCC -O2，`taskset -c 2` 绑核，sink 为 /dev/null，消息 `"bench msg %d"`）：
+实测数字（2026-09，Linux x86_64，GCC -O2，`taskset -c 2` 绑核，sink 为 /dev/null，消息 `"bench msg %d"`；5 次运行取中位数）：
 
 | 模式 | 吞吐量 | 延迟 |
 |------|--------|------|
-| 同步（单线程） | ~3,500,000 msg/s | ~0.29 µs/msg |
-| 同步（8 线程） | ~3,500,000 msg/s | — |
-| 异步（单线程） | ~2,100,000 msg/s | ~0.49 µs/msg |
-| 异步（8 线程） | ~3,400,000 msg/s | — |
+| 同步（单线程） | ~3,400,000 msg/s | ~0.29 µs/msg |
+| 同步（8 线程） | ~3,400,000 msg/s | — |
+| 异步（单线程） | ~2,000,000 msg/s | ~0.50 µs/msg |
+| 异步（8 线程） | ~3,300,000 msg/s | — |
 
 复现命令：
 
@@ -221,17 +221,17 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 
 | 标志 | 说明 | 节省 |
 |------|------|------|
-| `LOG_DISABLE_JSON` | 禁用 JSON 格式化 | ~2.4 KB |
+| `LOG_DISABLE_JSON` | 禁用 JSON 格式化 | ~2.6 KB |
 | `LOG_DISABLE_SYSLOG` | 禁用 Syslog 支持 | ~1.3 KB |
-| `LOG_DISABLE_ASYNC` | 禁用异步日志 | ~5.8 KB |
-| `LOG_DISABLE_MPOOL` | 禁用内存池 | ~1.5 KB |
-| `LOG_DISABLE_RING_QUEUE` | 禁用环形缓冲区队列 | ~2.9 KB |
-| `LOG_DISABLE_STATS` | 禁用性能统计 | ~0.4 KB |
+| `LOG_DISABLE_ASYNC` | 禁用异步日志 | ~6.3 KB |
+| `LOG_DISABLE_MPOOL` | 禁用内存池 | ~1.4 KB |
+| `LOG_DISABLE_RING_QUEUE` | 禁用环形缓冲区队列 | ~3.0 KB |
+| `LOG_DISABLE_STATS` | 禁用性能统计 | ~1.8 KB |
 | `LOG_DISABLE_FILE_OPS` | 禁用文件操作 | ~2.2 KB |
 | `LOG_DISABLE_THREAD_ID` | 禁用线程ID | ~0.15 KB |
 | `LOG_DISABLE_TS_CACHE` | 禁用时间戳缓存 | ~0.6 KB |
 | `LOG_DISABLE_CRASH_MODE` | 禁用崩溃安全模式 | ~1.3 KB |
-| `LOG_MINIMAL` | 禁用所有可选功能 | ~13.5 KB |
+| `LOG_MINIMAL` | 禁用所有可选功能 | ~15.2 KB |
 
 ## 📋 核心功能
 
@@ -441,11 +441,14 @@ typedef struct log_stats {
     uint64_t queue_drops;              // 丢弃的消息数（异步）
     uint64_t queue_blocked;            // 阻塞次数（异步）
     uint64_t rotation_count;           // 文件轮转次数
-    double avg_queue_latency_ms;        // 平均异步延迟
+    double avg_queue_latency_ms;        // 异步入队→出队的平均延迟（毫秒）
     uint64_t async_writes;             // 异步写入计数
     uint64_t sync_writes;              // 同步写入计数
 } log_stats;
 ```
+
+`log_get_stats` 会聚合所有曾向该 context 写入日志的线程的计数器，因此无论哪个
+线程调用，得到的都是全进程口径的统计。
 
 ## 🔒 线程安全
 
@@ -453,7 +456,7 @@ typedef struct log_stats {
 
 - **读写锁**: 保护配置更改（pthread_rwlock / SRWLOCK）
 - **环形缓冲队列**: 用于异步日志——互斥锁 + 条件变量保护，多生产者单消费者；写入线程批量出队
-- **线程本地统计**: 统计计数器每线程一份，无竞争，快照读取
+- **每线程统计**: 计数器无竞争地写入各自的线程槽；`log_get_stats` 快照时聚合所有已注册线程的槽（每 context 上限 64 个）
 - **多线程安全**: 可以并发调用
 
 ## 📝 示例
@@ -472,12 +475,12 @@ typedef struct log_stats {
 
 ## 🧪 测试
 
-项目包含 120 项测试，分为 6 个类别（以各 runner 输出的实测数为准；static_alloc 仅在 Linux + GNU ld 下构建）：
+项目包含 127 项测试，分为 6 个类别（以各 runner 输出的实测数为准；static_alloc 仅在 Linux + GNU ld 下构建）：
 
 | 类别 | 测试数 | 说明 |
 |------|--------|------|
-| core | 48 | 级别、处理器、格式、NULL安全、统计、边界 |
-| thread | 7 | 多线程同步/异步、配置竞态 |
+| core | 52 | 级别、处理器、格式、NULL安全、统计、边界、越界级别 |
+| thread | 10 | 多线程同步/异步、配置竞态、统计聚合 |
 | platform | 25 | Syslog、轮转、Unicode路径、flush策略、崩溃安全 |
 | stress | 28 | 队列满、长消息、完整性、崩溃安全、资源 |
 | perf | 7 | 吞吐量和延迟基准测试 |

@@ -659,16 +659,25 @@ int log_get_stats(log_handle *ctx, log_stats *stats);
 **Returns:**
 - 0 on success, -1 on failure
 
+**Notes:**
+Counters are accumulated per thread without contention and aggregated across
+every thread that logged to `ctx` when this function runs, so the totals are
+process-wide regardless of the calling thread. At most 64 distinct
+registrations per context are aggregated; additional threads still count
+locally but are not included.
+
 **Structure Definition:**
 ```c
 typedef struct log_stats {
     uint64_t total_count;              // Total messages logged
     uint64_t level_counts[LOG_LEVELS]; // Count per level
     uint64_t queue_drops;             // Dropped messages (async)
+    uint64_t queue_blocked;           // Times a producer blocked (async BLOCK)
     uint64_t rotation_count;          // File rotations
-    double avg_queue_latency_ms;       // Avg async latency
+    double avg_queue_latency_ms;       // Mean async enqueue->dequeue latency (ms)
     uint64_t async_writes;            // Async write count
     uint64_t sync_writes;             // Sync write count
+    uint64_t truncated_count;         // Messages truncated (static mode)
 } log_stats;
 ```
 

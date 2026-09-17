@@ -114,6 +114,70 @@ static void test_negative_level(void) {
     TEST_PASS("negative level");
 }
 
+/* Out-of-range levels passed directly to log_log() must never index the
+ * level_strings/level_colors arrays. Regression: 999 crashed with a
+ * SIGSEGV in format_prefix (level_strings[999]). */
+static void test_out_of_range_level(void) {
+    const char *path = TEST_TMP_DIR "test_oob_level.log";
+    remove(path);
+
+    log_handle *ctx = log_create();
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen");
+    int idx = log_add_fp(ctx, fp, LOG_TRACE);
+    TEST_ASSERT(idx >= 0, "add fp");
+    ctx->handlers[0].active = false;   /* silence stderr */
+
+    /* Above range: must be clamped to FATAL, not crash. */
+    log_log(ctx, 999, __FILE__, __LINE__, "oob high %d", 999);
+    /* Below range: filtered by the ctx level gate, must not crash. */
+    log_log(ctx, -3, __FILE__, __LINE__, "oob low");
+
+    log_destroy(ctx);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp, "reopen");
+    char buf[1024];
+    TEST_ASSERT(fgets(buf, sizeof(buf), fp) != NULL, "read line");
+    TEST_ASSERT(strstr(buf, "FATAL") != NULL, "high level clamped to FATAL");
+    TEST_ASSERT(strstr(buf, "oob high") != NULL, "high level message written");
+    TEST_ASSERT(fgets(buf, sizeof(buf), fp) == NULL, "low level filtered out");
+    fclose(fp);
+    remove(path);
+
+    TEST_PASS("out of range level");
+}
+
+/* Out-of-range level through the JSON formatter must not crash either. */
+static void test_out_of_range_level_json(void) {
+    const char *path = TEST_TMP_DIR "test_oob_level_json.log";
+    remove(path);
+
+    log_handle *ctx = log_create();
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen");
+    int idx = log_add_fp(ctx, fp, LOG_TRACE);
+    TEST_ASSERT(idx >= 0, "add fp");
+    ctx->handlers[0].active = false;
+    log_enable_json_format(ctx);
+
+    log_log(ctx, 999, __FILE__, __LINE__, "oob json");
+
+    log_destroy(ctx);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp, "reopen");
+    char buf[1024];
+    TEST_ASSERT(fgets(buf, sizeof(buf), fp) != NULL, "read line");
+    TEST_ASSERT(strstr(buf, "\"FATAL\"") != NULL, "json level clamped to FATAL");
+    fclose(fp);
+    remove(path);
+
+    TEST_PASS("out of range level json");
+}
+
 /* ==================== Path Boundary Tests ==================== */
 
 static void test_boundary_long_path(void) {
@@ -297,6 +361,8 @@ static void test_boundary_register(void) {
     test_add(test_very_long_format, "very_long_format");
     test_add(test_max_level, "max_level");
     test_add(test_negative_level, "negative_level");
+    test_add(test_out_of_range_level, "out_of_range_level");
+    test_add(test_out_of_range_level_json, "out_of_range_level_json");
     test_add(test_boundary_long_path, "boundary_long_path");
     test_add(test_path_with_special_chars, "path_with_special_chars");
     test_add(test_max_handlers, "max_handlers");

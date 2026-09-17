@@ -24,14 +24,14 @@ A simple, powerful, and thread-safe logging library implemented in C11 with full
 
 ## 📊 Performance
 
-Measured numbers (2026-09, Linux x86_64, GCC -O2, `taskset -c 2` core pinning, sink /dev/null, message `"bench msg %d"`):
+Measured numbers (2026-09, Linux x86_64, GCC -O2, `taskset -c 2` core pinning, sink /dev/null, message `"bench msg %d"`; medians of 5 runs):
 
 | Mode | Throughput | Latency |
 |------|-----------|---------|
-| Sync (single-thread) | ~3,500,000 msg/s | ~0.29 us/msg |
-| Sync (8 threads) | ~3,500,000 msg/s | — |
-| Async (single-thread) | ~2,100,000 msg/s | ~0.49 us/msg |
-| Async (8 threads) | ~3,400,000 msg/s | — |
+| Sync (single-thread) | ~3,400,000 msg/s | ~0.29 us/msg |
+| Sync (8 threads) | ~3,400,000 msg/s | — |
+| Async (single-thread) | ~2,000,000 msg/s | ~0.50 us/msg |
+| Async (8 threads) | ~3,300,000 msg/s | — |
 
 Reproduce with:
 
@@ -221,17 +221,17 @@ Disable optional features to reduce binary size (savings are measured .text delt
 
 | Flag | Description | Savings |
 |------|-------------|---------|
-| `LOG_DISABLE_JSON` | Disable JSON formatting | ~2.4 KB |
+| `LOG_DISABLE_JSON` | Disable JSON formatting | ~2.6 KB |
 | `LOG_DISABLE_SYSLOG` | Disable Syslog support | ~1.3 KB |
-| `LOG_DISABLE_ASYNC` | Disable async logging | ~5.8 KB |
-| `LOG_DISABLE_MPOOL` | Disable memory pool | ~1.5 KB |
-| `LOG_DISABLE_RING_QUEUE` | Disable ring buffer queue | ~2.9 KB |
-| `LOG_DISABLE_STATS` | Disable performance stats | ~0.4 KB |
+| `LOG_DISABLE_ASYNC` | Disable async logging | ~6.3 KB |
+| `LOG_DISABLE_MPOOL` | Disable memory pool | ~1.4 KB |
+| `LOG_DISABLE_RING_QUEUE` | Disable ring buffer queue | ~3.0 KB |
+| `LOG_DISABLE_STATS` | Disable performance stats | ~1.8 KB |
 | `LOG_DISABLE_FILE_OPS` | Disable file operations | ~2.2 KB |
 | `LOG_DISABLE_THREAD_ID` | Disable thread ID | ~0.15 KB |
 | `LOG_DISABLE_TS_CACHE` | Disable timestamp cache | ~0.6 KB |
 | `LOG_DISABLE_CRASH_MODE` | Disable crash-safe mode | ~1.3 KB |
-| `LOG_MINIMAL` | Disable all optional features | ~13.5 KB |
+| `LOG_MINIMAL` | Disable all optional features | ~15.2 KB |
 
 ## 📋 Core Features
 
@@ -441,11 +441,15 @@ typedef struct log_stats {
     uint64_t queue_drops;              // Dropped messages (async)
     uint64_t queue_blocked;            // Blocked count (async)
     uint64_t rotation_count;           // File rotations
-    double avg_queue_latency_ms;        // Avg async latency
+    double avg_queue_latency_ms;        // Mean async enqueue->dequeue latency (ms)
     uint64_t async_writes;             // Async write count
     uint64_t sync_writes;              // Sync write count
 } log_stats;
 ```
+
+`log_get_stats` aggregates the per-thread counters of every thread that has
+logged to the context, so the totals are process-wide regardless of which
+thread calls it.
 
 ## 🔒 Thread Safety
 
@@ -453,7 +457,7 @@ All public APIs are thread-safe:
 
 - **Reader-Writer Locks**: Protect configuration changes (pthread_rwlock / SRWLOCK)
 - **Ring Buffer Queue**: For async logging — mutex + condvar protected, multi-producer single-consumer, batch-drained by the writer thread
-- **Thread-Local Statistics**: One counter set per thread, contention-free, read via snapshot
+- **Per-Thread Statistics**: Counters are written without contention to a per-thread slot; `log_get_stats` aggregates all registered threads' slots (up to 64 per context) when it takes a snapshot
 - **Safe from Multiple Threads**: Can be called concurrently
 
 ## 📝 Examples
@@ -472,12 +476,12 @@ See [tests/example.c](tests/example.c) for comprehensive examples:
 
 ## 🧪 Testing
 
-The project includes 120 tests across 6 categories (actual counts as reported by each test runner; static_alloc only builds on Linux with GNU ld):
+The project includes 127 tests across 6 categories (actual counts as reported by each test runner; static_alloc only builds on Linux with GNU ld):
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| core | 48 | Levels, handlers, format, null safety, stats, boundary |
-| thread | 7 | Multi-threaded sync/async, config races |
+| core | 52 | Levels, handlers, format, null safety, stats, boundary, OOB level |
+| thread | 10 | Multi-threaded sync/async, config races, stats aggregation |
 | platform | 25 | Syslog, rotation, unicode paths, flush policies, crash safety |
 | stress | 28 | Queue full, long messages, integrity, crash safety, resources |
 | perf | 7 | Throughput and latency benchmarks |
