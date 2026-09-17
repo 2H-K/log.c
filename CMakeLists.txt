@@ -57,6 +57,12 @@ if(BUILD_TESTS)
     target_link_libraries(test_stress PRIVATE logc test_harness Threads::Threads)
     add_test(NAME test_stress COMMAND test_stress)
 
+    # Real malloc counting for the stress suite (GNU ld --wrap, Linux only)
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_compile_definitions(test_stress PRIVATE LOG_TEST_WRAP_MALLOC)
+        target_link_options(test_stress PRIVATE -Wl,--wrap=malloc)
+    endif()
+
     # Platform tests
     add_executable(test_platform tests/platform.c)
     target_link_libraries(test_platform PRIVATE logc test_harness Threads::Threads)
@@ -73,6 +79,18 @@ if(MSVC)
     add_executable(msvc_oi_smoke tests/compile/msvc_oi_smoke.c)
     target_link_libraries(msvc_oi_smoke PRIVATE logc)
     target_compile_options(msvc_oi_smoke PRIVATE /WX)
+endif()
+
+# Static-allocation mode tests: log.c compiled with LOG_STATIC_ALLOC and
+# real allocator wrapping (A3 roadmap). Linux + GNU toolchain only.
+if(BUILD_TESTS AND CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_static_alloc tests/static_alloc_main.c src/log.c)
+    target_include_directories(test_static_alloc PRIVATE src tests)
+    target_compile_definitions(test_static_alloc PRIVATE LOG_STATIC_ALLOC)
+    target_link_libraries(test_static_alloc PRIVATE Threads::Threads)
+    target_link_options(test_static_alloc PRIVATE
+        -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc)
+    add_test(NAME test_static_alloc COMMAND test_static_alloc)
 endif()
 
 # Examples

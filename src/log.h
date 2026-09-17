@@ -109,6 +109,14 @@
 #define LOG_MAX_QUEUE_SIZE 4096
 #define LOG_MAX_ROTATION_FILES 5
 #define LOG_DEFAULT_MAX_SIZE (10 * 1024 * 1024)
+#define MAX_HANDLERS 32
+
+/* Static-allocation mode: sizes the storage embedded in log_handle when
+ * LOG_STATIC_ALLOC is defined. Must be a power of two. Memory cost is
+ * LOG_RING_CAPACITY * sizeof(log_ring_entry) (~664 bytes per slot). */
+#ifndef LOG_RING_CAPACITY
+  #define LOG_RING_CAPACITY LOG_MAX_QUEUE_SIZE
+#endif
 
 /* ======================================================================== */
 /* Compile-time feature flags                                               */
@@ -211,6 +219,29 @@
   #define LOG_FEATURE_TS_CACHE 0
 #endif
 
+/* Crash-safe logging: per-line flush plus a fatal-signal marker line
+ * (POSIX: SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE). Intentionally NOT
+ * auto-disabled by LOG_MINIMAL: reliability is wanted in minimal daemon
+ * builds too. Trim explicitly with LOG_DISABLE_CRASH_MODE. */
+#ifndef LOG_DISABLE_CRASH_MODE
+  #define LOG_FEATURE_CRASH_MODE 1
+#else
+  #define LOG_FEATURE_CRASH_MODE 0
+#endif
+
+/* Static-allocation mode (opt-in, define LOG_STATIC_ALLOC):
+ * - log_create_static() builds the context inside caller-provided memory
+ * - the async ring queue and handler table are embedded, not heap-allocated
+ * - oversized messages are truncated instead of heap-allocated
+ * - setvbuf buffer sizing is skipped (stdio keeps its default buffer)
+ * Setup-time allocations (fopen, strdup of file_prefix/filename) still
+ * happen; the guarantee is zero heap allocation on the logging hot path. */
+#if defined(LOG_STATIC_ALLOC)
+  #define LOG_FEATURE_STATIC_ALLOC 1
+#else
+  #define LOG_FEATURE_STATIC_ALLOC 0
+#endif
+
 enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL, LOG_LEVELS };
 
 #define LOG_SYSLOG_EMERG   0
@@ -229,6 +260,17 @@ enum {
   LOG_QUEUE_FALLBACK_SYNC = 0,  /* Queue full -> write synchronously (default) */
   LOG_QUEUE_DROP,               /* Queue full -> drop the message */
   LOG_QUEUE_BLOCK               /* Queue full -> block until space is available */
+};
+
+/* Per-handler flush policy (durability vs throughput).
+ * fflush moves data from stdio buffers to the kernel; fsync (separate
+ * switch via log_handler_set_fsync) makes it durable. */
+enum {
+  LOG_FLUSH_NEVER = 0,   /* stdio default buffering (fastest, may lose data on crash) */
+  LOG_FLUSH_EVERY,       /* fflush after every message */
+  LOG_FLUSH_INTERVAL    /* fflush at most once per flush_interval_ms (sync mode:
+                            applied on the next write after the interval elapses;
+                            async mode: also driven by the writer thread timer) */
 };
 
 #ifndef LOG_USE_COLOR
@@ -343,6 +385,7 @@ typedef struct log_stats {
   double avg_queue_latency_ms;
   uint64_t async_writes;
   uint64_t sync_writes;
+  uint64_t truncated_count;   /* messages truncated (static mode / size limits) */
 } log_stats;
 
 /**
@@ -356,7 +399,8 @@ typedef struct log_thread_stats {
   uint64_t rotation_count;
   uint64_t async_writes;
   uint64_t sync_writes;
-  uint64_t padding[4];
+  uint64_t truncated_count;
+  uint64_t padding[3];
 } LOG_ALIGN_64 log_thread_stats;
 
 /**
@@ -400,12 +444,13 @@ typedef struct log_ring_entry {
 } log_ring_entry;
 
 /**
- * @brief Lock-free ring buffer for async logging
+ * @brief Ring buffer queue for async logging (mutex + condvar protected)
  */
 typedef struct log_ring_queue {
   log_ring_entry *buffer;
   size_t capacity;
   size_t mask;
+  bool storage_owned;   /* false when the buffer is embedded static storage */
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_t mtx;
   pthread_cond_t cond;
@@ -497,6 +542,10 @@ typedef struct log_handler {
   bool show_thread_id;
   int kind;
   bool owns_file;
+  int flush_policy;            /* LOG_FLUSH_* */
+  unsigned flush_interval_ms;  /* for LOG_FLUSH_INTERVAL */
+  bool flush_fsync;            /* fsync(_commit) after flush */
+  double last_flush;           /* monotonic seconds, interval bookkeeping */
 } log_handler;
 struct log_handle {
   log_rwlock rwlock;
@@ -542,6 +591,17 @@ struct log_handle {
   log_ring_queue ring_queue;
   bool use_ring_queue;
   int clock_source;
+
+  bool crash_safe;   /* crash-safe mode: forces sync + per-line flush */
+
+#if LOG_FEATURE_STATIC_ALLOC
+  /* Embedded storage for static mode (sized by MAX_HANDLERS /
+   * LOG_RING_CAPACITY; capacity must be a power of two, checked in log.c) */
+  log_handler handlers_storage[MAX_HANDLERS];
+#endif
+#if LOG_FEATURE_STATIC_ALLOC && LOG_FEATURE_RING_QUEUE
+  log_ring_entry ring_storage[LOG_RING_CAPACITY];
+#endif
 };
 
 /* ==================== Stubs for disabled features ==================== */
@@ -596,6 +656,18 @@ static inline int log_add_syslog_handler(log_handle *ctx, const char *ident, int
 static inline int log_level_to_syslog(int level) { (void)level; return 6; }
 static inline void log_handler_enable_syslog(log_handle *ctx, int handler_idx, bool enable) {
   (void)ctx; (void)handler_idx; (void)enable;
+}
+#endif
+
+#if !LOG_FEATURE_CRASH_MODE
+static inline int log_set_crash_safe(log_handle *ctx, bool enable) { (void)ctx; (void)enable; return -1; }
+static inline int log_install_crash_handler(log_handle *ctx) { (void)ctx; return -1; }
+#endif
+
+#if !LOG_FEATURE_STATIC_ALLOC
+static inline size_t log_static_ctx_size(void) { return 0; }
+static inline log_handle* log_create_static(void *buf, size_t buf_size) {
+  (void)buf; (void)buf_size; return NULL;
 }
 #endif
 
@@ -655,6 +727,42 @@ void log_handler_set_formatter(log_handle *ctx, int handler_idx, log_FormatFn ne
 void log_enable_text_format(log_handle* ctx);
 #if LOG_FEATURE_JSON
 void log_enable_json_format(log_handle* ctx);
+#endif
+
+/* Durability: per-handler flush/fsync policy (file and stdout handlers).
+ * Returns 0 on success, -1 on invalid arguments. */
+int log_handler_set_flush(log_handle *ctx, int handler_idx, int policy, unsigned interval_ms);
+int log_handler_set_fsync(log_handle *ctx, int handler_idx, bool enable);
+
+/* Crash-safe mode: forces the synchronous path (async is refused while on)
+ * and switches every file/stdout handler to per-line flush, so all messages
+ * written before a fatal signal have already reached the kernel.
+ * log_install_crash_handler() (POSIX only) additionally writes a final
+ * marker line to the handler files when the process dies from
+ * SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE, then re-raises with default
+ * disposition (core dumps keep working). */
+#if LOG_FEATURE_CRASH_MODE
+int log_set_crash_safe(log_handle *ctx, bool enable);
+int log_install_crash_handler(log_handle *ctx);
+#endif
+
+/* Static-allocation mode (requires LOG_STATIC_ALLOC).
+ * Declare storage as log_static_storage_t to get correct alignment:
+ *   static log_static_storage_t g_log_storage;
+ *   log_handle *ctx = log_create_static(&g_log_storage, sizeof g_log_storage);
+ * One context per storage block; log_destroy() tears the context down but
+ * does not free the storage. */
+#if LOG_FEATURE_STATIC_ALLOC
+typedef union {
+  log_handle ctx;
+  long double ld_align;
+  long long ll_align;
+  void *ptr_align;
+  char bytes[sizeof(log_handle)];
+} log_static_storage_t;
+
+size_t log_static_ctx_size(void);
+log_handle* log_create_static(void *buf, size_t buf_size);
 #endif
 
 void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...);

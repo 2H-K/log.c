@@ -11,14 +11,17 @@
 #include "thread/test_mt_sync.c"
 #include "thread/test_mt_async.c"
 #include "thread/test_config_race.c"
+#include "thread/test_block_config_race.c"
 
 int main(void) {
     extern void test_mt_sync_register(void);
     extern void test_mt_async_register(void);
     extern void test_config_race_register(void);
+    extern void test_block_config_race_register(void);
 
     test_mt_sync_register();
     test_mt_async_register();
     test_config_race_register();
+    test_block_config_race_register();
     return test_run_all() ? 1 : 0;
 }

@@ -1,14 +1,17 @@
 # 增强型 C 日志库 - 跨平台
 
-一个简单、强大且线程安全的 C17 日志库，具备完整的跨平台支持。
+一个简单、强大且线程安全的 C11 日志库，具备完整的跨平台支持。
 
 ![screenshot](https://cloud.githubusercontent.com/assets/3920290/23831970/a2415e96-0723-11e7-9886-f8f5d2de60fe.png)
 
 ## 🚀 特性
 
 - **跨平台支持**: Windows (MSVC/MinGW-w64) & Linux/macOS (GCC/Clang)
-- **线程安全**: 读写锁保护并发访问
-- **异步日志**: 无锁环形缓冲区队列 + 专用写入线程
+- **线程安全**: 读写锁保护配置与并发访问
+- **异步日志**: 互斥锁 + 条件变量保护的环形缓冲队列 + 专用写入线程（用于解耦而非吞吐）
+- **崩溃安全**: `log_set_crash_safe` 逐行落盘；`log_install_crash_handler` 致命信号时写入标记行（POSIX）
+- **持久化策略**: 按 handler 配置 NEVER / EVERY / INTERVAL flush 与独立 fsync 开关
+- **静态零分配**: `-DLOG_STATIC_ALLOC` + `log_create_static`，热路径 0 次堆分配
 - **日志轮转**: 按大小自动轮转文件（最多 5 个轮转文件）
 - **结构化日志**: JSON 格式支持
 - **线程ID追踪**: 输出中可选显示线程ID
@@ -21,14 +24,26 @@
 
 ## 📊 性能
 
-基准测试结果（Linux, GCC -O2）：
+实测数字（2026-09，Linux x86_64，GCC -O2，`taskset -c 2` 绑核，sink 为 /dev/null，消息 `"bench msg %d"`）：
 
 | 模式 | 吞吐量 | 延迟 |
 |------|--------|------|
-| 同步（单线程） | ~1,300,000 msg/s | ~0.7 us/msg |
-| 同步（8 线程） | ~3,400,000 msg/s | — |
-| 异步（单线程） | ~5,700,000 msg/s | ~0.2 us/msg |
-| 异步（8 线程） | ~4,000,000 msg/s | — |
+| 同步（单线程） | ~3,500,000 msg/s | ~0.29 µs/msg |
+| 同步（8 线程） | ~3,500,000 msg/s | — |
+| 异步（单线程） | ~2,100,000 msg/s | ~0.49 µs/msg |
+| 异步（8 线程） | ~3,400,000 msg/s | — |
+
+复现命令：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+taskset -c 2 ./build/test_perf
+```
+
+口径说明：
+
+- 数字为**端到端送达**口径：队列满时按 FALLBACK_SYNC 策略同步落盘，不丢消息。历史版本在队列满时静默丢弃溢出消息，旧文档的 ~5,700,000 msg/s 是丢弃消息后的假吞吐，不可比。
+- 异步模式的价值是**解耦**（生产者不被慢 sink 阻塞、可设置 DROP/BLOCK/FALLBACK_SYNC 满载策略），不是吞吐。
 
 ## 📦 快速开始
 
@@ -202,20 +217,21 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 
 ## 🔧 编译时功能标志
 
-禁用可选功能以减小二进制体积：
+禁用可选功能以减小二进制体积（节省值为 .text 实测差值：`gcc -std=c11 -O2 -c src/log.c` 后 `size` 对比，2026-09；随编译器/架构略有浮动）：
 
 | 标志 | 说明 | 节省 |
 |------|------|------|
-| `LOG_DISABLE_JSON` | 禁用 JSON 格式化 | ~2 KB |
-| `LOG_DISABLE_SYSLOG` | 禁用 Syslog 支持 | ~1 KB |
-| `LOG_DISABLE_ASYNC` | 禁用异步日志 | ~3 KB |
-| `LOG_DISABLE_MPOOL` | 禁用内存池 | ~1 KB |
-| `LOG_DISABLE_RING_QUEUE` | 禁用环形缓冲区队列 | ~2 KB |
-| `LOG_DISABLE_STATS` | 禁用性能统计 | ~0.5 KB |
-| `LOG_DISABLE_FILE_OPS` | 禁用文件操作 | ~3 KB |
-| `LOG_DISABLE_THREAD_ID` | 禁用线程ID | ~0.3 KB |
-| `LOG_DISABLE_TS_CACHE` | 禁用时间戳缓存 | ~0.2 KB |
-| `LOG_MINIMAL` | 禁用所有可选功能 | ~13 KB |
+| `LOG_DISABLE_JSON` | 禁用 JSON 格式化 | ~2.4 KB |
+| `LOG_DISABLE_SYSLOG` | 禁用 Syslog 支持 | ~1.3 KB |
+| `LOG_DISABLE_ASYNC` | 禁用异步日志 | ~5.8 KB |
+| `LOG_DISABLE_MPOOL` | 禁用内存池 | ~1.5 KB |
+| `LOG_DISABLE_RING_QUEUE` | 禁用环形缓冲区队列 | ~2.9 KB |
+| `LOG_DISABLE_STATS` | 禁用性能统计 | ~0.4 KB |
+| `LOG_DISABLE_FILE_OPS` | 禁用文件操作 | ~2.2 KB |
+| `LOG_DISABLE_THREAD_ID` | 禁用线程ID | ~0.15 KB |
+| `LOG_DISABLE_TS_CACHE` | 禁用时间戳缓存 | ~0.6 KB |
+| `LOG_DISABLE_CRASH_MODE` | 禁用崩溃安全模式 | ~1.3 KB |
+| `LOG_MINIMAL` | 禁用所有可选功能 | ~13.5 KB |
 
 ## 📋 核心功能
 
@@ -435,9 +451,9 @@ typedef struct log_stats {
 
 所有公共 API 都是线程安全的：
 
-- **读写锁**: 保护配置更改
-- **无锁环形缓冲区**: 用于异步日志（SPSC 模式）
-- **原子操作**: 用于统计计数器
+- **读写锁**: 保护配置更改（pthread_rwlock / SRWLOCK）
+- **环形缓冲队列**: 用于异步日志——互斥锁 + 条件变量保护，多生产者单消费者；写入线程批量出队
+- **线程本地统计**: 统计计数器每线程一份，无竞争，快照读取
 - **多线程安全**: 可以并发调用
 
 ## 📝 示例
@@ -456,15 +472,16 @@ typedef struct log_stats {
 
 ## 🧪 测试
 
-项目包含 101 个测试，分为 6 个类别：
+项目包含 120 项测试，分为 6 个类别（以各 runner 输出的实测数为准；static_alloc 仅在 Linux + GNU ld 下构建）：
 
 | 类别 | 测试数 | 说明 |
 |------|--------|------|
-| core | 22 | 级别、处理器、格式、NULL安全、统计、边界 |
-| thread | 8 | 多线程同步/异步、配置竞态 |
-| platform | 8 | Syslog、轮转、Unicode路径 |
-| stress | 33 | 队列满、长消息、完整性、崩溃安全 |
-| perf | 12 | 吞吐量和延迟基准测试 |
+| core | 48 | 级别、处理器、格式、NULL安全、统计、边界 |
+| thread | 7 | 多线程同步/异步、配置竞态 |
+| platform | 25 | Syslog、轮转、Unicode路径、flush策略、崩溃安全 |
+| stress | 28 | 队列满、长消息、完整性、崩溃安全、资源 |
+| perf | 7 | 吞吐量和延迟基准测试 |
+| static_alloc | 5 | 静态零分配模式（`--wrap=malloc` 真实计数） |
 
 ### 运行测试
 
@@ -521,7 +538,7 @@ MIT 许可证 - 详情请参阅 [LICENSE](LICENSE)。
   - 添加跨平台支持（Windows/Linux/macOS）
   - 添加 CMake 构建系统
   - 添加彩色输出支持
-  - 增强异步日志（无锁环形缓冲区队列）
+  - 增强异步日志（环形缓冲队列 + 专用写入线程）
   - 添加 JSON 格式支持
   - 添加线程ID追踪
   - 添加 syslog 集成
@@ -543,7 +560,7 @@ MIT 许可证 - 详情请参阅 [LICENSE](LICENSE)。
 
 欢迎贡献！请确保：
 
-1. 代码遵循 C17 标准
+1. 代码遵循 C11 标准
 2. 所有函数都有文档
 3. 测试通过
 4. 保持线程安全

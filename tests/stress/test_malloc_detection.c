@@ -1,13 +1,12 @@
 /**
  * test_malloc_detection.c - Hot-path malloc detection
- * Verifies that the logging hot path does not call malloc
+ * Verifies that the logging hot path does not call malloc.
  *
- * Technique: Use __malloc_hook to intercept malloc calls during logging.
- * Note: __malloc_hook is deprecated but still works on glibc.
- * For production, use strace or LD_PRELOAD instead.
- *
- * NOTE: Uses dlsym(), __malloc_hook (glibc), /dev/null — POSIX/Linux-only.
- *       On Windows all tests are skipped.
+ * Technique: the test binary is linked with -Wl,--wrap=malloc (GNU ld /
+ * LLVM lld, Linux only) so every malloc call in the process routes through
+ * __wrap_malloc and the counters are real. The old dlsym/__malloc_hook
+ * approach was vacuous: the hook was never installed, so the count was
+ * always 0. Windows and non-GNU linkers skip these tests.
  */
 
 #include "test_harness.h"
@@ -17,32 +16,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN32) && !defined(_WIN64)
-#include <dlfcn.h>
+#if defined(LOG_TEST_WRAP_MALLOC) && defined(__linux__)
 
-/* Counter for malloc calls */
+/* Counter for malloc calls inside measurement windows. */
 static size_t g_malloc_count = 0;
 static int g_tracking_enabled = 0;
 
-/* Original malloc function */
-static void *(*real_malloc)(size_t) = NULL;
+extern void *__real_malloc(size_t size);
 
-/* Tracking malloc wrapper */
-static void *tracking_malloc(size_t size) {
+void *__wrap_malloc(size_t size) {
     if (g_tracking_enabled) {
         g_malloc_count++;
     }
-    return real_malloc(size);
-}
-
-static void init_malloc_tracking(void) {
-    if (!real_malloc) {
-        real_malloc = dlsym(RTLD_NEXT, "malloc");
-    }
+    return __real_malloc(size);
 }
 
 static void start_tracking(void) {
-    init_malloc_tracking();
     g_malloc_count = 0;
     g_tracking_enabled = 1;
 }
@@ -261,10 +250,10 @@ void test_malloc_detection_register(void) {
     test_add(test_malloc_multithread, "malloc_multithread");
 }
 
-#else /* Windows - all tests skipped */
+#else /* Windows or non-GNU linker - tests skipped */
 
 static void test_malloc_skip(void) {
-    TEST_SKIP("malloc detection tests require dlsym/__malloc_hook (POSIX/Linux only)");
+    TEST_SKIP("malloc detection requires -Wl,--wrap=malloc (Linux + GNU ld)");
 }
 
 void test_malloc_detection_register(void) {

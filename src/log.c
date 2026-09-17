@@ -1,5 +1,5 @@
 /*
- * Enhanced C17 Log Library with async support, rotation, and performance stats
+ * Enhanced C11 Log Library with async support, rotation, and performance stats
  * Based on rxi/log.c (original copyright 2020 rxi)
  * Modified for enhanced features (2026)
  *
@@ -36,16 +36,23 @@
 
 #ifdef LOG_PLATFORM_POSIX
 #include <sys/stat.h>
+#include <signal.h>
 #endif
 
 #ifdef LOG_PLATFORM_WINDOWS
 #include <windows.h>
 #include <sys/stat.h>
+#include <io.h>
 #endif
 
 #ifdef __STDC_VERSION__
 #if __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(int) >= 4, "int must be at least 32 bits");
+#if LOG_FEATURE_STATIC_ALLOC && LOG_FEATURE_RING_QUEUE
+_Static_assert(LOG_RING_CAPACITY > 0 &&
+               (LOG_RING_CAPACITY & (LOG_RING_CAPACITY - 1)) == 0,
+               "LOG_RING_CAPACITY must be a power of two");
+#endif
 #endif
 #endif
 
@@ -106,11 +113,25 @@ static inline bool atomic_compare_exchange_weak(volatile void* obj, void* expect
 
 #endif
 
-#define MAX_HANDLERS 32
 #define DEFAULT_QUEUE_SIZE LOG_MAX_QUEUE_SIZE
 
 #define LOG_MPOOL_CHUNK_SIZE 64
 #define LOG_MPOOL_MAX_CHUNKS 64
+
+/* Thread-local message buffer: the sync path formats the message body here
+ * instead of heap-allocating it. Messages that do not fit fall back to an
+ * exact-size malloc (truncation in static mode). */
+#define LOG_MSG_BUF_SIZE 4096
+static LOG_THREAD_LOCAL char tl_msg_buf[LOG_MSG_BUF_SIZE];
+
+/* Async writer drain batch: number of entries moved out of the queue under
+ * a single lock acquisition. 64 * sizeof(log_ring_entry) ~ 42 KB on the
+ * writer thread stack. */
+#define LOG_DRAIN_BATCH 64
+
+/* stdio buffer size applied to files opened by the library itself
+ * (log_add_file / rotation reopen). Fewer write() syscalls per message. */
+#define LOG_FILE_BUF_SIZE (256 * 1024)
 
 static LOG_THREAD_LOCAL log_thread_stats tl_stats = {0};
 
@@ -185,6 +206,7 @@ static void mpool_destroy(log_mpool *mp) {
 #endif
 }
 
+#if LOG_FEATURE_ASYNC
 static log_queue_entry* mpool_alloc(log_mpool *mp) {
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&mp->mtx);
@@ -236,10 +258,13 @@ static void mpool_free(log_mpool *mp, log_queue_entry *entry) {
   LeaveCriticalSection(&mp->mtx);
 #endif
 }
+#endif /* LOG_FEATURE_ASYNC */
 
 #endif /* LOG_FEATURE_MPOOL */
 
+#if LOG_FEATURE_TS_CACHE
 static LOG_THREAD_LOCAL log_ts_cache ts_cache_local;
+#endif
 
 /* Format a high-precision timestamp. When use_cache is set, the
  * "%Y-%m-%dT%H:%M:%S" part is cached per thread and reused while the
@@ -352,6 +377,7 @@ static void rwlock_write_unlock(log_rwlock *lock) {
 }
 
 /* Lock-free Queue Implementation */
+#if LOG_FEATURE_ASYNC
 static log_queue_entry* queue_entry_create(log_handle *ctx, log_event *ev) {
   (void)ctx;
 #if LOG_FEATURE_MPOOL
@@ -433,6 +459,7 @@ static void queue_entry_destroy(log_handle *ctx, log_queue_entry *entry) {
   free(entry->file);
   free(entry);
 }
+#endif /* LOG_FEATURE_ASYNC */
 
 static void queue_init(log_queue *q, size_t max_size) {
   q->head = NULL;
@@ -451,6 +478,7 @@ static void queue_init(log_queue *q, size_t max_size) {
 #endif
 }
 
+#if LOG_FEATURE_ASYNC
 static bool queue_push(log_handle *ctx, log_queue_entry *entry, bool blocking) {
   log_queue *q = &ctx->queue;
 #if defined(LOG_PLATFORM_POSIX)
@@ -508,45 +536,76 @@ static bool queue_push(log_handle *ctx, log_queue_entry *entry, bool blocking) {
   return true;
 }
 
-static log_queue_entry* queue_pop(log_queue *q) {
+/* Drain up to cap entries under a single lock acquisition.
+ * Same return contract as ring_queue_pop_batch. */
+#if LOG_FEATURE_ASYNC
+static int queue_pop_batch(log_queue *q, log_queue_entry **out, size_t cap, int timeout_ms) {
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&q->mtx);
   while (!q->closed && q->size == 0) {
-    pthread_cond_wait(&q->cond, &q->mtx);
+    if (timeout_ms >= 0) {
+      struct timespec deadline;
+      clock_gettime(CLOCK_REALTIME, &deadline);
+      deadline.tv_sec += timeout_ms / 1000;
+      deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+      if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+      }
+      if (pthread_cond_timedwait(&q->cond, &q->mtx, &deadline) == ETIMEDOUT) {
+        pthread_mutex_unlock(&q->mtx);
+        return -1;
+      }
+    } else {
+      pthread_cond_wait(&q->cond, &q->mtx);
+    }
   }
   if (q->size == 0) {
     pthread_mutex_unlock(&q->mtx);
-    return NULL;
+    return 0;
   }
-  log_queue_entry *entry = q->head;
-  q->head = entry->next;
-  if (!q->head) {
-    q->tail = NULL;
+  size_t n = 0;
+  while (q->head && n < cap) {
+    out[n++] = q->head;
+    q->head = q->head->next;
+    if (!q->head) q->tail = NULL;
   }
-  q->size--;
-  pthread_cond_signal(&q->space_cond);
+  q->size -= n;
   pthread_mutex_unlock(&q->mtx);
-  return entry;
+  for (size_t k = 0; k < n; k++) {
+    pthread_cond_signal(&q->space_cond);
+  }
+  return (int)n;
 #else
   EnterCriticalSection(&q->mtx);
   while (!q->closed && q->size == 0) {
-    SleepConditionVariableCS(&q->cond, &q->mtx, INFINITE);
+    DWORD wait_ms = timeout_ms >= 0 ? (DWORD)timeout_ms : INFINITE;
+    if (!SleepConditionVariableCS(&q->cond, &q->mtx, wait_ms)) {
+      LeaveCriticalSection(&q->mtx);
+      return -1;
+    }
   }
   if (q->size == 0) {
     LeaveCriticalSection(&q->mtx);
-    return NULL;
+    return 0;
   }
-  log_queue_entry *entry = q->head;
-  q->head = entry->next;
-  if (!q->head) {
-    q->tail = NULL;
+  size_t n = 0;
+  while (q->head && n < cap) {
+    out[n++] = q->head;
+    q->head = q->head->next;
+    if (!q->head) q->tail = NULL;
   }
-  q->size--;
-  WakeConditionVariable(&q->space_cond);
+  q->size -= n;
   LeaveCriticalSection(&q->mtx);
-  return entry;
+  for (size_t k = 0; k < n; k++) {
+    WakeConditionVariable(&q->space_cond);
+  }
+  return (int)n;
 #endif
 }
+#endif /* LOG_FEATURE_ASYNC */  /* queue_pop_batch */
+
+#endif /* LOG_FEATURE_ASYNC */  /* queue_push .. queue_pop_batch */
 
 static void queue_shutdown(log_queue *q) {
 #if defined(LOG_PLATFORM_POSIX)
@@ -564,6 +623,7 @@ static void queue_shutdown(log_queue *q) {
 #endif
 }
 
+#if LOG_FEATURE_ASYNC
 /* Reopen a queue that was shut down (used when async is re-enabled). */
 static void queue_reopen(log_queue *q) {
 #if defined(LOG_PLATFORM_POSIX)
@@ -576,6 +636,7 @@ static void queue_reopen(log_queue *q) {
   LeaveCriticalSection(&q->mtx);
 #endif
 }
+#endif /* LOG_FEATURE_ASYNC */
 
 static void queue_destroy(log_queue *q) {
   if (!q) return;
@@ -610,12 +671,20 @@ static void queue_destroy(log_queue *q) {
 
 #if LOG_FEATURE_RING_QUEUE
 
-static void ring_queue_init(log_ring_queue *rq, size_t capacity) {
+static void ring_queue_init_with_storage(log_ring_queue *rq, size_t capacity,
+                                         log_ring_entry *storage) {
   size_t cap = 1;
   while (cap < capacity) cap <<= 1;
   rq->capacity = cap;
   rq->mask = cap - 1;
-  rq->buffer = calloc(cap, sizeof(log_ring_entry));
+  if (storage) {
+    rq->buffer = storage;
+    rq->storage_owned = false;
+    memset(storage, 0, cap * sizeof(log_ring_entry));
+  } else {
+    rq->buffer = calloc(cap, sizeof(log_ring_entry));
+    rq->storage_owned = true;
+  }
   atomic_store(&rq->head, 0);
   atomic_store(&rq->tail, 0);
   rq->closed = false;
@@ -630,9 +699,17 @@ static void ring_queue_init(log_ring_queue *rq, size_t capacity) {
 #endif
 }
 
+#if !LOG_FEATURE_STATIC_ALLOC
+static void ring_queue_init(log_ring_queue *rq, size_t capacity) {
+  ring_queue_init_with_storage(rq, capacity, NULL);
+}
+#endif
+
 static void ring_queue_destroy(log_ring_queue *rq) {
   if (!rq->buffer) return;
-  free(rq->buffer);
+  if (rq->storage_owned) {
+    free(rq->buffer);
+  }
   rq->buffer = NULL;
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_destroy(&rq->mtx);
@@ -643,6 +720,7 @@ static void ring_queue_destroy(log_ring_queue *rq) {
 #endif
 }
 
+#if LOG_FEATURE_ASYNC
 /* Format directly into ring buffer slot - eliminates malloc + memcpy for small messages */
 static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap,
                                  const char *file, int level, int line,
@@ -699,6 +777,11 @@ static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap
     entry->has_large_msg = false;
     entry->msg[0] = '\0';
   } else if ((size_t)msg_len >= sizeof(entry->msg)) {
+#if LOG_FEATURE_STATIC_ALLOC
+    /* Static mode: keep the vsnprintf-truncated text, no heap allocation. */
+    entry->has_large_msg = false;
+    STAT_INC(truncated_count);
+#else
     entry->has_large_msg = true;
     char *large = malloc((size_t)msg_len + 1);
     if (!large) {
@@ -714,12 +797,25 @@ static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap
     vsnprintf(large, (size_t)msg_len + 1, fmt, ap_copy2);
     va_end(ap_copy2);
     *(char**)entry->msg = large;
+#endif
   } else {
     entry->has_large_msg = false;
   }
 
   size_t file_len = file ? strlen(file) : 0;
   if (file_len >= sizeof(entry->file)) {
+#if LOG_FEATURE_STATIC_ALLOC
+    /* Static mode: truncate the file path instead of heap-allocating. */
+    entry->has_large_file = false;
+    if (file) {
+      size_t copy = sizeof(entry->file) - 1;
+      memcpy(entry->file, file, copy);
+      entry->file[copy] = '\0';
+    } else {
+      entry->file[0] = '\0';
+    }
+    STAT_INC(truncated_count);
+#else
     entry->has_large_file = true;
     char *large = malloc(file_len + 1);
     if (!large) {
@@ -733,6 +829,7 @@ static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap
     if (file) memcpy(large, file, file_len + 1);
     else large[0] = '\0';
     *(char**)entry->file = large;
+#endif
   } else {
     entry->has_large_file = false;
     if (file) memcpy(entry->file, file, file_len + 1);
@@ -751,53 +848,122 @@ static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap
 #endif
   return true;
 }
+#endif /* LOG_FEATURE_ASYNC */
 
-static bool ring_queue_pop(log_ring_queue *rq, log_ring_entry *entry, char **msg_ptr, char **file_ptr) {
+/* Batch drain state for the async writer thread (on its stack). */
+typedef struct {
+  log_ring_entry entries[LOG_DRAIN_BATCH];
+  char *large_msg[LOG_DRAIN_BATCH];
+  char *large_file[LOG_DRAIN_BATCH];
+  int count;
+} log_drain_batch;
+
+/* Wait for at least one entry, then drain up to LOG_DRAIN_BATCH entries in a
+ * single lock acquisition. Returns:
+ *   >0  number of entries filled into out (ownership of large-message
+ *       pointers transfers to out->large_msg / out->large_file)
+ *    0  queue closed and empty (writer thread should exit)
+ *   -1  timeout_ms elapsed with no entry (flush INTERVAL handlers and retry)
+ * The per-entry heap strdup of the old single-pop is gone: inline buffers
+ * are copied into the batch instead, and one wakeup serves a whole batch. */
+#if LOG_FEATURE_ASYNC
+static int ring_queue_pop_batch(log_ring_queue *rq, log_drain_batch *out, int timeout_ms) {
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&rq->mtx);
+  size_t head = atomic_load(&rq->head);
+  while (head == atomic_load(&rq->tail)) {
+    if (rq->closed) {
+      pthread_mutex_unlock(&rq->mtx);
+      return 0;
+    }
+    if (timeout_ms >= 0) {
+      struct timespec deadline;
+      clock_gettime(CLOCK_REALTIME, &deadline);
+      deadline.tv_sec += timeout_ms / 1000;
+      deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+      if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+      }
+      if (pthread_cond_timedwait(&rq->cond, &rq->mtx, &deadline) == ETIMEDOUT) {
+        pthread_mutex_unlock(&rq->mtx);
+        return -1;
+      }
+    } else {
+      pthread_cond_wait(&rq->cond, &rq->mtx);
+    }
+    head = atomic_load(&rq->head);
+  }
+  size_t tail = atomic_load(&rq->tail);
+  size_t avail = tail - head;
+  if (avail > (size_t)LOG_DRAIN_BATCH) avail = (size_t)LOG_DRAIN_BATCH;
+  for (size_t k = 0; k < avail; k++) {
+    log_ring_entry *e = &rq->buffer[(head + k) & rq->mask];
+    out->entries[k] = *e;
+    if (e->has_large_msg) {
+      out->large_msg[k] = *(char**)e->msg;
+      e->has_large_msg = false;
+    } else {
+      out->large_msg[k] = NULL;
+    }
+    if (e->has_large_file) {
+      out->large_file[k] = *(char**)e->file;
+      e->has_large_file = false;
+    } else {
+      out->large_file[k] = NULL;
+    }
+  }
+  atomic_store(&rq->head, head + avail);
+  pthread_mutex_unlock(&rq->mtx);
+  for (size_t k = 0; k < avail; k++) {
+    pthread_cond_signal(&rq->space_cond);
+  }
+  out->count = (int)avail;
+  return (int)avail;
 #else
   EnterCriticalSection(&rq->mtx);
-#endif
   size_t head = atomic_load(&rq->head);
-  while (head == atomic_load(&rq->tail) && !rq->closed) {
-#if defined(LOG_PLATFORM_POSIX)
-    pthread_cond_wait(&rq->cond, &rq->mtx);
-#else
-    SleepConditionVariableCS(&rq->cond, &rq->mtx, INFINITE);
-#endif
+  while (head == atomic_load(&rq->tail)) {
+    if (rq->closed) {
+      LeaveCriticalSection(&rq->mtx);
+      return 0;
+    }
+    DWORD wait_ms = timeout_ms >= 0 ? (DWORD)timeout_ms : INFINITE;
+    if (!SleepConditionVariableCS(&rq->cond, &rq->mtx, wait_ms)) {
+      LeaveCriticalSection(&rq->mtx);
+      return -1;
+    }
+    head = atomic_load(&rq->head);
   }
-  if (head == atomic_load(&rq->tail)) {
-#if defined(LOG_PLATFORM_POSIX)
-    pthread_mutex_unlock(&rq->mtx);
-#else
-    LeaveCriticalSection(&rq->mtx);
-#endif
-    return false;
+  size_t tail = atomic_load(&rq->tail);
+  size_t avail = tail - head;
+  if (avail > (size_t)LOG_DRAIN_BATCH) avail = (size_t)LOG_DRAIN_BATCH;
+  for (size_t k = 0; k < avail; k++) {
+    log_ring_entry *e = &rq->buffer[(head + k) & rq->mask];
+    out->entries[k] = *e;
+    if (e->has_large_msg) {
+      out->large_msg[k] = *(char**)e->msg;
+      e->has_large_msg = false;
+    } else {
+      out->large_msg[k] = NULL;
+    }
+    if (e->has_large_file) {
+      out->large_file[k] = *(char**)e->file;
+      e->has_large_file = false;
+    } else {
+      out->large_file[k] = NULL;
+    }
   }
-  log_ring_entry *e = &rq->buffer[head & rq->mask];
-  *entry = *e;
-  if (e->has_large_msg) {
-    *msg_ptr = *(char**)e->msg;
-    e->has_large_msg = false;
-  } else {
-    *msg_ptr = strdup(e->msg);
-  }
-  if (e->has_large_file) {
-    *file_ptr = *(char**)e->file;
-    e->has_large_file = false;
-  } else {
-    *file_ptr = strdup(e->file);
-  }
-  atomic_store(&rq->head, head + 1);
-#if defined(LOG_PLATFORM_POSIX)
-  pthread_cond_signal(&rq->space_cond);
-  pthread_mutex_unlock(&rq->mtx);
-#else
-  WakeConditionVariable(&rq->space_cond);
+  atomic_store(&rq->head, head + avail);
   LeaveCriticalSection(&rq->mtx);
+  for (size_t k = 0; k < avail; k++) {
+    WakeConditionVariable(&rq->space_cond);
+  }
+  out->count = (int)avail;
+  return (int)avail;
 #endif
-  return true;
 }
+#endif /* LOG_FEATURE_ASYNC */
 
 static void ring_queue_shutdown(log_ring_queue *rq) {
 #if defined(LOG_PLATFORM_POSIX)
@@ -817,10 +983,13 @@ static void ring_queue_shutdown(log_ring_queue *rq) {
 
 #endif /* LOG_FEATURE_RING_QUEUE */
 
-/* Format helpers: the message is formatted exactly once, then shared by all handlers. */
-static char* format_message(log_event *ev) {
+/* Format helpers: the message is formatted exactly once, then shared by all handlers.
+ * Sets *heap_owned when the caller must free the returned pointer; otherwise the
+ * buffer belongs to the event (thread-local storage) and must not be freed. */
+static char* format_message(log_event *ev, bool *heap_owned) {
+  *heap_owned = false;
   if (ev->raw_msg) {
-    return strdup(ev->raw_msg);
+    return (char*)ev->raw_msg;
   }
   va_list args_copy;
   va_copy(args_copy, ev->ap);
@@ -830,6 +999,7 @@ static char* format_message(log_event *ev) {
   char *msg = malloc((size_t)len + 1);
   if (!msg) return NULL;
   vsnprintf(msg, (size_t)len + 1, ev->fmt, ev->ap);
+  *heap_owned = true;
   return msg;
 }
 
@@ -868,6 +1038,154 @@ static int format_prefix(log_handle *ctx, log_event *ev, char *buf, size_t buf_s
                   ev->file ? ev->file : "", ev->line);
 }
 
+/* ==================== Stream buffering & durability ==================== */
+
+#if LOG_FEATURE_FILE_OPS
+/* Fully buffer files opened by the library: fewer write() syscalls per
+ * message. Only valid before the first I/O on the stream, so it is used
+ * exclusively for files we open ourselves (log_add_file, rotation
+ * reopen). Skipped in static mode (setvbuf would heap-allocate). */
+static void log_setup_stream_buffer(FILE *fp) {
+#if !LOG_FEATURE_STATIC_ALLOC
+  setvbuf(fp, NULL, _IOFBF, LOG_FILE_BUF_SIZE);
+#else
+  (void)fp;
+#endif
+}
+#endif /* LOG_FEATURE_FILE_OPS */
+
+/* fflush + durable sync of a stdio stream (fsync on POSIX, _commit on Windows). */
+static void log_flush_fsync(FILE *fp) {
+  fflush(fp);
+#if defined(LOG_PLATFORM_POSIX)
+  fsync(fileno(fp));
+#else
+  _commit(_fileno(fp));
+#endif
+}
+
+static double monotonic_seconds(void) {
+  return get_timestamp_with_clock(LOG_CLOCK_MONOTONIC);
+}
+
+/* Apply the per-handler flush policy after one message was written.
+ * INTERVAL bookkeeping races benignly between writer threads: worst case
+ * is a duplicate flush or one interval of extra delay. The first write
+ * only starts the interval clock; the flush itself happens interval_ms
+ * later (on a later write, or via the async writer timer). */
+static void log_apply_flush(log_handle *ctx, int handler_idx) {
+  log_handler *h = &ctx->handlers[handler_idx];
+  FILE *fp = h->fp;
+  if (!fp) return;
+  if (h->flush_policy == LOG_FLUSH_EVERY) {
+    fflush(fp);
+    if (h->flush_fsync) log_flush_fsync(fp);
+  } else if (h->flush_policy == LOG_FLUSH_INTERVAL && h->flush_interval_ms > 0) {
+    double now = monotonic_seconds();
+    if (h->last_flush == 0.0) {
+      h->last_flush = now;   /* baseline only: nothing withheld yet */
+    } else if (now - h->last_flush >= (double)h->flush_interval_ms / 1000.0) {
+      h->last_flush = now;
+      fflush(fp);
+      if (h->flush_fsync) log_flush_fsync(fp);
+    }
+  }
+}
+
+#if LOG_FEATURE_ASYNC
+/* Flush handlers whose INTERVAL deadline has passed (async writer timer). */
+static void log_flush_due_intervals(log_handle *ctx) {
+  double now = monotonic_seconds();
+  for (int i = 0; i < ctx->handler_count; i++) {
+    log_handler *h = &ctx->handlers[i];
+    if (!h->fp || h->flush_policy != LOG_FLUSH_INTERVAL || h->flush_interval_ms == 0) continue;
+    if (h->last_flush == 0.0 ||
+        now - h->last_flush >= (double)h->flush_interval_ms / 1000.0) {
+      h->last_flush = now;
+      fflush(h->fp);
+      if (h->flush_fsync) log_flush_fsync(h->fp);
+    }
+  }
+}
+
+/* Smallest pending INTERVAL in ms, or -1 when no handler needs timed flushes
+ * (the async writer then waits indefinitely). */
+static int log_next_flush_timeout_ms(log_handle *ctx) {
+  int best = -1;
+  for (int i = 0; i < ctx->handler_count; i++) {
+    log_handler *h = &ctx->handlers[i];
+    if (h->active && h->fp && h->flush_policy == LOG_FLUSH_INTERVAL &&
+        h->flush_interval_ms > 0) {
+      int ms = (int)h->flush_interval_ms;
+      if (best < 0 || ms < best) best = ms;
+    }
+  }
+  return best;
+}
+#endif /* LOG_FEATURE_ASYNC */
+
+/* ==================== Crash-safe mode ==================== */
+#if LOG_FEATURE_CRASH_MODE
+
+#define LOG_CRASH_FD_MAX 16
+static struct {
+  int fds[LOG_CRASH_FD_MAX];
+  int count;
+} crash_targets;
+
+/* (Re)collect the raw fds of all active file-backed handlers of ctx.
+ * fds are written first and count afterwards, so a fatal signal arriving
+ * mid-update observes a consistent target set (old or new). */
+static void crash_refresh_targets(log_handle *ctx) {
+  int n = 0;
+  for (int i = 0; i < ctx->handler_count && n < LOG_CRASH_FD_MAX; i++) {
+    FILE *fp = ctx->handlers[i].fp;
+    if (!fp || !ctx->handlers[i].active) continue;
+    int fd = fileno(fp);
+    if (fd < 0) continue;
+    bool dup = false;
+    for (int j = 0; j < n; j++) {
+      if (crash_targets.fds[j] == fd) { dup = true; break; }
+    }
+    if (!dup) crash_targets.fds[n++] = fd;
+  }
+  crash_targets.count = n;
+}
+
+#if defined(LOG_PLATFORM_POSIX)
+/* Async-signal-safe marker line: constant text plus a hand-rolled integer
+ * conversion. Only write(2)/memcpy/stack are used here. */
+static void crash_marker_write(int sig) {
+  char buf[80];
+  size_t n = 0;
+  static const char prefix[] = "==== log: fatal signal ";
+  static const char suffix[] = " caught, process dying ====\n";
+  memcpy(buf, prefix, sizeof(prefix) - 1);
+  n += sizeof(prefix) - 1;
+  char digits[12];
+  size_t d = 0;
+  int v = sig < 0 ? -sig : sig;
+  do { digits[d++] = (char)('0' + (v % 10)); v /= 10; } while (v);
+  while (d) buf[n++] = digits[--d];
+  memcpy(buf + n, suffix, sizeof(suffix) - 1);
+  n += sizeof(suffix) - 1;
+  for (int i = 0; i < crash_targets.count; i++) {
+    ssize_t r = write(crash_targets.fds[i], buf, n);
+    (void)r;
+  }
+}
+
+/* Installed with SA_RESETHAND: the disposition is already back to SIG_DFL
+ * while this handler runs, so a nested fault kills the process instead of
+ * recursing. */
+static void crash_signal_handler(int sig) {
+  crash_marker_write(sig);
+  kill(getpid(), sig);
+}
+#endif /* LOG_PLATFORM_POSIX */
+
+#endif /* LOG_FEATURE_CRASH_MODE */
+
 /* File rotation */
 #if LOG_FEATURE_FILE_OPS
 static void rotate_file(log_handle *ctx, const char *filename) {
@@ -894,7 +1212,8 @@ static void rotate_file(log_handle *ctx, const char *filename) {
 
 /* Output handlers */
 static void stdout_handler(log_handle *ctx, log_event *ev) {
-  char *msg = format_message(ev);
+  bool heap_msg = false;
+  char *msg = format_message(ev, &heap_msg);
   if (!msg) return;
 
   bool show_tid = false;
@@ -916,30 +1235,44 @@ static void stdout_handler(log_handle *ctx, log_event *ev) {
 #endif
                );
   fprintf(ev->udata, "%s%s\n", prefix, msg);
-  free(msg);
+  if (heap_msg) free(msg);
 }
 
 static void file_handler_internal(log_handle *ctx, log_event *ev, int handler_idx) {
-  char *msg = format_message(ev);
+  bool heap_msg = false;
+  char *msg = format_message(ev, &heap_msg);
   if (!msg) return;
 
   char prefix[512];
   int prefix_len = format_prefix(ctx, ev, prefix, sizeof(prefix),
                                  ctx->handlers[handler_idx].show_thread_id, false);
-  if (prefix_len < 0) { free(msg); return; }
+  if (prefix_len < 0) { if (heap_msg) free(msg); return; }
   if ((size_t)prefix_len >= sizeof(prefix)) prefix_len = (int)sizeof(prefix) - 1;
 
   size_t msg_len = strlen(msg);
-  size_t total = (size_t)prefix_len + msg_len + 2;
-  char *buf = malloc(total);
-  if (!buf) { free(msg); return; }
-  memcpy(buf, prefix, prefix_len);
-  memcpy(buf + prefix_len, msg, msg_len);
-  buf[prefix_len + msg_len] = '\n';
-  buf[prefix_len + msg_len + 1] = '\0';
-
   FILE *fp = ctx->handlers[handler_idx].fp;
-  size_t written = fwrite(buf, 1, total - 1, fp);
+  /* Assemble prefix+msg+'\n' and write with a SINGLE fwrite: stdio holds
+   * the stream lock for the whole line, so concurrent writers cannot tear
+   * lines apart. The common case assembles into thread-local storage (no
+   * heap); oversized lines fall back to an exact-size malloc. */
+  size_t total = (size_t)prefix_len + msg_len + 1;
+  static LOG_THREAD_LOCAL char tl_line_buf[512 + LOG_MSG_BUF_SIZE + 2];
+  size_t written;
+  if (total <= sizeof(tl_line_buf)) {
+    memcpy(tl_line_buf, prefix, (size_t)prefix_len);
+    memcpy(tl_line_buf + prefix_len, msg, msg_len);
+    tl_line_buf[prefix_len + msg_len] = '\n';
+    written = fwrite(tl_line_buf, 1, total, fp);
+  } else {
+    char *buf = malloc(total);
+    if (!buf) { if (heap_msg) free(msg); return; }
+    memcpy(buf, prefix, (size_t)prefix_len);
+    memcpy(buf + prefix_len, msg, msg_len);
+    buf[prefix_len + msg_len] = '\n';
+    written = fwrite(buf, 1, total, fp);
+    free(buf);
+  }
+
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&ctx->file_mtx);
 #else
@@ -951,6 +1284,7 @@ static void file_handler_internal(log_handle *ctx, log_event *ev, int handler_id
   if (ctx->handlers[handler_idx].file_size >= ctx->max_file_size) {
     if (ctx->handlers[handler_idx].owns_file && ctx->file_prefix) {
       fflush(fp);
+      if (ctx->handlers[handler_idx].flush_fsync) log_flush_fsync(fp);
       if (fp != stderr && fp != stdout) {
         fclose(fp);
       }
@@ -961,9 +1295,13 @@ static void file_handler_internal(log_handle *ctx, log_event *ev, int handler_id
       rotate_file(ctx, ctx->file_prefix);
       FILE *reopened = fopen(ctx->file_prefix, "a");
       if (reopened) {
+        log_setup_stream_buffer(reopened);
         ctx->handlers[handler_idx].fp = reopened;
         ctx->handlers[handler_idx].udata = reopened;
         ctx->handlers[handler_idx].file_size = 0;
+#if LOG_FEATURE_CRASH_MODE
+        crash_refresh_targets(ctx);
+#endif
       }
     } else {
       ctx->handlers[handler_idx].file_size = 0;
@@ -976,8 +1314,7 @@ static void file_handler_internal(log_handle *ctx, log_event *ev, int handler_id
   LeaveCriticalSection(&ctx->file_mtx);
 #endif
 
-  free(buf);
-  free(msg);
+  if (heap_msg) free(msg);
 }
 
 static void file_handler_wrapper(log_handle *ctx, log_event *ev) {
@@ -993,10 +1330,11 @@ static void file_handler_wrapper(log_handle *ctx, log_event *ev) {
     }
   }
 
-  char *msg = format_message(ev);
+  bool heap_fb = false;
+  char *msg = format_message(ev, &heap_fb);
   if (msg) {
     fprintf(target_fp, "%s\n", msg);
-    free(msg);
+    if (heap_fb) free(msg);
   }
 }
 
@@ -1035,7 +1373,8 @@ static char* json_escape(const char *src) {
 }
 
 static void json_handler(log_handle *ctx, log_event *ev) {
-  char *msg = format_message(ev);
+  bool heap_msg = false;
+  char *msg = format_message(ev, &heap_msg);
   if (!msg) return;
 
   char time_buf[64];
@@ -1043,7 +1382,7 @@ static void json_handler(log_handle *ctx, log_event *ev) {
                    ctx && ctx->enable_ts_cache);
 
   char *escaped_msg = json_escape(msg);
-  free(msg);
+  if (heap_msg) free(msg);
   if (!escaped_msg) return;
 
   char *escaped_file = json_escape(ev->file ? ev->file : "");
@@ -1103,57 +1442,78 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
 
 #if LOG_FEATURE_RING_QUEUE
   if (ctx->use_ring_queue) {
+    log_drain_batch batch;
     while (true) {
-      log_ring_entry ring_entry;
-      char *msg = NULL, *file = NULL;
-      if (!ring_queue_pop(&ctx->ring_queue, &ring_entry, &msg, &file)) {
-        break;
+      int timeout_ms = log_next_flush_timeout_ms(ctx);
+      int n = ring_queue_pop_batch(&ctx->ring_queue, &batch, timeout_ms);
+      if (n == 0) break;                 /* closed and drained */
+      if (n < 0) {                       /* interval timer fired */
+        log_flush_due_intervals(ctx);
+        continue;
       }
-      log_event ev = {0};
-      ev.level = ring_entry.level;
-      ev.file = file;
-      ev.line = ring_entry.line;
-      ev.timestamp = ring_entry.timestamp;
-      ev.raw_msg = msg;
       rwlock_read_lock(&ctx->rwlock);
-      for (int i = 0; i < ctx->handler_count; i++) {
-        if (ctx->handlers[i].active && ctx->handlers[i].fn && ring_entry.level >= ctx->handlers[i].level) {
-          ev.udata = ctx->handlers[i].udata;
-          ctx->handlers[i].fn(ctx, &ev);
+      for (int k = 0; k < n; k++) {
+        log_ring_entry *re = &batch.entries[k];
+        log_event ev = {0};
+        ev.level = re->level;
+        ev.file = batch.large_file[k] ? batch.large_file[k] : re->file;
+        ev.line = re->line;
+        ev.timestamp = re->timestamp;
+        ev.raw_msg = batch.large_msg[k] ? batch.large_msg[k] : re->msg;
+        for (int i = 0; i < ctx->handler_count; i++) {
+          if (ctx->handlers[i].active && ctx->handlers[i].fn && re->level >= ctx->handlers[i].level) {
+            ev.udata = ctx->handlers[i].udata;
+            ctx->handlers[i].fn(ctx, &ev);
+            log_apply_flush(ctx, i);
+          }
         }
       }
       rwlock_read_unlock(&ctx->rwlock);
-      free(msg);
-      free(file);
+      for (int k = 0; k < n; k++) {
+        free(batch.large_msg[k]);
+        free(batch.large_file[k]);
+      }
     }
   } else
 #endif /* LOG_FEATURE_RING_QUEUE */
   {
+    log_queue_entry *entries[LOG_DRAIN_BATCH];
     while (true) {
-      log_queue_entry *entry = queue_pop(&ctx->queue);
-      if (!entry) {
-        break;
+      int timeout_ms = log_next_flush_timeout_ms(ctx);
+      int n = queue_pop_batch(&ctx->queue, entries, LOG_DRAIN_BATCH, timeout_ms);
+      if (n == 0) break;                 /* closed and drained */
+      if (n < 0) {                       /* interval timer fired */
+        log_flush_due_intervals(ctx);
+        continue;
       }
-      log_event ev = {0};
-      ev.level = entry->level;
-      ev.file = entry->file;
-      ev.line = entry->line;
-      ev.timestamp = entry->timestamp;
-      ev.raw_msg = entry->msg;
       rwlock_read_lock(&ctx->rwlock);
-      for (int i = 0; i < ctx->handler_count; i++) {
-        if (ctx->handlers[i].active && ctx->handlers[i].fn && entry->level >= ctx->handlers[i].level) {
-          ev.udata = ctx->handlers[i].udata;
-          ctx->handlers[i].fn(ctx, &ev);
+      for (int k = 0; k < n; k++) {
+        log_queue_entry *entry = entries[k];
+        log_event ev = {0};
+        ev.level = entry->level;
+        ev.file = entry->file;
+        ev.line = entry->line;
+        ev.timestamp = entry->timestamp;
+        ev.raw_msg = entry->msg;
+        for (int i = 0; i < ctx->handler_count; i++) {
+          if (ctx->handlers[i].active && ctx->handlers[i].fn && entry->level >= ctx->handlers[i].level) {
+            ev.udata = ctx->handlers[i].udata;
+            ctx->handlers[i].fn(ctx, &ev);
+            log_apply_flush(ctx, i);
+          }
         }
       }
       rwlock_read_unlock(&ctx->rwlock);
-      /* format_message returns a strdup, so free the original */
-      free(entry->msg);
-      free(entry->file);
-      entry->msg = NULL;
-      entry->file = NULL;
-      queue_entry_destroy(ctx, entry);
+      for (int k = 0; k < n; k++) {
+        log_queue_entry *entry = entries[k];
+        /* NULL before returning to the pool: pooled entries reuse the
+         * msg/file slots and must not hold dangling pointers. */
+        free(entry->msg);
+        free(entry->file);
+        entry->msg = NULL;
+        entry->file = NULL;
+        queue_entry_destroy(ctx, entry);
+      }
     }
   }
 
@@ -1166,10 +1526,11 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
 #endif /* LOG_FEATURE_ASYNC */
 
 /* API Implementation */
-log_handle* log_create(void) {
-  log_handle *ctx = calloc(1, sizeof(log_handle));
+
+/* Shared context initialization for log_create() and log_create_static().
+ * Returns false on allocation failure (impossible in static mode). */
+static bool init_context(log_handle *ctx) {
   reset_thread_stats();
-  if (!ctx) return NULL;
 
   /* Pre-warm the timezone state once so that concurrent log calls never
    * race inside glibc's lazily-initialized tzset_internal. */
@@ -1189,11 +1550,18 @@ log_handle* log_create(void) {
   ctx->max_file_size = LOG_DEFAULT_MAX_SIZE;
   ctx->async_enabled = false;
   ctx->queue_policy = LOG_QUEUE_FALLBACK_SYNC;
+  ctx->crash_safe = false;
 
   queue_init(&ctx->queue, DEFAULT_QUEUE_SIZE);
 
   ctx->handler_capacity = MAX_HANDLERS;
+#if LOG_FEATURE_STATIC_ALLOC
+  ctx->handlers = ctx->handlers_storage;
+  memset(ctx->handlers_storage, 0, sizeof(ctx->handlers_storage));
+#else
   ctx->handlers = calloc(MAX_HANDLERS, sizeof(log_handler));
+  if (!ctx->handlers) return false;
+#endif
   ctx->handler_count = 0;
 
   ctx->format_fn = NULL;
@@ -1204,7 +1572,11 @@ log_handle* log_create(void) {
 
 #if LOG_FEATURE_MPOOL
   mpool_init(&ctx->mpool, LOG_MPOOL_MAX_CHUNKS * LOG_MPOOL_CHUNK_SIZE);
+#if LOG_FEATURE_STATIC_ALLOC
+  ctx->enable_mpool = false;   /* pool chunks would heap-allocate */
+#else
   ctx->enable_mpool = true;
+#endif
 #else
   ctx->enable_mpool = false;
 #endif
@@ -1215,8 +1587,12 @@ log_handle* log_create(void) {
 #endif
 
 #if LOG_FEATURE_RING_QUEUE
-  ring_queue_init(&ctx->ring_queue, DEFAULT_QUEUE_SIZE);
   ctx->use_ring_queue = true;
+#endif
+#if LOG_FEATURE_STATIC_ALLOC && LOG_FEATURE_RING_QUEUE
+  ring_queue_init_with_storage(&ctx->ring_queue, LOG_RING_CAPACITY, ctx->ring_storage);
+#elif LOG_FEATURE_RING_QUEUE
+  ring_queue_init(&ctx->ring_queue, DEFAULT_QUEUE_SIZE);
 #else
   ctx->use_ring_queue = false;
 #endif
@@ -1228,8 +1604,36 @@ log_handle* log_create(void) {
     ctx->handlers[0].owns_file = false;
   }
 
+  return true;
+}
+
+log_handle* log_create(void) {
+  log_handle *ctx = calloc(1, sizeof(log_handle));
+  if (!ctx) return NULL;
+  if (!init_context(ctx)) {
+    free(ctx);
+    return NULL;
+  }
   return ctx;
 }
+
+#if LOG_FEATURE_STATIC_ALLOC
+size_t log_static_ctx_size(void) {
+  return sizeof(log_handle);
+}
+
+log_handle* log_create_static(void *buf, size_t buf_size) {
+  if (!buf || buf_size < sizeof(log_handle)) return NULL;
+  /* buf must be aligned like log_static_storage_t (see log.h); that type
+   * is the documented way to declare the storage. */
+  log_handle *ctx = (log_handle*)buf;
+  memset(ctx, 0, sizeof(*ctx));
+  if (!init_context(ctx)) {
+    return NULL;
+  }
+  return ctx;
+}
+#endif /* LOG_FEATURE_STATIC_ALLOC */
 
 void log_destroy(log_handle *ctx) {
   if (!ctx) return;
@@ -1266,7 +1670,11 @@ void log_destroy(log_handle *ctx) {
     }
     free(ctx->handlers[i].filename);
   }
+#if LOG_FEATURE_STATIC_ALLOC
+  /* handlers storage is embedded in the caller-provided context */
+#else
   free(ctx->handlers);
+#endif
 
   free(ctx->file_prefix);
   free(ctx->syslog_ident);
@@ -1282,7 +1690,11 @@ void log_destroy(log_handle *ctx) {
 #if LOG_FEATURE_MPOOL
   mpool_destroy(&ctx->mpool);
 #endif
+#if LOG_FEATURE_STATIC_ALLOC
+  /* context memory belongs to the caller's storage block */
+#else
   free(ctx);
+#endif
 }
 
 log_handle* log_default(void) {
@@ -1338,6 +1750,11 @@ void log_set_format(log_handle *ctx, log_FormatFn fn) {
 #if LOG_FEATURE_ASYNC
 int log_set_async(log_handle *ctx, bool enable) {
   if (!ctx) return -1;
+#if LOG_FEATURE_CRASH_MODE
+  /* Crash-safe mode requires the synchronous path: messages sitting in a
+   * queue when a fatal signal hits would be lost. */
+  if (enable && ctx->crash_safe) return -1;
+#endif
   if (enable && !ctx->async_enabled) {
     queue_reopen(&ctx->queue);
     ctx->async_enabled = true;
@@ -1500,9 +1917,13 @@ void log_set_queue_policy(log_handle *ctx, int policy) {
 #if LOG_FEATURE_RING_QUEUE
 void log_enable_ring_queue(log_handle *ctx, bool enable) {
   if (!ctx) return;
+#if LOG_FEATURE_STATIC_ALLOC
+  (void)enable;  /* static mode always uses the embedded ring storage */
+#else
   rwlock_write_lock(&ctx->rwlock);
   ctx->use_ring_queue = enable;
   rwlock_write_unlock(&ctx->rwlock);
+#endif
 }
 #endif /* LOG_FEATURE_RING_QUEUE */
 
@@ -1515,6 +1936,10 @@ void log_set_clock_source(log_handle *ctx, int clock_source) {
 
 void log_set_queue_size(log_handle *ctx, size_t size) {
   if (!ctx || size < 2) return;
+#if LOG_FEATURE_STATIC_ALLOC
+  (void)size;  /* ring storage is fixed at compile time */
+  return;
+#else
   rwlock_write_lock(&ctx->rwlock);
 #if LOG_FEATURE_RING_QUEUE
   ring_queue_destroy(&ctx->ring_queue);
@@ -1522,6 +1947,7 @@ void log_set_queue_size(log_handle *ctx, size_t size) {
 #endif
   ctx->queue.max_size = size;
   rwlock_write_unlock(&ctx->rwlock);
+#endif
 }
 
 /* Snapshot stats from thread-local storage into a plain struct */
@@ -1536,6 +1962,7 @@ static void stats_snapshot(log_handle *ctx, log_stats *stats) {
   stats->rotation_count = tl_stats.rotation_count;
   stats->async_writes = tl_stats.async_writes;
   stats->sync_writes = tl_stats.sync_writes;
+  stats->truncated_count = tl_stats.truncated_count;
 }
 
 #if LOG_FEATURE_STATS
@@ -1564,6 +1991,10 @@ int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level) {
   h->syslog_facility = LOG_USER;
   h->show_thread_id = false;
   h->kind = HANDLER_CUSTOM;
+  h->flush_policy = LOG_FLUSH_NEVER;
+  h->flush_interval_ms = 0;
+  h->flush_fsync = false;
+  h->last_flush = 0.0;
 
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
@@ -1588,6 +2019,10 @@ int log_add_fp(log_handle *ctx, FILE *fp, int level) {
   h->show_thread_id = false;
   h->kind = HANDLER_FILE;
   h->owns_file = false;
+  h->flush_policy = LOG_FLUSH_NEVER;
+  h->flush_interval_ms = 0;
+  h->flush_fsync = false;
+  h->last_flush = 0.0;
 
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
@@ -1600,6 +2035,7 @@ int log_add_file(log_handle *ctx, const char *filename, int level) {
 
   FILE *fp = fopen(filename, "a");
   if (!fp) return -1;
+  log_setup_stream_buffer(fp);
 
   rwlock_write_lock(&ctx->rwlock);
 
@@ -1616,6 +2052,10 @@ int log_add_file(log_handle *ctx, const char *filename, int level) {
   h->show_thread_id = false;
   h->kind = HANDLER_FILE;
   h->owns_file = true;
+  h->flush_policy = LOG_FLUSH_NEVER;
+  h->flush_interval_ms = 0;
+  h->flush_fsync = false;
+  h->last_flush = 0.0;
 
   rwlock_write_unlock(&ctx->rwlock);
   return ctx->handler_count - 1;
@@ -1628,6 +2068,50 @@ void log_remove_handler(log_handle *ctx, int idx) {
   rwlock_write_lock(&ctx->rwlock);
   ctx->handlers[idx].active = false;
   rwlock_write_unlock(&ctx->rwlock);
+}
+
+/* Format the message body once (thread-local buffer; exact-size heap
+ * fallback for oversized messages, truncation in static mode), then
+ * dispatch synchronously to every active handler. Shared by the sync path
+ * and the async FALLBACK_SYNC path. Caller holds the ctx read lock and has
+ * already va_start()ed ev->ap (consumed here). */
+static void sync_format_and_dispatch(log_handle *ctx, log_event *ev) {
+  char *big = NULL;
+  va_list probe;
+  va_copy(probe, ev->ap);
+  int pflen = vsnprintf(NULL, 0, ev->fmt, probe);
+  va_end(probe);
+  if (pflen < 0) {
+    return;
+  }
+  if ((size_t)pflen < sizeof(tl_msg_buf)) {
+    vsnprintf(tl_msg_buf, sizeof(tl_msg_buf), ev->fmt, ev->ap);
+    ev->raw_msg = tl_msg_buf;
+  } else {
+#if LOG_FEATURE_STATIC_ALLOC
+    /* Static mode: keep the truncated text, no heap allocation. */
+    vsnprintf(tl_msg_buf, sizeof(tl_msg_buf), ev->fmt, ev->ap);
+    ev->raw_msg = tl_msg_buf;
+    STAT_INC(truncated_count);
+#else
+    big = malloc((size_t)pflen + 1);
+    if (big) {
+      vsnprintf(big, (size_t)pflen + 1, ev->fmt, ev->ap);
+      ev->raw_msg = big;
+    } else {
+      ev->raw_msg = "";   /* OOM: handlers print an empty body */
+    }
+#endif
+  }
+
+  for (int i = 0; i < ctx->handler_count; i++) {
+    if (ctx->handlers[i].active && ctx->handlers[i].fn && ev->level >= ctx->handlers[i].level) {
+      ev->udata = ctx->handlers[i].udata;
+      ctx->handlers[i].fn(ctx, ev);
+      log_apply_flush(ctx, i);
+    }
+  }
+  free(big);
 }
 
 void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...) {
@@ -1652,92 +2136,70 @@ void log_log(log_handle *ctx, int level, const char *file, int line, const char 
   ev.level = level;
   ev.timestamp = get_timestamp_with_clock(ctx->clock_source);
 
-  if (ctx->async_enabled) {
-#if LOG_FEATURE_ASYNC
-    bool pushed;
-#if LOG_FEATURE_RING_QUEUE
-    if (ctx->use_ring_queue) {
-      va_start(ev.ap, fmt);
-      pushed = ring_queue_push_vfmt(&ctx->ring_queue, fmt, ev.ap, file, level, line,
-                                    ev.timestamp, ctx->queue_policy == LOG_QUEUE_BLOCK);
-      va_end(ev.ap);
-      if (!pushed) {
-        if (ctx->queue_policy == LOG_QUEUE_DROP) {
-          STAT_INC(queue_drops);
-        }
-        rwlock_read_unlock(&ctx->rwlock);
-        return;
-      }
-    } else
-#endif /* LOG_FEATURE_RING_QUEUE */
-    {
-      va_start(ev.ap, fmt);
-      log_queue_entry *entry = queue_entry_create(ctx, &ev);
-      va_end(ev.ap);
-      pushed = entry && queue_push(ctx, entry, ctx->queue_policy == LOG_QUEUE_BLOCK);
-      if (!pushed && entry) queue_entry_destroy(ctx, entry);
-    }
-
-    if (pushed) {
-      STAT_INC(async_writes);
-    } else {
-      if (ctx->queue_policy == LOG_QUEUE_DROP) {
-        STAT_INC(queue_drops);
-      } else {
-        /* FALLBACK_SYNC or BLOCK: write synchronously, no drop */
-        va_start(ev.ap, fmt);
-        char *pre_fmt_fb = NULL;
-        va_list args_copy_fb;
-        va_copy(args_copy_fb, ev.ap);
-        int pflen_fb = vsnprintf(NULL, 0, fmt, args_copy_fb);
-        va_end(args_copy_fb);
-        if (pflen_fb >= 0) {
-          pre_fmt_fb = malloc((size_t)pflen_fb + 1);
-          if (pre_fmt_fb) {
-            vsnprintf(pre_fmt_fb, (size_t)pflen_fb + 1, fmt, ev.ap);
-            ev.raw_msg = pre_fmt_fb;
-          }
-        }
-        for (int i = 0; i < ctx->handler_count; i++) {
-          if (ctx->handlers[i].active && ctx->handlers[i].fn && level >= ctx->handlers[i].level) {
-            ev.udata = ctx->handlers[i].udata;
-            ctx->handlers[i].fn(ctx, &ev);
-          }
-        }
-        free(pre_fmt_fb);
-        va_end(ev.ap);
-        STAT_INC(sync_writes);
-      }
-    }
+#if LOG_FEATURE_CRASH_MODE
+  /* Crash-safe mode never queues: messages must be in the kernel before
+   * log_log returns. */
+  bool async_path = ctx->async_enabled && !ctx->crash_safe;
 #else
-    (void)0;
-#endif /* LOG_FEATURE_ASYNC */
-  } else {
+  bool async_path = ctx->async_enabled;
+#endif
+
+  if (!async_path) {
     STAT_INC(sync_writes);
     va_start(ev.ap, fmt);
-    char *pre_fmt = NULL;
-    va_list args_copy;
-    va_copy(args_copy, ev.ap);
-    int pflen = vsnprintf(NULL, 0, fmt, args_copy);
-    va_end(args_copy);
-    if (pflen >= 0) {
-      pre_fmt = malloc((size_t)pflen + 1);
-      if (pre_fmt) {
-        vsnprintf(pre_fmt, (size_t)pflen + 1, fmt, ev.ap);
-        ev.raw_msg = pre_fmt;
-      }
-    }
-    for (int i = 0; i < ctx->handler_count; i++) {
-      if (ctx->handlers[i].active && ctx->handlers[i].fn && level >= ctx->handlers[i].level) {
-        ev.udata = ctx->handlers[i].udata;
-        ctx->handlers[i].fn(ctx, &ev);
-      }
-    }
-    free(pre_fmt);
+    sync_format_and_dispatch(ctx, &ev);
     va_end(ev.ap);
+    rwlock_read_unlock(&ctx->rwlock);
+    return;
   }
 
+#if LOG_FEATURE_ASYNC
+  /* Enqueue without holding the ctx rwlock. Holding the read lock across a
+   * blocking queue_push (LOG_QUEUE_BLOCK) deadlocks against a concurrent
+   * configuration change: the blocked producer holds the read lock forever,
+   * the writer thread's read lock is queued behind the pending write lock,
+   * so the queue is never drained and space_cond is never signalled. */
+  int queue_policy = ctx->queue_policy;
+#if LOG_FEATURE_RING_QUEUE
+  bool use_ring_queue = ctx->use_ring_queue;
+#endif
+  bool pushed = false;
   rwlock_read_unlock(&ctx->rwlock);
+
+#if LOG_FEATURE_RING_QUEUE
+  if (use_ring_queue) {
+    va_start(ev.ap, fmt);
+    pushed = ring_queue_push_vfmt(&ctx->ring_queue, fmt, ev.ap, file, level, line,
+                                  ev.timestamp, queue_policy == LOG_QUEUE_BLOCK);
+    va_end(ev.ap);
+  } else
+#endif /* LOG_FEATURE_RING_QUEUE */
+  {
+    va_start(ev.ap, fmt);
+    log_queue_entry *entry = queue_entry_create(ctx, &ev);
+    va_end(ev.ap);
+    pushed = entry && queue_push(ctx, entry, queue_policy == LOG_QUEUE_BLOCK);
+    if (!pushed && entry) queue_entry_destroy(ctx, entry);
+  }
+
+  if (pushed) {
+    STAT_INC(async_writes);
+  } else if (queue_policy == LOG_QUEUE_DROP) {
+    STAT_INC(queue_drops);
+  } else {
+    /* FALLBACK_SYNC or BLOCK: write synchronously, no drop. Re-acquire the
+     * read lock: dispatch touches handler state guarded by the rwlock. */
+    rwlock_read_lock(&ctx->rwlock);
+    va_start(ev.ap, fmt);
+    sync_format_and_dispatch(ctx, &ev);
+    va_end(ev.ap);
+    STAT_INC(sync_writes);
+    rwlock_read_unlock(&ctx->rwlock);
+  }
+#else
+  (void)0;
+  rwlock_read_unlock(&ctx->rwlock);
+#endif /* LOG_FEATURE_ASYNC */
 }
 
 #if LOG_FEATURE_FILE_OPS
@@ -1751,7 +2213,11 @@ void log_rotate(log_handle *ctx) {
     if (ctx->handlers[i].kind != HANDLER_FILE) continue;
     if (!ctx->handlers[i].fp) continue;
     if (ctx->handlers[i].fp == stderr || ctx->handlers[i].fp == stdout) continue;
-    fflush(ctx->handlers[i].fp);
+    if (ctx->handlers[i].flush_fsync) {
+      log_flush_fsync(ctx->handlers[i].fp);
+    } else {
+      fflush(ctx->handlers[i].fp);
+    }
     if (ctx->handlers[i].owns_file) {
       fclose(ctx->handlers[i].fp);
       ctx->handlers[i].fp = NULL;
@@ -1769,6 +2235,7 @@ void log_rotate(log_handle *ctx) {
 
     FILE *reopened = fopen(ctx->file_prefix, "a");
     if (reopened) {
+      log_setup_stream_buffer(reopened);
       ctx->handlers[i].fp = reopened;
       ctx->handlers[i].udata = reopened;
       ctx->handlers[i].file_size = 0;
@@ -1780,6 +2247,9 @@ void log_rotate(log_handle *ctx) {
       ctx->handlers[i].udata = NULL;
     }
   }
+#if LOG_FEATURE_CRASH_MODE
+  crash_refresh_targets(ctx);
+#endif
   rwlock_write_unlock(&ctx->rwlock);
 }
 #endif /* LOG_FEATURE_FILE_OPS */
@@ -1792,7 +2262,8 @@ int log_get_stats(log_handle *ctx, log_stats *stats) {
 
 #if LOG_FEATURE_JSON
 int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size) {
-  char *msg = format_message(ev);
+  bool heap_msg = false;
+  char *msg = format_message(ev, &heap_msg);
   if (!msg) return 0;
 
   char time_buf[64];
@@ -1800,7 +2271,7 @@ int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size) 
                    ctx && ctx->enable_ts_cache);
 
   char *escaped_msg = json_escape(msg);
-  free(msg);
+  if (heap_msg) free(msg);
   if (!escaped_msg) return 0;
 
   char *escaped_file = json_escape(ev->file ? ev->file : "");
@@ -1824,6 +2295,84 @@ void log_handler_set_level(log_handle *ctx, int handler_idx, int new_level) {
   ctx->handlers[handler_idx].level = new_level;
   rwlock_write_unlock(&ctx->rwlock);
 }
+
+int log_handler_set_flush(log_handle *ctx, int handler_idx, int policy, unsigned interval_ms) {
+  if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return -1;
+  if (policy != LOG_FLUSH_NEVER && policy != LOG_FLUSH_EVERY && policy != LOG_FLUSH_INTERVAL) {
+    return -1;
+  }
+  if (policy == LOG_FLUSH_INTERVAL && interval_ms == 0) return -1;
+
+  rwlock_write_lock(&ctx->rwlock);
+  ctx->handlers[handler_idx].flush_policy = policy;
+  ctx->handlers[handler_idx].flush_interval_ms = interval_ms;
+  ctx->handlers[handler_idx].last_flush = 0.0;
+  rwlock_write_unlock(&ctx->rwlock);
+  return 0;
+}
+
+int log_handler_set_fsync(log_handle *ctx, int handler_idx, bool enable) {
+  if (!ctx || handler_idx < 0 || handler_idx >= ctx->handler_count) return -1;
+
+  rwlock_write_lock(&ctx->rwlock);
+  ctx->handlers[handler_idx].flush_fsync = enable;
+  rwlock_write_unlock(&ctx->rwlock);
+  return 0;
+}
+
+#if LOG_FEATURE_CRASH_MODE
+int log_set_crash_safe(log_handle *ctx, bool enable) {
+  if (!ctx) return -1;
+  if (!enable) {
+    /* Only clears the flag: flush policies stay whatever they are now. */
+    rwlock_write_lock(&ctx->rwlock);
+    ctx->crash_safe = false;
+    rwlock_write_unlock(&ctx->rwlock);
+    return 0;
+  }
+  /* Crash-safe mode requires the synchronous path: drain a running writer. */
+  if (ctx->async_enabled) {
+    if (log_set_async(ctx, false) != 0) return -1;
+  }
+  rwlock_write_lock(&ctx->rwlock);
+  ctx->crash_safe = true;
+  /* Per-line flush on every file-backed handler: everything written before
+   * a fatal signal has already reached the kernel. */
+  for (int i = 0; i < ctx->handler_count; i++) {
+    if (ctx->handlers[i].fp) {
+      ctx->handlers[i].flush_policy = LOG_FLUSH_EVERY;
+    }
+  }
+  rwlock_write_unlock(&ctx->rwlock);
+  return 0;
+}
+
+int log_install_crash_handler(log_handle *ctx) {
+#if defined(LOG_PLATFORM_POSIX)
+  if (!ctx) return -1;
+  crash_refresh_targets(ctx);
+
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = crash_signal_handler;
+  sigemptyset(&sa.sa_mask);
+  /* SA_RESETHAND: the disposition is back to SIG_DFL while the handler
+   * runs, so a nested fault kills the process instead of recursing. */
+  sa.sa_flags = SA_RESETHAND;
+  static const int crash_sigs[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE };
+  bool ok = true;
+  for (size_t i = 0; i < sizeof(crash_sigs) / sizeof(crash_sigs[0]); i++) {
+    if (sigaction(crash_sigs[i], &sa, NULL) != 0) {
+      ok = false;
+    }
+  }
+  return ok ? 0 : -1;
+#else
+  (void)ctx;
+  return -1;  /* fatal-signal markers are POSIX-only */
+#endif
+}
+#endif /* LOG_FEATURE_CRASH_MODE */
 
 void log_handler_set_formatter(log_handle *ctx, int handler_idx, log_FormatFn new_fn) {
   rwlock_write_lock(&ctx->rwlock);
@@ -1907,7 +2456,8 @@ static void syslog_handler(log_handle *ctx, log_event *ev) {
 
   int priority = LOG_USER | log_level_to_syslog(ev->level);
 
-  char *msg = format_message(ev);
+  bool heap_msg = false;
+  char *msg = format_message(ev, &heap_msg);
   if (!msg) return;
 
   if (ctx->handlers && ctx->handler_count > 0) {
@@ -1918,14 +2468,14 @@ static void syslog_handler(log_handle *ctx, log_event *ev) {
                 LOG_GET_THREAD_ID(),
                 ev->file ? ev->file : "", ev->line, msg);
         syslog(priority, "%s", full_msg);
-        free(msg);
+        if (heap_msg) free(msg);
         return;
       }
     }
   }
 
   syslog(priority, "%s:%d: %s", ev->file ? ev->file : "", ev->line, msg);
-  free(msg);
+  if (heap_msg) free(msg);
 }
 
 int log_add_syslog_handler(log_handle *ctx, const char *ident, int facility, int level) {

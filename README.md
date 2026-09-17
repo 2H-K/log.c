@@ -1,14 +1,17 @@
 # Enhanced C Log Library - Cross Platform
 
-A simple, powerful, and thread-safe logging library implemented in C17 with full cross-platform support.
+A simple, powerful, and thread-safe logging library implemented in C11 with full cross-platform support.
 
 ![screenshot](https://cloud.githubusercontent.com/assets/3920290/23831970/a2415e96-0723-11e7-9886-f8f5d2de60fe.png)
 
 ## 🚀 Features
 
 - **Cross-Platform Support**: Windows (MSVC/MinGW-w64) & Linux/macOS (GCC/Clang)
-- **Thread-Safe**: Reader-writer locks for concurrent access
-- **Async Logging**: Lock-free ring buffer queue with dedicated writer thread
+- **Thread-Safe**: Reader-writer locks for configuration and concurrent access
+- **Async Logging**: Mutex + condvar protected ring buffer queue with dedicated writer thread (for decoupling, not throughput)
+- **Crash Safety**: `log_set_crash_safe` flushes every line; `log_install_crash_handler` writes a marker on fatal signals (POSIX)
+- **Durability Policies**: Per-handler NEVER / EVERY / INTERVAL flush with an independent fsync switch
+- **Static Zero-Allocation**: `-DLOG_STATIC_ALLOC` + `log_create_static`, zero heap allocations on the hot path
 - **Log Rotation**: Automatic file rotation by size (up to 5 rotated files)
 - **Structured Logging**: JSON format support
 - **Thread ID Tracking**: Optional thread ID in output
@@ -21,14 +24,26 @@ A simple, powerful, and thread-safe logging library implemented in C17 with full
 
 ## 📊 Performance
 
-Benchmark results (Linux, GCC -O2):
+Measured numbers (2026-09, Linux x86_64, GCC -O2, `taskset -c 2` core pinning, sink /dev/null, message `"bench msg %d"`):
 
 | Mode | Throughput | Latency |
 |------|-----------|---------|
-| Sync (single-thread) | ~1,300,000 msg/s | ~0.7 us/msg |
-| Sync (8 threads) | ~3,400,000 msg/s | — |
-| Async (single-thread) | ~5,700,000 msg/s | ~0.2 us/msg |
-| Async (8 threads) | ~4,000,000 msg/s | — |
+| Sync (single-thread) | ~3,500,000 msg/s | ~0.29 us/msg |
+| Sync (8 threads) | ~3,500,000 msg/s | — |
+| Async (single-thread) | ~2,100,000 msg/s | ~0.49 us/msg |
+| Async (8 threads) | ~3,400,000 msg/s | — |
+
+Reproduce with:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+taskset -c 2 ./build/test_perf
+```
+
+Measurement notes:
+
+- Numbers are **end-to-end delivery**: when the queue is full, messages are written synchronously per the FALLBACK_SYNC policy — nothing is dropped. Historical versions silently dropped overflowing messages, so the old ~5,700,000 msg/s figure was fake throughput and is not comparable.
+- The value of async mode is **decoupling** (producers are never blocked by a slow sink, with DROP/BLOCK/FALLBACK_SYNC full-queue policies), not throughput.
 
 ## 📦 Quick Start
 
@@ -202,20 +217,21 @@ Color output is enabled by default and uses ANSI escape codes:
 
 ## 🔧 Compile-Time Feature Flags
 
-Disable optional features to reduce binary size:
+Disable optional features to reduce binary size (savings are measured .text deltas: `gcc -std=c11 -O2 -c src/log.c` + `size`, 2026-09; varies slightly by compiler/arch):
 
 | Flag | Description | Savings |
 |------|-------------|---------|
-| `LOG_DISABLE_JSON` | Disable JSON formatting | ~2 KB |
-| `LOG_DISABLE_SYSLOG` | Disable Syslog support | ~1 KB |
-| `LOG_DISABLE_ASYNC` | Disable async logging | ~3 KB |
-| `LOG_DISABLE_MPOOL` | Disable memory pool | ~1 KB |
-| `LOG_DISABLE_RING_QUEUE` | Disable ring buffer queue | ~2 KB |
-| `LOG_DISABLE_STATS` | Disable performance stats | ~0.5 KB |
-| `LOG_DISABLE_FILE_OPS` | Disable file operations | ~3 KB |
-| `LOG_DISABLE_THREAD_ID` | Disable thread ID | ~0.3 KB |
-| `LOG_DISABLE_TS_CACHE` | Disable timestamp cache | ~0.2 KB |
-| `LOG_MINIMAL` | Disable all optional features | ~13 KB |
+| `LOG_DISABLE_JSON` | Disable JSON formatting | ~2.4 KB |
+| `LOG_DISABLE_SYSLOG` | Disable Syslog support | ~1.3 KB |
+| `LOG_DISABLE_ASYNC` | Disable async logging | ~5.8 KB |
+| `LOG_DISABLE_MPOOL` | Disable memory pool | ~1.5 KB |
+| `LOG_DISABLE_RING_QUEUE` | Disable ring buffer queue | ~2.9 KB |
+| `LOG_DISABLE_STATS` | Disable performance stats | ~0.4 KB |
+| `LOG_DISABLE_FILE_OPS` | Disable file operations | ~2.2 KB |
+| `LOG_DISABLE_THREAD_ID` | Disable thread ID | ~0.15 KB |
+| `LOG_DISABLE_TS_CACHE` | Disable timestamp cache | ~0.6 KB |
+| `LOG_DISABLE_CRASH_MODE` | Disable crash-safe mode | ~1.3 KB |
+| `LOG_MINIMAL` | Disable all optional features | ~13.5 KB |
 
 ## 📋 Core Features
 
@@ -435,9 +451,9 @@ typedef struct log_stats {
 
 All public APIs are thread-safe:
 
-- **Reader-Writer Locks**: Protects configuration changes
-- **Lock-Free Ring Buffer**: For async logging (SPSC pattern)
-- **Atomic Operations**: For statistics counters
+- **Reader-Writer Locks**: Protect configuration changes (pthread_rwlock / SRWLOCK)
+- **Ring Buffer Queue**: For async logging — mutex + condvar protected, multi-producer single-consumer, batch-drained by the writer thread
+- **Thread-Local Statistics**: One counter set per thread, contention-free, read via snapshot
 - **Safe from Multiple Threads**: Can be called concurrently
 
 ## 📝 Examples
@@ -456,15 +472,16 @@ See [tests/example.c](tests/example.c) for comprehensive examples:
 
 ## 🧪 Testing
 
-The project includes 101 tests across 6 categories:
+The project includes 120 tests across 6 categories (actual counts as reported by each test runner; static_alloc only builds on Linux with GNU ld):
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| core | 22 | Levels, handlers, format, null safety, stats, boundary |
-| thread | 8 | Multi-threaded sync/async, config races |
-| platform | 8 | Syslog, rotation, unicode paths |
-| stress | 33 | Queue full, long messages, integrity, crash safety |
-| perf | 12 | Throughput and latency benchmarks |
+| core | 48 | Levels, handlers, format, null safety, stats, boundary |
+| thread | 7 | Multi-threaded sync/async, config races |
+| platform | 25 | Syslog, rotation, unicode paths, flush policies, crash safety |
+| stress | 28 | Queue full, long messages, integrity, crash safety, resources |
+| perf | 7 | Throughput and latency benchmarks |
+| static_alloc | 5 | Static zero-allocation mode (real counting via `--wrap=malloc`) |
 
 ### Run Tests
 
@@ -525,7 +542,7 @@ MIT License - See [LICENSE](LICENSE) for details.
   - Added cross-platform support (Windows/Linux/macOS)
   - Added CMake build system
   - Added colored output support
-  - Enhanced async logging with lock-free ring buffer queue
+  - Enhanced async logging (ring buffer queue + dedicated writer thread)
   - Added JSON format support
   - Added thread ID tracking
   - Added syslog integration
@@ -547,7 +564,7 @@ Enhanced with cross-platform support and additional features in 2026.
 
 Contributions are welcome! Please ensure:
 
-1. Code follows C17 standard
+1. Code follows C11 standard
 2. All functions are documented
 3. Tests pass
 4. Thread safety is maintained

@@ -94,6 +94,13 @@ static void test_memory_baseline(void) {
 }
 
 static void test_memory_stability(void) {
+#if defined(__SANITIZE_ADDRESS__)
+    /* ASan's quarantine retains freed chunks (10K x 2.6MB ring buffers of
+     * churn), so RSS deltas are meaningless under sanitizers. Real leak
+     * detection happens via LeakSanitizer, which runs alongside. */
+    TEST_SKIP("RSS-based leak check is meaningless under AddressSanitizer");
+    return;
+#endif
     long rss_before = get_kb_rss();
     if (rss_before < 0) { TEST_SKIP("RSS unavailable (no /proc)"); return; }
 

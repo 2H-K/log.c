@@ -39,6 +39,15 @@ endif
 SRC_DIR   = src
 TEST_DIR  = tests
 
+# ----- Real malloc counting (GNU ld --wrap, Linux only) -----
+ifneq ($(IS_WIN),1)
+  ifeq ($(shell uname 2>/dev/null),Linux)
+    MALLOC_WRAP_DEFS  = -DLOG_TEST_WRAP_MALLOC
+    MALLOC_WRAP_LD    = -Wl,--wrap=malloc
+    STATIC_WRAP_LD    = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc
+  endif
+endif
+
 # ----- Library -----
 .PHONY: all lib clean run-tests
 
@@ -62,7 +71,7 @@ test_platform$(TEST_EXT): $(TEST_DIR)/platform.c $(wildcard $(TEST_DIR)/platform
 	$(CC) $(CFLAGS) -o $@ $(TEST_DIR)/platform.c $(SRC_DIR)/log.c $(LDFLAGS)
 
 test_stress$(TEST_EXT): $(TEST_DIR)/stress.c $(wildcard $(TEST_DIR)/stress/*.c) $(SRC_DIR)/log.c $(SRC_DIR)/log.h
-	$(CC) $(CFLAGS) -o $@ $(TEST_DIR)/stress.c $(SRC_DIR)/log.c $(LDFLAGS)
+	$(CC) $(CFLAGS) $(MALLOC_WRAP_DEFS) -o $@ $(TEST_DIR)/stress.c $(SRC_DIR)/log.c $(MALLOC_WRAP_LD) $(LDFLAGS)
 
 test_perf$(TEST_EXT): $(TEST_DIR)/perf.c $(wildcard $(TEST_DIR)/perf/*.c) $(SRC_DIR)/log.c $(SRC_DIR)/log.h
 	$(CC) $(CFLAGS) -o $@ $(TEST_DIR)/perf.c $(SRC_DIR)/log.c $(LDFLAGS)
@@ -70,8 +79,17 @@ test_perf$(TEST_EXT): $(TEST_DIR)/perf.c $(wildcard $(TEST_DIR)/perf/*.c) $(SRC_
 test_all$(TEST_EXT): $(TEST_DIR)/all.c $(wildcard $(TEST_DIR)/*/*.c) $(SRC_DIR)/log.c $(SRC_DIR)/log.h
 	$(CC) $(CFLAGS) -o $@ $(TEST_DIR)/all.c $(SRC_DIR)/log.c $(LDFLAGS)
 
+# Static-allocation mode tests (own binary: LOG_STATIC_ALLOC + wrapped
+# allocators). Only meaningful when MALLOC_WRAP_LD is set (Linux/GNU ld).
+test_static_alloc$(TEST_EXT): $(TEST_DIR)/static_alloc_main.c $(SRC_DIR)/log.c $(SRC_DIR)/log.h
+	$(CC) $(CFLAGS) -DLOG_STATIC_ALLOC -o $@ $(TEST_DIR)/static_alloc_main.c $(SRC_DIR)/log.c $(STATIC_WRAP_LD) $(LDFLAGS)
+
 # ----- Run all tests -----
-run-tests: test_core test_thread test_stress test_platform test_perf
+ifneq ($(STATIC_WRAP_LD),)
+RUN_TESTS_EXTRA = test_static_alloc
+endif
+
+run-tests: test_core test_thread test_stress test_platform test_perf $(RUN_TESTS_EXTRA)
 	@echo ""
 	@echo "=== Core Tests ==="
 	./test_core$(TEST_EXT)
@@ -87,6 +105,11 @@ run-tests: test_core test_thread test_stress test_platform test_perf
 	@echo ""
 	@echo "=== Performance Benchmarks ==="
 	./test_perf$(TEST_EXT)
+ifneq ($(STATIC_WRAP_LD),)
+	@echo ""
+	@echo "=== Static Alloc Tests ==="
+	./test_static_alloc$(TEST_EXT)
+endif
 
 run-all: test_all
 	@echo ""
