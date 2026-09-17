@@ -9,12 +9,15 @@ A simple, powerful, and thread-safe logging library implemented in C11 with full
 - **Cross-Platform Support**: Windows (MSVC/MinGW-w64) & Linux/macOS (GCC/Clang)
 - **Thread-Safe**: Reader-writer locks for configuration and concurrent access
 - **Async Logging**: Mutex + condvar protected ring buffer queue with dedicated writer thread (for decoupling, not throughput)
-- **Crash Safety**: `log_set_crash_safe` flushes every line; `log_install_crash_handler` writes a marker on fatal signals (POSIX)
+- **Crash Safety**: `log_set_crash_safe` flushes every line; `log_install_crash_handler` writes a marker and dumps the flight-recorder tail on fatal signals (POSIX)
 - **Lifecycle Safety**: `log_install_atfork` reinitializes locks in the child and downgrades async to sync after `fork()`; `log_install_atexit` flushes a still-async context on exit (POSIX)
 - **Durability Policies**: Per-handler NEVER / EVERY / INTERVAL flush with an independent fsync switch
 - **Static Zero-Allocation**: `-DLOG_STATIC_ALLOC` + `log_create_static`, zero heap allocations on the hot path
 - **Log Rotation**: Automatic file rotation by size (up to 5 rotated files)
 - **Structured Logging**: JSON format support; typed key-value metadata (`LOG_KV_*`) emitted as top-level JSON fields or a `key=value` text suffix
+- **In-Memory Flight Recorder**: `log_add_memory_handler` retains the last N lines; `log_dump_memory_handler` exports a consistent snapshot with no I/O
+- **Flood Control**: `log_set_rate_limit` per level and `log_set_dedupe` collapses repeats with a `last message repeated N times` summary; observable via `suppressed_count`
+- **Named Loggers**: `log_get("net")` / `log_named_set_level` give each module an independent level while sharing handlers
 - **Thread ID Tracking**: Optional thread ID in output
 - **Syslog Integration**: Native syslog support (POSIX only)
 - **Dynamic Configuration**: Runtime level/format changes
@@ -31,8 +34,33 @@ Measured numbers (2026-09, Linux x86_64, GCC -O2, `taskset -c 2` core pinning, s
 |------|-----------|---------|
 | Sync (single-thread) | ~3,400,000 msg/s | ~0.29 us/msg |
 | Sync (8 threads) | ~3,400,000 msg/s | — |
-| Async (single-thread) | ~2,000,000 msg/s | ~0.50 us/msg |
-| Async (8 threads) | ~3,300,000 msg/s | — |
+| Async (single-thread) | ~1,900,000 msg/s | ~0.53 us/msg |
+| Async (8 threads) | ~3,200,000 msg/s | — |
+
+Durability tiers (sync path, per-handler flush policy; see `log_handler_set_flush`):
+
+| Tier | Throughput | Latency |
+|------|-----------|---------|
+| `buffered` (`LOG_FLUSH_NEVER`) | ~2,460,000 msg/s | ~0.41 us/msg |
+| `flushed` (`LOG_FLUSH_EVERY`) | ~519,000 msg/s | ~1.92 us/msg |
+| `fsynced` (`LOG_FLUSH_EVERY` + `log_handler_set_fsync`) | ~2,009 msg/s | ~497 us/msg |
+
+Crash-loss promise per tier (child `_exit()` with no stdio flush; verified by
+`tests/platform/test_flush.c`): `EVERY` loses nothing, `NEVER` may lose the
+buffered tail, and `INTERVAL(n)` withholds at most `n` ms — its buffer is
+flushed on the first write after the window elapses.
+
+Producer tail latency under overload (async, 256-slot queue, 50 us slow sink,
+`LOG_QUEUE_DROP`): **p50 0.04 us, p99 ~0.1 us**, worst scheduler spike < 0.1 ms
+across runs. The caller never touches the slow sink, so its pauses stay bounded.
+
+Queue-policy overload observations (async, 16-slot queue, 50 us slow sink):
+
+| Policy | `queue_drops` | `queue_blocked` | `sync_writes` | Outcome |
+|--------|--------------|-----------------|---------------|---------|
+| `LOG_QUEUE_DROP` | yes | 0 | 0 | excess dropped, caller never blocks |
+| `LOG_QUEUE_FALLBACK_SYNC` | 0 | 0 | > 0 | overflow written on the caller thread |
+| `LOG_QUEUE_BLOCK` | 0 | > 0 | 0 | caller waits for queue space |
 
 Reproduce with:
 
@@ -54,7 +82,7 @@ dependencies, and small enough to embed anywhere.
 
 **It does:** level filtering, text/JSON formatting, custom formatters and handlers,
 async decoupling via a writer thread, file rotation, syslog, flush/fsync policies,
-crash-safe marker output, and a static zero-allocation mode.
+crash-safe marker output and flight-recorder tail dump, and a static zero-allocation mode.
 
 **It does not (by design):** at-least-once delivery, on-disk spooling or offset
 tracking, network/TLS transport, cross-process aggregation, or storage of large
@@ -290,18 +318,21 @@ Disable optional features to reduce binary size (savings are measured .text delt
 | Flag | Description | Savings |
 |------|-------------|---------|
 | `LOG_DISABLE_JSON` | Disable JSON formatting | ~4.7 KB |
-| `LOG_DISABLE_SYSLOG` | Disable Syslog support | ~1.3 KB |
-| `LOG_DISABLE_ASYNC` | Disable async logging | ~8.0 KB |
+| `LOG_DISABLE_SYSLOG` | Disable Syslog support | ~1.4 KB |
+| `LOG_DISABLE_ASYNC` | Disable async logging | ~9.5 KB |
 | `LOG_DISABLE_MPOOL` | Disable memory pool | ~1.8 KB |
-| `LOG_DISABLE_RING_QUEUE` | Disable ring buffer queue | ~3.7 KB |
-| `LOG_DISABLE_STATS` | Disable performance stats | ~1.9 KB |
+| `LOG_DISABLE_RING_QUEUE` | Disable ring buffer queue | ~4.2 KB |
+| `LOG_DISABLE_STATS` | Disable performance stats | ~2.0 KB |
 | `LOG_DISABLE_FILE_OPS` | Disable file operations | ~2.2 KB |
 | `LOG_DISABLE_THREAD_ID` | Disable thread ID | ~0.15 KB |
 | `LOG_DISABLE_TS_CACHE` | Disable timestamp cache | ~0.6 KB |
-| `LOG_DISABLE_CRASH_MODE` | Disable crash-safe mode | ~1.3 KB |
-| `LOG_DISABLE_KV` | Disable key-value metadata | ~6.3 KB |
+| `LOG_DISABLE_CRASH_MODE` | Disable crash-safe mode | ~2.0 KB |
+| `LOG_DISABLE_KV` | Disable key-value metadata | ~6.0 KB |
 | `LOG_DISABLE_LIFECYCLE` | Disable fork/exit lifecycle safety | ~1.7 KB |
-| `LOG_MINIMAL` | Disable all optional features | ~23.3 KB |
+| `LOG_DISABLE_MEMORY_HANDLER` | Disable the in-memory flight recorder | ~2.3 KB |
+| `LOG_DISABLE_FILTER` | Disable rate limiting & dedupe | ~4.4 KB |
+| `LOG_DISABLE_NAMED` | Disable named loggers | ~1.6 KB |
+| `LOG_MINIMAL` | Disable all optional features | ~31.9 KB |
 
 ### Static-mode footprint
 
@@ -312,8 +343,8 @@ be a power of two):
 | Build | `sizeof(log_handle)` |
 |-------|----------------------|
 | `LOG_STATIC_ALLOC`, `LOG_RING_CAPACITY=4096` (default) | ~3.61 MiB |
-| `LOG_STATIC_ALLOC`, `LOG_RING_CAPACITY=256` | ~246 KiB |
-| `LOG_STATIC_ALLOC` + `LOG_MINIMAL`, `LOG_RING_CAPACITY=256` | ~4 KiB |
+| `LOG_STATIC_ALLOC`, `LOG_RING_CAPACITY=256` | ~247 KiB |
+| `LOG_STATIC_ALLOC` + `LOG_MINIMAL`, `LOG_RING_CAPACITY=256` | ~3.8 KiB |
 
 Pick the smallest capacity that absorbs your burst; the default favors throughput
 over footprint. With KV enabled each ring slot also embeds `LOG_KV_INLINE_MAX`
@@ -543,6 +574,79 @@ log_install_atexit(ctx);
 - Pending async entries at the instant of `fork()` are abandoned in the child
   rather than duplicated.
 
+### 9. In-Memory Flight Recorder
+
+A memory-only handler that retains the most recent N formatted lines with no
+I/O, stays completely silent in normal operation, and is dumped when you need
+to investigate or after a crash:
+
+```c
+int idx = log_add_memory_handler(ctx, 256, LOG_WARN);  /* keep last 256 >= WARN */
+/* ... run ... */
+log_dump_memory_handler(ctx, idx, stderr);             /* oldest -> newest */
+```
+
+- Each record is a fully rendered line (prefix + message + KV, including the
+  trailing `\n`). Oversized lines are truncated to `LOG_MEMORY_LINE_MAX` and
+  counted in `truncated_count`.
+- `lines` is clamped to the compile-time cap `LOG_MEMORY_MAX_LINES`;
+  `lines <= 0` returns `-1`.
+- The dump is a consistent snapshot taken under the context read lock and the
+  per-handler store lock, so it never tears or reorders against concurrent
+  writers.
+- Entries are POD (no pointers). This is wired to A2 crash-safe mode:
+  `log_install_crash_handler` `write(2)`s the last N lines directly from the
+  fatal-signal handler (after the `==== log: flight recorder tail ====` header).
+- Storage is allocated per handler on `log_add_memory_handler()`; contexts that
+  never use it pay nothing.
+- Trim with `LOG_DISABLE_MEMORY_HANDLER` (or `LOG_MINIMAL`); available on both
+  Windows and POSIX.
+
+### 10. Rate Limiting & Duplicate Suppression
+
+Keep a repeated error from flooding the log. Both rules are configured per
+level and applied **before** enqueueing, so a storm never fills the async queue:
+
+```c
+log_set_rate_limit(ctx, LOG_ERROR, 10);  /* at most 10 errors per second */
+log_set_dedupe(ctx, LOG_WARN, 1000);     /* collapse repeats within 1s */
+/* ... */
+log_flush_suppressed(ctx);               /* emit pending summaries now */
+```
+
+- Rate limiting uses a one-second fixed window per level; the first
+  `max_per_sec` messages pass, the rest are suppressed until the window resets.
+- Dedupe hashes the rendered message (plus KV fields) and suppresses repeats,
+  emitting `last message repeated N times` when the window expires or a
+  different message arrives.
+- Suppressed messages are reported in `log_stats.suppressed_count`; each level
+  keeps independent state. `log_destroy` flushes pending summaries.
+- Trim with `LOG_DISABLE_FILTER` (or `LOG_MINIMAL`).
+
+### 11. Named Loggers
+
+Give each module its own level switch while sharing the same handlers:
+
+```c
+log_handle *net = log_get("net");
+log_handle *db  = log_get("db");
+log_named_set_level("net", LOG_DEBUG);   /* chatty module */
+log_named_set_level("db",  LOG_ERROR);   /* quiet module */
+
+log_ctx_debug(net, "connection accepted");   /* emitted */
+log_ctx_warn(db, "slow query");              /* filtered */
+```
+
+- `log_get()` creates the logger on first use (once, even under concurrent
+  calls) and returns an alias attached to the default context: handlers are
+  shared, levels are independent. A named logger is **not** re-filtered by the
+  default context's level.
+- The registry is a fixed flat table of `LOG_NAMED_MAX` (16) slots; names are
+  at most 15 bytes. Invalid/overlong names or a full registry return the
+  default context and log a warning (never fail or crash).
+- Aliases live until the default context is destroyed. Trim with
+  `LOG_DISABLE_NAMED` (or `LOG_MINIMAL`).
+
 ## 🔧 API Reference
 
 For complete API documentation, see [API.md](API.md).
@@ -566,6 +670,11 @@ int log_set_async(log_handle *ctx, bool enable);
 void log_set_queue_policy(log_handle *ctx, int policy);
 void log_set_max_file_size(log_handle *ctx, size_t size);
 void log_set_file_prefix(log_handle *ctx, const char *prefix);
+void log_set_rate_limit(log_handle *ctx, int level, unsigned max_per_sec);
+void log_set_dedupe(log_handle *ctx, int level, unsigned window_ms);
+void log_flush_suppressed(log_handle *ctx);
+log_handle* log_get(const char *name);
+void log_named_set_level(const char *name, int level);
 ```
 
 ### Handler Management
@@ -574,6 +683,8 @@ void log_set_file_prefix(log_handle *ctx, const char *prefix);
 int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level);
 int log_add_fp(log_handle *ctx, FILE *fp, int level);
 int log_add_file(log_handle *ctx, const char *filename, int level);
+int log_add_memory_handler(log_handle *ctx, int lines, int level);
+void log_dump_memory_handler(log_handle *ctx, int handler_idx, FILE *out);
 void log_remove_handler(log_handle *ctx, int idx);
 void log_handler_set_level(log_handle *ctx, int handler_idx, int new_level);
 ```
@@ -590,6 +701,8 @@ typedef struct log_stats {
     double avg_queue_latency_ms;        // Mean async enqueue->dequeue latency (ms)
     uint64_t async_writes;             // Async write count
     uint64_t sync_writes;              // Sync write count
+    uint64_t truncated_count;          // Messages / KV pairs dropped by size limits
+    uint64_t suppressed_count;         // Messages dropped by rate limit / dedupe
 } log_stats;
 ```
 
@@ -622,16 +735,16 @@ See [tests/example.c](tests/example.c) for comprehensive examples:
 
 ## 🧪 Testing
 
-The project includes 137 tests across 6 categories (actual counts as reported by each test runner; static_alloc only builds on Linux with GNU ld):
+The project includes 170 tests across 6 categories (actual counts as reported by each test runner; static_alloc only builds on Linux with GNU ld):
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| core | 59 | Levels, handlers, format, null safety, stats, key-value metadata, boundary, OOB level |
-| thread | 10 | Multi-threaded sync/async, config races, stats aggregation |
-| platform | 28 | Syslog, rotation, unicode paths, flush policies, crash safety, fork/exit lifecycle |
+| core | 79 | Levels, handlers, format, null safety, stats, key-value metadata, boundary, OOB level, flight recorder, rate limit / dedupe, named loggers |
+| thread | 15 | Multi-threaded sync/async, config races, stats aggregation, concurrent flight-recorder dump, filter and named-logger concurrency |
+| platform | 32 | Syslog, rotation, unicode paths, flush policies, crash loss per durability tier, crash safety (incl. tail dump), fork/exit lifecycle |
 | stress | 28 | Queue full, long messages, integrity, crash safety, resources |
-| perf | 7 | Throughput and latency benchmarks |
-| static_alloc | 5 | Static zero-allocation mode (real counting via `--wrap=malloc`) |
+| perf | 10 | Throughput, durability tiers, tail latency, and queue-policy overload matrix |
+| static_alloc | 6 | Static zero-allocation mode (real counting via `--wrap=malloc`), incl. filter path |
 
 ### Run Tests
 

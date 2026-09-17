@@ -11,10 +11,24 @@
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>
 #include <time.h>
+#include <sys/wait.h>
 
 static void msleep(int ms) {
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
+}
+
+/* Count occurrences of a marker in a file (A4 crash-loss tests). */
+static long flush_count_marker(const char *path, const char *marker) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[512];
+    long n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, marker)) n++;
+    }
+    fclose(f);
+    return n;
 }
 
 /* Read the whole file into a heap buffer (caller frees). */
@@ -254,6 +268,98 @@ static void test_flush_rotation_with_fsync(void) {
     TEST_PASS("flush rotation with fsync");
 }
 
+/* ==================== A4: crash loss promises per policy ====================
+ * A child process logs, then _exit()s WITHOUT any stdio flush or log_destroy,
+ * so only the configured flush policy decides what survives. */
+
+#if !defined(_WIN32) && !defined(_WIN64)
+static void test_flush_crash_loss_every(void) {
+    const char *path = "/tmp/test_flush_loss_every.log";
+    remove(path);
+    const int n = 200;
+
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        log_handle *ctx = log_create();
+        int idx = log_add_file(ctx, path, LOG_INFO);
+        if (idx < 0) _exit(43);
+        ctx->handlers[0].active = false;
+        if (log_handler_set_flush(ctx, idx, LOG_FLUSH_EVERY, 0) != 0) _exit(44);
+        for (int i = 0; i < n; i++) log_ctx_info(ctx, "every-line %d", i);
+        _exit(0);
+    }
+
+    int status = 0;
+    TEST_ASSERT_EQ(waitpid(pid, &status, 0), pid, "waitpid");
+    TEST_ASSERT(WIFEXITED(status), "child exited");
+
+    long lines = flush_count_marker(path, "every-line");
+    TEST_ASSERT_EQ(lines, n, "EVERY loses no lines on abrupt exit");
+    remove(path);
+    TEST_PASS("flush crash loss (EVERY = 0 lost)");
+}
+
+static void test_flush_crash_loss_never(void) {
+    const char *path = "/tmp/test_flush_loss_never.log";
+    remove(path);
+    const int n = 50000;
+
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        log_handle *ctx = log_create();
+        int idx = log_add_file(ctx, path, LOG_INFO);
+        if (idx < 0) _exit(43);
+        ctx->handlers[0].active = false;
+        /* default policy is NEVER */
+        for (int i = 0; i < n; i++) log_ctx_info(ctx, "never-line %d", i);
+        _exit(0);
+    }
+
+    int status = 0;
+    TEST_ASSERT_EQ(waitpid(pid, &status, 0), pid, "waitpid");
+    TEST_ASSERT(WIFEXITED(status), "child exited");
+
+    long lines = flush_count_marker(path, "never-line");
+    TEST_ASSERT(lines > 0, "some buffered lines reached the kernel");
+    TEST_ASSERT(lines < n, "NEVER may lose buffered lines on abrupt exit");
+    remove(path);
+    TEST_PASS("flush crash loss (NEVER may lose)");
+}
+
+static void test_flush_crash_loss_interval(void) {
+    const char *path = "/tmp/test_flush_loss_interval.log";
+    remove(path);
+    const int n = 200;
+
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        log_handle *ctx = log_create();
+        int idx = log_add_file(ctx, path, LOG_INFO);
+        if (idx < 0) _exit(43);
+        ctx->handlers[0].active = false;
+        if (log_handler_set_flush(ctx, idx, LOG_FLUSH_INTERVAL, 50) != 0) _exit(44);
+        for (int i = 0; i < n; i++) log_ctx_info(ctx, "interval-line %d", i);
+        /* Let the interval elapse; the next write flushes everything. */
+        msleep(80);
+        log_ctx_info(ctx, "interval-line final");
+        _exit(0);
+    }
+
+    int status = 0;
+    TEST_ASSERT_EQ(waitpid(pid, &status, 0), pid, "waitpid");
+    TEST_ASSERT(WIFEXITED(status), "child exited");
+
+    long lines = flush_count_marker(path, "interval-line");
+    TEST_ASSERT_EQ(lines, n + 1,
+                   "INTERVAL flushes everything once the window elapses");
+    remove(path);
+    TEST_PASS("flush crash loss (INTERVAL flushes on tick)");
+}
+#endif /* POSIX */
+
 void test_flush_register(void) {
     test_add(test_flush_every_visible_without_close, "flush_every_visible");
     test_add(test_flush_default_buffers, "flush_default_buffers");
@@ -262,4 +368,9 @@ void test_flush_register(void) {
     test_add(test_flush_fsync_roundtrip, "flush_fsync_roundtrip");
     test_add(test_flush_invalid_args, "flush_invalid_args");
     test_add(test_flush_rotation_with_fsync, "flush_rotation_with_fsync");
+#if !defined(_WIN32) && !defined(_WIN64)
+    test_add(test_flush_crash_loss_every, "flush_crash_loss_every");
+    test_add(test_flush_crash_loss_never, "flush_crash_loss_never");
+    test_add(test_flush_crash_loss_interval, "flush_crash_loss_interval");
+#endif
 }

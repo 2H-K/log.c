@@ -12,7 +12,7 @@
 #include "test_harness.h"
 #include "log.h"
 
-#if !defined(_WIN32) && !defined(_WIN64)
+#if !defined(_WIN32) && !defined(_WIN64) && LOG_FEATURE_CRASH_MODE
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -21,6 +21,7 @@
 
 #define CRASH_LOG_A "/tmp/test_crash_safe.log"
 #define CRASH_LOG_B "/tmp/test_crash_marker.log"
+#define CRASH_LOG_C "/tmp/test_crash_memory.log"
 
 static char *read_file_all(const char *path) {
     FILE *f = fopen(path, "r");
@@ -108,6 +109,51 @@ static void test_crash_marker_on_fatal_signal(void) {
     TEST_PASS("crash marker on fatal signal");
 }
 
+#if LOG_FEATURE_MEMORY_HANDLER
+/* Child body: crash-safe handler + a memory flight recorder, then SIGSEGV.
+ * The signal handler must write(2) the retained tail even though the stdio
+ * buffer holding the live lines is lost with the process. */
+static void test_crash_dumps_memory_tail(void) {
+    remove(CRASH_LOG_C);
+
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        log_handle *ctx = log_create();
+        int fidx = log_add_file(ctx, CRASH_LOG_C, LOG_TRACE);
+        if (fidx < 0) _exit(43);
+        ctx->handlers[0].active = false;   /* silence stderr handler */
+        int midx = log_add_memory_handler(ctx, 8, LOG_TRACE);
+        if (midx < 0) _exit(44);
+        if (log_install_crash_handler(ctx) != 0) _exit(45);
+        for (int i = 0; i < 20; i++) {
+            log_ctx_info(ctx, "tail-%d", i);
+        }
+        raise(SIGSEGV);
+        _exit(46);   /* not reached */
+    }
+
+    int status = 0;
+    TEST_ASSERT_EQ(waitpid(pid, &status, 0), pid, "waitpid");
+    TEST_ASSERT(WIFSIGNALED(status), "child died from a signal");
+
+    char *content = read_file_all(CRASH_LOG_C);
+    TEST_ASSERT_NOT_NULL(content, "log file readable");
+    TEST_ASSERT(strstr(content, "fatal signal") != NULL, "crash marker present");
+    TEST_ASSERT(strstr(content, "flight recorder tail") != NULL, "tail header present");
+    TEST_ASSERT(strstr(content, "tail-19\n") != NULL, "newest retained line dumped");
+    TEST_ASSERT(strstr(content, "tail-12\n") != NULL, "oldest retained line dumped");
+    TEST_ASSERT(strstr(content, "tail-11\n") == NULL, "evicted line absent");
+    int count = 0;
+    for (const char *p = content; (p = strstr(p, "tail-")) != NULL; p++) count++;
+    TEST_ASSERT_EQ(count, 8, "exactly capacity lines dumped");
+    free(content);
+
+    remove(CRASH_LOG_C);
+    TEST_PASS("crash dumps memory tail");
+}
+#endif /* LOG_FEATURE_MEMORY_HANDLER */
+
 static void test_crash_safe_blocks_async(void) {
     log_handle *ctx = log_create();
     TEST_ASSERT_EQ(log_set_crash_safe(ctx, true), 0, "enable crash safe");
@@ -159,15 +205,18 @@ static void test_crash_install_without_files(void) {
 void test_crash_register(void) {
     test_add(test_crash_safe_survives_exit, "crash_safe_survives_exit");
     test_add(test_crash_marker_on_fatal_signal, "crash_marker_on_fatal_signal");
+#if LOG_FEATURE_MEMORY_HANDLER
+    test_add(test_crash_dumps_memory_tail, "crash_dumps_memory_tail");
+#endif
     test_add(test_crash_safe_blocks_async, "crash_safe_blocks_async");
     test_add(test_crash_safe_enables_flush_policy, "crash_safe_enables_flush_policy");
     test_add(test_crash_install_without_files, "crash_install_without_files");
 }
 
-#else /* Windows: signals/fork unavailable */
+#else /* Windows, or LOG_FEATURE_CRASH_MODE disabled */
 
 static void test_crash_skip(void) {
-    TEST_SKIP("crash tests require fork/POSIX signals");
+    TEST_SKIP("crash tests require POSIX signals and LOG_FEATURE_CRASH_MODE");
 }
 
 void test_crash_register(void) {

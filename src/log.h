@@ -118,6 +118,18 @@
   #define LOG_RING_CAPACITY LOG_MAX_QUEUE_SIZE
 #endif
 
+/* In-memory flight recorder (B1). Each memory handler keeps its last N
+ * rendered lines. The requested line count is clamped to LOG_MEMORY_MAX_LINES
+ * and a stored line is truncated to LOG_MEMORY_LINE_MAX bytes. Storage is
+ * heap-allocated per handler at log_add_memory_handler() time, so contexts
+ * that never add one pay nothing. */
+#ifndef LOG_MEMORY_MAX_LINES
+  #define LOG_MEMORY_MAX_LINES 1024
+#endif
+#ifndef LOG_MEMORY_LINE_MAX
+  #define LOG_MEMORY_LINE_MAX 512
+#endif
+
 /* ======================================================================== */
 /* Compile-time feature flags                                               */
 /* Define these BEFORE including log.h to disable features                  */
@@ -159,6 +171,15 @@
   #endif
   #ifndef LOG_DISABLE_LIFECYCLE
     #define LOG_DISABLE_LIFECYCLE
+  #endif
+  #ifndef LOG_DISABLE_MEMORY_HANDLER
+    #define LOG_DISABLE_MEMORY_HANDLER
+  #endif
+  #ifndef LOG_DISABLE_FILTER
+    #define LOG_DISABLE_FILTER
+  #endif
+  #ifndef LOG_DISABLE_NAMED
+    #define LOG_DISABLE_NAMED
   #endif
 #endif
 
@@ -237,6 +258,39 @@
   #define LOG_FEATURE_LIFECYCLE 1
 #else
   #define LOG_FEATURE_LIFECYCLE 0
+#endif
+
+/* In-memory flight recorder handler (B1): keep the last N formatted lines in
+ * a ring and dump them on demand / from a fatal-signal handler. Auto-disabled
+ * by LOG_MINIMAL. */
+#ifndef LOG_DISABLE_MEMORY_HANDLER
+  #define LOG_FEATURE_MEMORY_HANDLER 1
+#else
+  #define LOG_FEATURE_MEMORY_HANDLER 0
+#endif
+
+/* Rate limiting & duplicate suppression (B3): keep log floods from
+ * amplifying an incident. Auto-disabled by LOG_MINIMAL. */
+#ifndef LOG_DISABLE_FILTER
+  #define LOG_FEATURE_FILTER 1
+#else
+  #define LOG_FEATURE_FILTER 0
+#endif
+
+/* Named loggers (B4): per-module level switches sharing the default context's
+ * handlers. Auto-disabled by LOG_MINIMAL. */
+#ifndef LOG_DISABLE_NAMED
+  #define LOG_FEATURE_NAMED 1
+#else
+  #define LOG_FEATURE_NAMED 0
+#endif
+
+/* Named-logger registry: fixed-size flat table with linear lookup. */
+#ifndef LOG_NAMED_MAX
+  #define LOG_NAMED_MAX 16
+#endif
+#ifndef LOG_NAMED_NAME_MAX
+  #define LOG_NAMED_NAME_MAX 16   /* 15 chars + NUL */
 #endif
 
 /* Crash-safe logging: per-line flush plus a fatal-signal marker line
@@ -456,6 +510,7 @@ typedef struct log_stats {
   uint64_t async_writes;
   uint64_t sync_writes;
   uint64_t truncated_count;   /* messages / kv pairs dropped by size limits */
+  uint64_t suppressed_count;  /* messages dropped by rate limit / dedupe (B3) */
 } log_stats;
 
 /**
@@ -474,10 +529,24 @@ typedef struct log_thread_stats {
   uint64_t async_writes;
   uint64_t sync_writes;
   uint64_t truncated_count;
+  uint64_t suppressed_count;          /* rate limit / dedupe drops (B3) */
   uint64_t queue_latency_count;       /* number of async messages with latency sampled */
   double queue_latency_total_ms;      /* sum of enqueue->dequeue latency, ms */
   uint64_t padding[2];
 } LOG_ALIGN_64 log_thread_stats;
+
+/* =====================================================================
+ * INTERNAL — implementation detail, NOT part of the public API.
+ *
+ * Everything from here through the end of `struct log_handle` describes
+ * the concrete layout of the logger. It is visible only so the two-file
+ * build and its white-box tests compile; treat it as private. Do not
+ * read or write these fields from application code, and do not rely on
+ * this layout being stable across versions (no ABI guarantee).
+ *
+ * Public types (log_kv, log_event, log_config, log_stats,
+ * log_thread_stats) are defined above this block.
+ * ===================================================================== */
 
 /**
  * @brief Per-context pool of per-thread stats blocks.
@@ -622,10 +691,94 @@ typedef struct log_rwlock {
 #endif
 } log_rwlock;
 
+#if LOG_FEATURE_FILTER
+/**
+ * @brief Per-level fixed-window rate limiter (B3).
+ *
+ * max_per_sec == 0 disables the rule. The first accepted message of a window
+ * starts the window; once `count` reaches max_per_sec every further message
+ * of that level is suppressed until the window elapses.
+ */
+typedef struct log_rate_limit {
+  unsigned max_per_sec;
+  unsigned count;
+  double window_start;   /* monotonic seconds; 0 = window not started */
+} log_rate_limit;
+
+/**
+ * @brief Per-level duplicate-suppression state (B3).
+ *
+ * One active group per level: `hash` is the FNV-1a hash of the rendered
+ * message (plus kv bytes); repeated identical messages inside the window are
+ * counted in `suppressed` and emitted later as a single summary line. Each
+ * level owns its group, so there is no cross-level collision.
+ */
+typedef struct log_dedupe_group {
+  uint64_t hash;
+  unsigned suppressed;
+  double window_start;   /* monotonic seconds */
+  bool active;
+} log_dedupe_group;
+
+/**
+ * @brief Filtering state (rate limit + dedupe), guarded by `mtx`.
+ *
+ * Guarded by its own mutex rather than the context rwlock because every log
+ * call mutates it. Callers never hold `mtx` while acquiring the rwlock, so
+ * the two locks do not nest in both directions.
+ */
+typedef struct log_filter {
+  bool enabled;
+  log_rate_limit rate[LOG_LEVELS];
+  log_dedupe_group dedupe[LOG_LEVELS];
+  unsigned dedupe_window_ms[LOG_LEVELS];
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_t mtx;
+#else
+  CRITICAL_SECTION mtx;
+#endif
+} log_filter;
+#endif /* LOG_FEATURE_FILTER */
+
 /**
  * @brief Handler kinds (used to switch text/json output per handler)
  */
-enum { HANDLER_STDOUT, HANDLER_FILE, HANDLER_SYSLOG, HANDLER_CUSTOM };
+enum { HANDLER_STDOUT, HANDLER_FILE, HANDLER_SYSLOG, HANDLER_CUSTOM, HANDLER_MEMORY };
+
+#if LOG_FEATURE_MEMORY_HANDLER
+/**
+ * @brief One recorded line of the in-memory flight recorder (B1).
+ *
+ * POD by construction: a fixed char array plus scalar fields, no pointers.
+ * This is what lets a fatal-signal handler walk the ring and write(2) each
+ * entry without locks or allocation. The `line` is a fully rendered line
+ * including its trailing '\n'; `len` is the number of valid bytes.
+ */
+typedef struct log_memory_entry {
+  char line[LOG_MEMORY_LINE_MAX];
+  int level;
+  int len;
+} log_memory_entry;
+
+/**
+ * @brief Ring storage backing one memory handler.
+ *
+ * Heap-allocated at log_add_memory_handler() time (setup; not the hot path).
+ * Producers serialize on mtx; the crash path reads entries/count/head
+ * lock-free and tolerates the single in-flight entry being inconsistent.
+ */
+typedef struct log_memory_store {
+  log_memory_entry *entries;   /* capacity rows */
+  size_t capacity;
+  size_t count;                /* valid entries, <= capacity */
+  size_t head;                 /* next slot to overwrite */
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_t mtx;
+#else
+  CRITICAL_SECTION mtx;
+#endif
+} log_memory_store;
+#endif /* LOG_FEATURE_MEMORY_HANDLER */
 
 /**
  * @brief Output handler
@@ -649,6 +802,21 @@ typedef struct log_handler {
   double last_flush;           /* monotonic seconds, interval bookkeeping */
   log_FormatFn format_fn;      /* per-handler formatter (overrides ctx->format_fn) */
 } log_handler;
+
+#if LOG_FEATURE_NAMED
+/**
+ * @brief One named-logger registry slot (B4).
+ *
+ * The handle is a lightweight alias (log_handle::base != NULL) that owns only
+ * its level/quiet state; logging through it is redirected to the default
+ * context, so all handlers are shared. Created lazily by log_get().
+ */
+typedef struct log_named_entry {
+  char name[LOG_NAMED_NAME_MAX];
+  struct log_handle *handle;
+} log_named_entry;
+#endif
+
 struct log_handle {
   log_rwlock rwlock;
 
@@ -705,6 +873,17 @@ struct log_handle {
 
   bool crash_safe;   /* crash-safe mode: forces sync + per-line flush */
 
+#if LOG_FEATURE_FILTER
+  log_filter filter;   /* rate limiting / dedupe state (B3) */
+#endif
+
+#if LOG_FEATURE_NAMED
+  /* Named-logger registry (B4), populated on the default context. */
+  struct log_handle *base;   /* non-NULL on a named alias */
+  log_named_entry named[LOG_NAMED_MAX];
+  int named_count;
+#endif
+
 #if LOG_FEATURE_STATIC_ALLOC
   /* Embedded storage for static mode (sized by MAX_HANDLERS /
    * LOG_RING_CAPACITY; capacity must be a power of two, checked in log.c) */
@@ -714,6 +893,8 @@ struct log_handle {
   log_ring_entry ring_storage[LOG_RING_CAPACITY];
 #endif
 };
+
+/* ==================== End of internal layout ==================== */
 
 /* ==================== Stubs for disabled features ==================== */
 /* These must come after all types they reference (log_stats, log_handle). */
@@ -780,6 +961,32 @@ static inline int log_install_atfork(log_handle *ctx) { (void)ctx; return -1; }
 static inline int log_install_atexit(log_handle *ctx) { (void)ctx; return -1; }
 #endif
 
+#if !LOG_FEATURE_MEMORY_HANDLER
+static inline int log_add_memory_handler(log_handle *ctx, int lines, int level) {
+  (void)ctx; (void)lines; (void)level; return -1;
+}
+static inline void log_dump_memory_handler(log_handle *ctx, int handler_idx, FILE *out) {
+  (void)ctx; (void)handler_idx; (void)out;
+}
+#endif
+
+#if !LOG_FEATURE_NAMED
+static inline log_handle* log_get(const char *name) { (void)name; return NULL; }
+static inline void log_named_set_level(const char *name, int level) {
+  (void)name; (void)level;
+}
+#endif
+
+#if !LOG_FEATURE_FILTER
+static inline void log_set_rate_limit(log_handle *ctx, int level, unsigned max_per_sec) {
+  (void)ctx; (void)level; (void)max_per_sec;
+}
+static inline void log_set_dedupe(log_handle *ctx, int level, unsigned window_ms) {
+  (void)ctx; (void)level; (void)window_ms;
+}
+static inline void log_flush_suppressed(log_handle *ctx) { (void)ctx; }
+#endif
+
 #if !LOG_FEATURE_STATIC_ALLOC
 static inline size_t log_static_ctx_size(void) { return 0; }
 static inline log_handle* log_create_static(void *buf, size_t buf_size) {
@@ -792,6 +999,17 @@ log_handle* log_create(void);
 void log_destroy(log_handle *ctx);
 
 log_handle* log_default(void);
+
+/* Named loggers (B4): per-module level switches that share the default
+ * context's handlers. log_get() lazily creates (once) and returns an alias
+ * whose level/quiet are independent; logging through it emits via the default
+ * handlers. Invalid / overlong names or a full registry (LOG_NAMED_MAX) return
+ * the default context and emit a warning. Aliases live until the default
+ * context is destroyed. Trim with LOG_DISABLE_NAMED (or LOG_MINIMAL). */
+#if LOG_FEATURE_NAMED
+log_handle* log_get(const char *name);
+void log_named_set_level(const char *name, int level);
+#endif
 
 const char* log_level_string(int level);
 void log_set_level(log_handle *ctx, int level);
@@ -826,6 +1044,16 @@ int log_add_fp(log_handle *ctx, FILE *fp, int level);
 #if LOG_FEATURE_FILE_OPS
 int log_add_file(log_handle *ctx, const char *filename, int level);
 #endif
+#if LOG_FEATURE_MEMORY_HANDLER
+/* In-memory flight recorder (B1): keep the most recent `lines` lines whose
+ * level is >= `level` in a ring, with no I/O. `lines` is clamped to
+ * LOG_MEMORY_MAX_LINES; lines <= 0 returns -1. Returns the handler index.
+ * Dump the retained lines oldest-first with log_dump_memory_handler(); the
+ * snapshot is taken under the context and store locks, so it is consistent
+ * with concurrent producers. */
+int log_add_memory_handler(log_handle *ctx, int lines, int level);
+void log_dump_memory_handler(log_handle *ctx, int handler_idx, FILE *out);
+#endif
 void log_remove_handler(log_handle *ctx, int idx);
 
 /* Thread ID and Syslog support */
@@ -850,13 +1078,35 @@ void log_enable_json_format(log_handle* ctx);
 int log_handler_set_flush(log_handle *ctx, int handler_idx, int policy, unsigned interval_ms);
 int log_handler_set_fsync(log_handle *ctx, int handler_idx, bool enable);
 
+/* Log flood control (B3): rate limiting and duplicate suppression.
+ *
+ * log_set_rate_limit: allow at most max_per_sec messages of `level` per
+ *   one-second window. max_per_sec == 0 disables the rule for that level.
+ * log_set_dedupe: suppress consecutive identical messages of `level` within
+ *   window_ms. When the window expires (or a different message arrives) a
+ *   single "last message repeated N times" line is emitted. window_ms == 0
+ *   disables the rule for that level.
+ * log_flush_suppressed: immediately emit any pending dedupe summaries (also
+ *   done automatically by log_destroy).
+ *
+ * Suppressed messages are counted in log_stats::suppressed_count. Each call
+ * configures exactly the given level (rate limit and dedupe state are
+ * per-level); out-of-range levels are ignored. When LOG_FEATURE_FILTER is
+ * disabled these are no-ops. */
+#if LOG_FEATURE_FILTER
+void log_set_rate_limit(log_handle *ctx, int level, unsigned max_per_sec);
+void log_set_dedupe(log_handle *ctx, int level, unsigned window_ms);
+void log_flush_suppressed(log_handle *ctx);
+#endif
+
 /* Crash-safe mode: forces the synchronous path (async is refused while on)
  * and switches every file/stdout handler to per-line flush, so all messages
  * written before a fatal signal have already reached the kernel.
  * log_install_crash_handler() (POSIX only) additionally writes a final
  * marker line to the handler files when the process dies from
- * SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE, then re-raises with default
- * disposition (core dumps keep working). */
+ * SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE, dumps the tail of any registered
+ * memory flight recorder (log_add_memory_handler) to those files, then
+ * re-raises with default disposition (core dumps keep working). */
 #if LOG_FEATURE_CRASH_MODE
 int log_set_crash_safe(log_handle *ctx, bool enable);
 int log_install_crash_handler(log_handle *ctx);

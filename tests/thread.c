@@ -1,6 +1,7 @@
 /**
  * thread.c - Thread safety test runner
- * Runs: mt_sync, mt_async, config_race
+ * Runs: mt_sync, mt_async, config_race, block_config_race, stats_aggregation,
+ *       memory_mt
  *
  * Note: Test files are included directly to share static state
  * from test_harness.h. Each category compiles as a single unit.
@@ -13,6 +14,9 @@
 #include "thread/test_config_race.c"
 #include "thread/test_block_config_race.c"
 #include "thread/test_stats_aggregation.c"
+#include "thread/test_memory_mt.c"
+#include "thread/test_filter_mt.c"
+#include "thread/test_named_mt.c"
 
 int main(void) {
     extern void test_mt_sync_register(void);
@@ -20,11 +24,17 @@ int main(void) {
     extern void test_config_race_register(void);
     extern void test_block_config_race_register(void);
     extern void test_stats_aggregation_register(void);
+    extern void test_memory_mt_register(void);
+    extern void test_filter_mt_register(void);
+    extern void test_named_mt_register(void);
 
     test_mt_sync_register();
     test_mt_async_register();
     test_config_race_register();
     test_block_config_race_register();
     test_stats_aggregation_register();
+    test_memory_mt_register();
+    test_filter_mt_register();
+    test_named_mt_register();
     return test_run_all() ? 1 : 0;
 }

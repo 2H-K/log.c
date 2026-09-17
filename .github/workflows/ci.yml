@@ -109,7 +109,9 @@ jobs:
           set -e
           flags="LOG_DISABLE_JSON LOG_DISABLE_SYSLOG LOG_DISABLE_ASYNC LOG_DISABLE_MPOOL \
                  LOG_DISABLE_RING_QUEUE LOG_DISABLE_STATS LOG_DISABLE_FILE_OPS \
-                 LOG_DISABLE_THREAD_ID LOG_DISABLE_TS_CACHE LOG_DISABLE_CRASH_MODE LOG_MINIMAL"
+                 LOG_DISABLE_THREAD_ID LOG_DISABLE_TS_CACHE LOG_DISABLE_CRASH_MODE \
+                 LOG_DISABLE_MEMORY_HANDLER LOG_DISABLE_KV LOG_DISABLE_LIFECYCLE \
+                 LOG_DISABLE_FILTER LOG_DISABLE_NAMED LOG_MINIMAL"
           for f in $flags; do
             echo "=== -D$f ==="
             gcc -std=c11 -Wall -Wextra -Werror -Isrc -c -D"$f" src/log.c -o /dev/null
@@ -120,3 +122,6 @@ jobs:
           gcc -std=c11 -Wall -Wextra -Werror -Isrc -c -DLOG_MINIMAL -DLOG_STATIC_ALLOC src/log.c -o /dev/null
           echo "=== -DLOG_RING_CAPACITY=256 -DLOG_STATIC_ALLOC ==="
           gcc -std=c11 -Wall -Wextra -Werror -Isrc -c -DLOG_RING_CAPACITY=256 -DLOG_STATIC_ALLOC src/log.c -o /dev/null
+
+      - name: Size gate (LOG_MINIMAL +2 KiB budget)
+        run: tests/size_gate.sh gcc

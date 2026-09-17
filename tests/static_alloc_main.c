@@ -267,11 +267,57 @@ static void test_static_async_truncation(void) {
     TEST_PASS("static async truncation");
 }
 
+#if LOG_FEATURE_FILTER
+static void test_static_filter_zero_malloc(void) {
+    const char *path = "/tmp/test_static_filter.log";
+    remove(path);
+
+    log_handle *ctx = log_create_static(&g_storage, sizeof(g_storage));
+    TEST_ASSERT_NOT_NULL(ctx, "create_static");
+    ctx->handlers[0].active = false;
+    TEST_ASSERT(log_add_file(ctx, path, LOG_INFO) >= 0, "add file handler");
+
+    log_set_dedupe(ctx, LOG_INFO, 60000);
+    log_set_rate_limit(ctx, LOG_WARN, 100);
+
+    /* Warmup exercises the filter render buffer and file buffering. */
+    for (int i = 0; i < 200; i++) {
+        log_ctx_info(ctx, "warmup %d", i);
+    }
+
+    long before = wrap_snapshot();
+    for (int i = 0; i < 1000; i++) log_ctx_info(ctx, "deduped");
+    for (int i = 0; i < 1000; i++) log_ctx_info(ctx, "unique %d", i);
+    long delta = wrap_snapshot() - before;
+    TEST_ASSERT_EQ(delta, 0, "filter path allocates zero heap (sync)");
+
+    /* Async filtered path: embedded ring stores small bodies inline. */
+    log_flush_suppressed(ctx);
+    TEST_ASSERT_EQ(log_set_async(ctx, true), 0, "async on");
+    long before2 = wrap_snapshot();
+    for (int i = 0; i < 1000; i++) log_ctx_info(ctx, "async-deduped");
+    long delta2 = wrap_snapshot() - before2;
+    TEST_ASSERT_EQ(delta2, 0, "filter path allocates zero heap (async)");
+    log_set_async(ctx, false);
+
+    log_stats st;
+    log_get_stats(ctx, &st);
+    TEST_ASSERT(st.suppressed_count >= 1998, "expected dedupe suppressions");
+
+    log_destroy(ctx);
+    remove(path);
+    TEST_PASS("static filter zero malloc");
+}
+#endif /* LOG_FEATURE_FILTER */
+
 int main(void) {
     test_add(test_static_create_destroy_reuse, "static_create_destroy_reuse");
     test_add(test_static_hot_path_zero_malloc_sync, "static_zero_malloc_sync");
     test_add(test_static_hot_path_zero_malloc_async, "static_zero_malloc_async");
     test_add(test_static_sync_truncation, "static_sync_truncation");
     test_add(test_static_async_truncation, "static_async_truncation");
+#if LOG_FEATURE_FILTER
+    test_add(test_static_filter_zero_malloc, "static_filter_zero_malloc");
+#endif
     return test_run_all() ? 1 : 0;
 }

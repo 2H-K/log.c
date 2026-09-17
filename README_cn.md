@@ -9,12 +9,15 @@
 - **跨平台支持**: Windows (MSVC/MinGW-w64) & Linux/macOS (GCC/Clang)
 - **线程安全**: 读写锁保护配置与并发访问
 - **异步日志**: 互斥锁 + 条件变量保护的环形缓冲队列 + 专用写入线程（用于解耦而非吞吐）
-- **崩溃安全**: `log_set_crash_safe` 逐行落盘；`log_install_crash_handler` 致命信号时写入标记行（POSIX）
+- **崩溃安全**: `log_set_crash_safe` 逐行落盘；`log_install_crash_handler` 致命信号时写入标记行并 dump 内存黑盒最近 N 条（POSIX）
 - **生命周期安全**: `log_install_atfork` 在 `fork()` 后子进程重建锁并把异步降级为同步；`log_install_atexit` 退出时排空异步队列（POSIX）
 - **持久化策略**: 按 handler 配置 NEVER / EVERY / INTERVAL flush 与独立 fsync 开关
 - **静态零分配**: `-DLOG_STATIC_ALLOC` + `log_create_static`，热路径 0 次堆分配
 - **日志轮转**: 按大小自动轮转文件（最多 5 个轮转文件）
 - **结构化日志**: JSON 格式支持；类型化键值元数据（`LOG_KV_*`）输出为 JSON 顶级字段或 `key=value` 文本后缀
+- **内存黑盒**: `log_add_memory_handler` 常驻保留最近 N 条日志，`log_dump_memory_handler` 一致快照导出，无 I/O
+- **防日志洪水**: `log_set_rate_limit` 按级别限速、`log_set_dedupe` 折叠重复并补发 `last message repeated N times`；`suppressed_count` 可观测
+- **命名 logger**: `log_get("net")` / `log_named_set_level` 按模块独立级别，handler 共享
 - **线程ID追踪**: 输出中可选显示线程ID
 - **Syslog集成**: 原生 syslog 支持（仅 POSIX）
 - **动态配置**: 运行时级别/格式更改
@@ -31,8 +34,28 @@
 |------|--------|------|
 | 同步（单线程） | ~3,400,000 msg/s | ~0.29 µs/msg |
 | 同步（8 线程） | ~3,400,000 msg/s | — |
-| 异步（单线程） | ~2,000,000 msg/s | ~0.50 µs/msg |
-| 异步（8 线程） | ~3,300,000 msg/s | — |
+| 异步（单线程） | ~1,900,000 msg/s | ~0.53 µs/msg |
+| 异步（8 线程） | ~3,200,000 msg/s | — |
+
+持久化档位（同步路径，按 handler 配置 flush 策略，见 `log_handler_set_flush`）：
+
+| 档位 | 吞吐量 | 延迟 |
+|------|--------|------|
+| `buffered`（`LOG_FLUSH_NEVER`） | ~2,460,000 msg/s | ~0.41 µs/msg |
+| `flushed`（`LOG_FLUSH_EVERY`） | ~519,000 msg/s | ~1.92 µs/msg |
+| `fsynced`（`LOG_FLUSH_EVERY` + `log_handler_set_fsync`） | ~2,009 msg/s | ~497 µs/msg |
+
+过载下的生产者尾延迟（异步、256 槽队列、50 µs 慢 sink、`LOG_QUEUE_DROP`）：**p50 0.04 µs、p99 ~0.1 µs**，最坏调度尖峰 < 0.1 ms；调用方完全不碰慢 sink，停顿有界。
+
+队列满载策略实测（异步、16 槽队列、50 µs 慢 sink）：
+
+| 策略 | `queue_drops` | `queue_blocked` | `sync_writes` | 结果 |
+|------|--------------|-----------------|---------------|------|
+| `LOG_QUEUE_DROP` | 有 | 0 | 0 | 丢弃溢出，调用方从不阻塞 |
+| `LOG_QUEUE_FALLBACK_SYNC` | 0 | 0 | > 0 | 溢出在调用线程同步写出 |
+| `LOG_QUEUE_BLOCK` | 0 | > 0 | 0 | 调用方等待队列空间 |
+
+各档位的崩溃丢失承诺（子进程 `_exit()`、无 stdio flush，由 `tests/platform/test_flush.c` 验证）：`EVERY` 不丢；`NEVER` 可能丢缓冲区尾部；`INTERVAL(n)` 最多滞留 `n` ms——窗口到期后的首次写入会全部刷出。
 
 复现命令：
 
@@ -50,7 +73,7 @@ taskset -c 2 ./build/test_perf
 
 本库是**进程内发射层**，刻意不做传输层或可靠性层——正是这一点让它保持双文件、零依赖、可嵌入任意进程。
 
-**它做：** 级别过滤、文本/JSON 格式化、自定义格式化器与 handler、异步解耦（专用写入线程）、按大小轮转、syslog、flush/fsync 策略、崩溃安全标记输出、静态零分配模式。
+**它做：** 级别过滤、文本/JSON 格式化、自定义格式化器与 handler、异步解耦（专用写入线程）、按大小轮转、syslog、flush/fsync 策略、崩溃安全标记输出与飞行记录器尾部导出、静态零分配模式。
 
 **它不做（刻意）：** at-least-once 投递、磁盘 spool/offset 持久化、网络/TLS 传输、跨进程聚合、大块二进制 payload 存储。
 
@@ -271,18 +294,21 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 | 标志 | 说明 | 节省 |
 |------|------|------|
 | `LOG_DISABLE_JSON` | 禁用 JSON 格式化 | ~4.7 KB |
-| `LOG_DISABLE_SYSLOG` | 禁用 Syslog 支持 | ~1.3 KB |
-| `LOG_DISABLE_ASYNC` | 禁用异步日志 | ~8.0 KB |
+| `LOG_DISABLE_SYSLOG` | 禁用 Syslog 支持 | ~1.4 KB |
+| `LOG_DISABLE_ASYNC` | 禁用异步日志 | ~9.5 KB |
 | `LOG_DISABLE_MPOOL` | 禁用内存池 | ~1.8 KB |
-| `LOG_DISABLE_RING_QUEUE` | 禁用环形缓冲区队列 | ~3.7 KB |
-| `LOG_DISABLE_STATS` | 禁用性能统计 | ~1.9 KB |
+| `LOG_DISABLE_RING_QUEUE` | 禁用环形缓冲区队列 | ~4.2 KB |
+| `LOG_DISABLE_STATS` | 禁用性能统计 | ~2.0 KB |
 | `LOG_DISABLE_FILE_OPS` | 禁用文件操作 | ~2.2 KB |
 | `LOG_DISABLE_THREAD_ID` | 禁用线程ID | ~0.15 KB |
 | `LOG_DISABLE_TS_CACHE` | 禁用时间戳缓存 | ~0.6 KB |
-| `LOG_DISABLE_CRASH_MODE` | 禁用崩溃安全模式 | ~1.3 KB |
-| `LOG_DISABLE_KV` | 禁用键值元数据 | ~6.3 KB |
+| `LOG_DISABLE_CRASH_MODE` | 禁用崩溃安全模式 | ~2.0 KB |
+| `LOG_DISABLE_KV` | 禁用键值元数据 | ~6.0 KB |
 | `LOG_DISABLE_LIFECYCLE` | 禁用 fork/退出生命周期安全 | ~1.7 KB |
-| `LOG_MINIMAL` | 禁用所有可选功能 | ~23.3 KB |
+| `LOG_DISABLE_MEMORY_HANDLER` | 禁用内存黑盒处理器 | ~2.3 KB |
+| `LOG_DISABLE_FILTER` | 禁用限速/去重 | ~4.4 KB |
+| `LOG_DISABLE_NAMED` | 禁用命名 logger | ~1.6 KB |
+| `LOG_MINIMAL` | 禁用所有可选功能 | ~31.9 KB |
 
 ### 静态模式占用
 
@@ -291,8 +317,8 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 | 构建 | `sizeof(log_handle)` |
 |------|----------------------|
 | `LOG_STATIC_ALLOC`，`LOG_RING_CAPACITY=4096`（默认） | ~3.61 MiB |
-| `LOG_STATIC_ALLOC`，`LOG_RING_CAPACITY=256` | ~246 KiB |
-| `LOG_STATIC_ALLOC` + `LOG_MINIMAL`，`LOG_RING_CAPACITY=256` | ~4 KiB |
+| `LOG_STATIC_ALLOC`，`LOG_RING_CAPACITY=256` | ~247 KiB |
+| `LOG_STATIC_ALLOC` + `LOG_MINIMAL`，`LOG_RING_CAPACITY=256` | ~3.8 KiB |
 
 选择能吸收你突发量的最小容量；默认值偏向吞吐而非占用。启用 KV 时每个环槽还内嵌
 `LOG_KV_INLINE_MAX`（256）字节的键值存储，开销为 `256 × LOG_RING_CAPACITY`；
@@ -509,6 +535,57 @@ log_install_atexit(ctx);
 - 仅 POSIX：Windows 下两者返回 `-1`（没有 `fork`；需要 flush 请在退出前调用 `log_set_async(ctx, false)`）。
 - 注意：`fork()` 瞬间仍在队列中的异步条目在子进程中被放弃，不会重复写出。
 
+### 9. 内存黑盒（flight recorder）
+
+一个只写内存、不碰 I/O 的 handler：常驻保留最近 N 条已格式化日志，正常运行时完全沉默，排障或崩溃现场再导出。
+
+```c
+int idx = log_add_memory_handler(ctx, 256, LOG_WARN);  /* 保留最近 256 条 >= WARN */
+/* ... 运行 ... */
+log_dump_memory_handler(ctx, idx, stderr);             /* 最旧 -> 最新依次导出 */
+```
+
+- 每条记录是完整渲染行（前缀 + 消息 + KV，含末尾 `\n`），超长行按 `LOG_MEMORY_LINE_MAX` 截断并计入 `truncated_count`。
+- `lines` 会被钳制到编译期上限 `LOG_MEMORY_MAX_LINES`；`lines <= 0` 返回 `-1`。
+- 导出的快照在 context 读锁 + 每 handler 存储锁内取得，与并发写入一致，不会撕裂或乱序。
+- 条目为 POD（无指针）。已挂接 A2 崩溃安全模式：`log_install_crash_handler` 在致命信号处理器内以 `write(2)` 直接导出最近 N 条（`==== log: flight recorder tail ====` 之后）。
+- 每个 handler 的存储按需在 `log_add_memory_handler()` 时分配，未使用该功能的 context 零成本。
+- 用 `LOG_DISABLE_MEMORY_HANDLER`（或 `LOG_MINIMAL`）裁剪；Windows/POSIX 均可用。
+
+### 10. 限速与去重（防日志洪水）
+
+同一条错误刷屏是生产事故的常见放大器。两条规则都按级别配置，且在**入队前**生效，因此洪水不会占满异步队列触发丢弃：
+
+```c
+log_set_rate_limit(ctx, LOG_ERROR, 10);  /* 每秒最多 10 条 ERROR */
+log_set_dedupe(ctx, LOG_WARN, 1000);     /* 1 秒窗口内折叠重复 */
+/* ... */
+log_flush_suppressed(ctx);               /* 立即补发待发汇总 */
+```
+
+- 限速为每级别固定一秒窗口：窗口内前 `max_per_sec` 条放行，其余抑制到窗口重置。
+- 去重对渲染后的消息做哈希（KV 字段一并混入），窗口到期或出现不同消息时补发一行 `last message repeated N times`。
+- 被抑制的条数计入 `log_stats.suppressed_count`；每个级别状态独立；`log_destroy` 会自动补发待发汇总。
+- 用 `LOG_DISABLE_FILTER`（或 `LOG_MINIMAL`）裁剪。
+
+### 11. 命名 logger（按模块开关）
+
+每个模块一个独立级别开关，同时共享同一套 handler：
+
+```c
+log_handle *net = log_get("net");
+log_handle *db  = log_get("db");
+log_named_set_level("net", LOG_DEBUG);   /* 啰嗦模块 */
+log_named_set_level("db",  LOG_ERROR);   /* 安静模块 */
+
+log_ctx_debug(net, "connection accepted");   /* 输出 */
+log_ctx_warn(db, "slow query");              /* 抑制 */
+```
+
+- `log_get()` 首次调用惰性创建（并发下也只创建一次），返回挂在默认 context 上的轻量别名：handler 共享、级别独立；命名 logger **不会**再被默认 context 的级别过滤。
+- 注册表为默认 context 内固定 `LOG_NAMED_MAX`（16）槽扁平表，名字最长 15 字节。非法/超长名或槽满时返回默认 context 并 `log_warn`（不失败、不崩溃）。
+- 别名生命周期随默认 context；用 `LOG_DISABLE_NAMED`（或 `LOG_MINIMAL`）裁剪。
+
 ## 🔧 API 参考
 
 完整的 API 文档请参阅 [API.md](API.md)。
@@ -532,6 +609,11 @@ int log_set_async(log_handle *ctx, bool enable);
 void log_set_queue_policy(log_handle *ctx, int policy);
 void log_set_max_file_size(log_handle *ctx, size_t size);
 void log_set_file_prefix(log_handle *ctx, const char *prefix);
+void log_set_rate_limit(log_handle *ctx, int level, unsigned max_per_sec);
+void log_set_dedupe(log_handle *ctx, int level, unsigned window_ms);
+void log_flush_suppressed(log_handle *ctx);
+log_handle* log_get(const char *name);
+void log_named_set_level(const char *name, int level);
 ```
 
 ### 处理器管理
@@ -540,6 +622,8 @@ void log_set_file_prefix(log_handle *ctx, const char *prefix);
 int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level);
 int log_add_fp(log_handle *ctx, FILE *fp, int level);
 int log_add_file(log_handle *ctx, const char *filename, int level);
+int log_add_memory_handler(log_handle *ctx, int lines, int level);
+void log_dump_memory_handler(log_handle *ctx, int handler_idx, FILE *out);
 void log_remove_handler(log_handle *ctx, int idx);
 void log_handler_set_level(log_handle *ctx, int handler_idx, int new_level);
 ```
@@ -556,6 +640,8 @@ typedef struct log_stats {
     double avg_queue_latency_ms;        // 异步入队→出队的平均延迟（毫秒）
     uint64_t async_writes;             // 异步写入计数
     uint64_t sync_writes;              // 同步写入计数
+    uint64_t truncated_count;          // 因长度限制丢弃的消息 / KV 对数
+    uint64_t suppressed_count;         // 被限速/去重抑制的消息数
 } log_stats;
 ```
 
@@ -587,16 +673,16 @@ typedef struct log_stats {
 
 ## 🧪 测试
 
-项目包含 137 项测试，分为 6 个类别（以各 runner 输出的实测数为准；static_alloc 仅在 Linux + GNU ld 下构建）：
+项目包含 170 项测试，分为 6 个类别（以各 runner 输出的实测数为准；static_alloc 仅在 Linux + GNU ld 下构建）：
 
 | 类别 | 测试数 | 说明 |
 |------|--------|------|
-| core | 59 | 级别、处理器、格式、NULL安全、统计、键值元数据、边界、越界级别 |
-| thread | 10 | 多线程同步/异步、配置竞态、统计聚合 |
-| platform | 28 | Syslog、轮转、Unicode路径、flush策略、崩溃安全、fork/退出生命周期 |
+| core | 79 | 级别、处理器、格式、NULL安全、统计、键值元数据、边界、越界级别、内存黑盒、限速/去重、命名 logger |
+| thread | 15 | 多线程同步/异步、配置竞态、统计聚合、内存黑盒并发 dump、过滤与命名 logger 并发 |
+| platform | 32 | Syslog、轮转、Unicode路径、flush策略、各持久化档位崩溃丢失、崩溃安全（含尾部 dump）、fork/退出生命周期 |
 | stress | 28 | 队列满、长消息、完整性、崩溃安全、资源 |
-| perf | 7 | 吞吐量和延迟基准测试 |
-| static_alloc | 5 | 静态零分配模式（`--wrap=malloc` 真实计数） |
+| perf | 10 | 吞吐、持久化档位、尾延迟、队列满载策略矩阵 |
+| static_alloc | 6 | 静态零分配模式（`--wrap=malloc` 真实计数），含过滤路径 |
 
 ### 运行测试
 

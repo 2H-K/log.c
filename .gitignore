@@ -60,6 +60,7 @@ cmake-build-release/
 # --- 构建系统 ---
 # 如果使用 CMake
 build/
+build-*/
 CMakeCache.txt
 CMakeFiles/
 CMakeScripts/

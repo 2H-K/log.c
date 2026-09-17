@@ -1,6 +1,6 @@
 /**
  * core.c - Core functionality test runner
- * Runs: levels, handlers, format, null safety, stats, boundary
+ * Runs: levels, handlers, format, null safety, stats, boundary, memory
  *
  * Note: Test files are included directly to share static state
  * from test_harness.h. Each category compiles as a single unit.
@@ -14,6 +14,9 @@
 #include "core/test_null.c"
 #include "core/test_stats.c"
 #include "core/test_boundary.c"
+#include "core/test_memory.c"
+#include "core/test_filter.c"
+#include "core/test_named.c"
 
 int main(void) {
     extern void test_levels_register(void);
@@ -22,6 +25,9 @@ int main(void) {
     extern void test_null_register(void);
     extern void test_stats_register(void);
     extern void test_boundary_register(void);
+    extern void test_memory_register(void);
+    extern void test_filter_register(void);
+    extern void test_named_register(void);
 
     test_levels_register();
     test_handlers_register();
@@ -29,5 +35,8 @@ int main(void) {
     test_null_register();
     test_stats_register();
     test_boundary_register();
+    test_memory_register();
+    test_filter_register();
+    test_named_register();
     return test_run_all() ? 1 : 0;
 }

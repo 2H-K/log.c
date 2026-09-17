@@ -14,11 +14,17 @@
 #include "core/test_null.c"
 #include "core/test_stats.c"
 #include "core/test_boundary.c"
+#include "core/test_memory.c"
+#include "core/test_filter.c"
+#include "core/test_named.c"
 
 /* Thread tests */
 #include "thread/test_mt_sync.c"
 #include "thread/test_mt_async.c"
 #include "thread/test_config_race.c"
+#include "thread/test_memory_mt.c"
+#include "thread/test_filter_mt.c"
+#include "thread/test_named_mt.c"
 
 /* Platform tests */
 #include "platform/test_syslog.c"
@@ -37,6 +43,8 @@
 /* Perf tests */
 #include "perf/bench_sync.c"
 #include "perf/bench_async.c"
+#include "perf/bench_durability.c"
+#include "perf/bench_latency.c"
 
 int main(void) {
     /* Core */
@@ -46,11 +54,17 @@ int main(void) {
     extern void test_null_register(void);
     extern void test_stats_register(void);
     extern void test_boundary_register(void);
+    extern void test_memory_register(void);
+    extern void test_filter_register(void);
+    extern void test_named_register(void);
 
     /* Thread */
     extern void test_mt_sync_register(void);
     extern void test_mt_async_register(void);
     extern void test_config_race_register(void);
+    extern void test_memory_mt_register(void);
+    extern void test_filter_mt_register(void);
+    extern void test_named_mt_register(void);
 
     /* Platform */
     extern void test_syslog_register(void);
@@ -69,6 +83,8 @@ int main(void) {
     /* Perf */
     extern void bench_sync_register(void);
     extern void bench_async_register(void);
+    extern void bench_durability_register(void);
+    extern void bench_latency_register(void);
 
     test_levels_register();
     test_handlers_register();
@@ -76,10 +92,18 @@ int main(void) {
     test_null_register();
     test_stats_register();
     test_boundary_register();
+    test_memory_register();
+    test_filter_register();
+    /* Run the concurrent-creation test before the registry-exhaustion test
+     * (the later one permanently fills the default context's registry). */
+    test_named_mt_register();
+    test_named_register();
 
     test_mt_sync_register();
     test_mt_async_register();
     test_config_race_register();
+    test_memory_mt_register();
+    test_filter_mt_register();
 
     test_syslog_register();
     test_rotation_register();
@@ -95,6 +119,8 @@ int main(void) {
 
     bench_sync_register();
     bench_async_register();
+    bench_durability_register();
+    bench_latency_register();
 
     return test_run_all() ? 1 : 0;
 }

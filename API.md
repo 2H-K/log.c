@@ -8,12 +8,14 @@ Version 3.0.0
 2. [Core Functions](#core-functions)
 3. [Configuration Functions](#configuration-functions)
 4. [Handler Management](#handler-management)
-5. [Format Functions](#format-functions)
-6. [Thread Safety Features](#thread-safety-features)
-7. [Syslog Support](#syslog-support)
-8. [Performance Monitoring](#performance-monitoring)
-9. [Macros](#macros)
-10. [Examples](#examples)
+5. [Filtering & Flood Control](#filtering--flood-control)
+6. [Named Loggers](#named-loggers)
+7. [Format Functions](#format-functions)
+8. [Thread Safety Features](#thread-safety-features)
+9. [Syslog Support](#syslog-support)
+10. [Performance Monitoring](#performance-monitoring)
+11. [Macros](#macros)
+12. [Examples](#examples)
 
 ---
 
@@ -31,6 +33,15 @@ This is an enhanced logging library for C11 that provides:
 - Thread ID tracking
 - Syslog integration
 - Performance statistics
+
+### Public API vs. internals
+
+Only the functions, macros and types documented in this file are public.
+`src/log.h` also exposes the concrete layout of `log_handle` and its helper
+structs (fenced as `INTERNAL` in the header) so the two-file build and its
+white-box tests can compile. Those fields are not part of the API, carry no
+ABI guarantee, and may change without notice — do not access them from
+application code.
 
 ### Log Levels
 
@@ -524,6 +535,67 @@ int idx = log_add_fp(ctx, fp, LOG_INFO);
 
 ---
 
+### log_add_memory_handler()
+
+Adds an in-memory flight-recorder handler (B1): it retains the most recent
+`lines` fully rendered log lines in a ring, performing no I/O.
+
+**Prototype:**
+```c
+int log_add_memory_handler(log_handle *ctx, int lines, int level);
+```
+
+**Parameters:**
+- `ctx`: Logger context
+- `lines`: Number of recent lines to retain; clamped to the compile-time cap
+  `LOG_MEMORY_MAX_LINES`. Must be > 0.
+- `level`: Minimum level for this handler
+
+**Returns:**
+- Handler index on success, -1 on invalid arguments / allocation failure /
+  handler table full
+
+**Example:**
+```c
+int idx = log_add_memory_handler(ctx, 256, LOG_WARN);
+/* ... run ... */
+log_dump_memory_handler(ctx, idx, stderr);   /* oldest -> newest */
+```
+
+**Notes:**
+- Storage is allocated per handler at call time; contexts without a memory
+  handler pay nothing.
+- Trim with `LOG_DISABLE_MEMORY_HANDLER` / `LOG_MINIMAL` (then this returns -1).
+
+---
+
+### log_dump_memory_handler()
+
+Writes the lines retained by a memory handler to a stream, oldest first.
+
+**Prototype:**
+```c
+void log_dump_memory_handler(log_handle *ctx, int handler_idx, FILE *out);
+```
+
+**Parameters:**
+- `ctx`: Logger context
+- `handler_idx`: Index returned by `log_add_memory_handler()`
+- `out`: Destination stream (e.g. `stderr`, `stdout`, or an `fopen` result)
+
+**Returns:**
+- Nothing. Invalid arguments or a non-memory handler index are no-ops.
+
+**Notes:**
+- The snapshot is taken under the context read lock and the per-handler store
+  lock, so it is consistent with concurrent producers (no torn or reordered
+  records).
+- Each record is a complete rendered line including its trailing `\n`;
+  oversized lines are truncated to `LOG_MEMORY_LINE_MAX` and counted in
+  `log_stats::truncated_count`.
+
+---
+
 ### log_remove_handler()
 
 Removes a handler by index.
@@ -583,6 +655,146 @@ void log_handler_set_formatter(log_handle *ctx, int handler_idx, log_FormatFn ne
 **Example:**
 ```c
 log_handler_set_formatter(ctx, idx, log_format_json);
+```
+
+---
+
+## Filtering & Flood Control
+
+Rate limiting and duplicate suppression keep a repeated error from amplifying
+an incident (B3). Both are configured per level and are applied **before** the
+message is enqueued, so a flood never fills the async queue (and therefore
+never triggers `LOG_QUEUE_DROP`). Suppressed messages are counted in
+`log_stats::suppressed_count`. Rules are inert unless configured, and the
+whole feature is compiled out by `LOG_DISABLE_FILTER` / `LOG_MINIMAL`.
+
+### log_set_rate_limit()
+
+Allows at most `max_per_sec` messages of `level` per one-second window.
+
+**Prototype:**
+```c
+void log_set_rate_limit(log_handle *ctx, int level, unsigned max_per_sec);
+```
+
+**Parameters:**
+- `ctx`: Logger context
+- `level`: The exact level the rule applies to (out-of-range ignored)
+- `max_per_sec`: Allowed messages per second; `0` disables the rule
+
+**Notes:**
+- The window starts with the first accepted message and resets one second
+  later; the first `max_per_sec` messages of a window are emitted, the rest
+  are suppressed.
+
+**Example:**
+```c
+log_set_rate_limit(ctx, LOG_ERROR, 10);   /* at most 10 errors/second */
+```
+
+---
+
+### log_set_dedupe()
+
+Suppresses consecutive identical messages of `level` within `window_ms`,
+emitting a single `last message repeated N times` summary when the window
+expires or a different message arrives.
+
+**Prototype:**
+```c
+void log_set_dedupe(log_handle *ctx, int level, unsigned window_ms);
+```
+
+**Parameters:**
+- `ctx`: Logger context
+- `level`: The exact level the rule applies to (out-of-range ignored)
+- `window_ms`: Suppression window in milliseconds; `0` disables the rule
+
+**Notes:**
+- The comparison is the FNV-1a hash of the rendered message; structured (KV)
+  events also hash their encoded fields, so the same body with different
+  fields is not collapsed.
+- Each level keeps its own active group, so there is no cross-level collision.
+
+**Example:**
+```c
+log_set_dedupe(ctx, LOG_WARN, 1000);   /* collapse repeated warnings */
+```
+
+---
+
+### log_flush_suppressed()
+
+Immediately emits any pending dedupe summaries.
+
+**Prototype:**
+```c
+void log_flush_suppressed(log_handle *ctx);
+```
+
+**Notes:**
+- Optional: `log_destroy()` flushes pending summaries automatically, and a
+  summary for a group is emitted as soon as its window expires and another
+  message arrives.
+- Safe to call at any time; a no-op when there is nothing pending.
+
+---
+
+## Named Loggers
+
+Named loggers (B4) give each module an independent level switch. They are
+created lazily and attached to the default context, so all handlers are
+shared. A named logger is not re-filtered by the default context's level,
+only by its own level; per-handler minimum levels still apply.
+
+### log_get()
+
+Returns (creating once if needed) the named logger handle.
+
+**Prototype:**
+```c
+log_handle* log_get(const char *name);
+```
+
+**Parameters:**
+- `name`: Logger name, at most `LOG_NAMED_NAME_MAX - 1` (15) characters
+
+**Returns:**
+- The named handle on success; the default context if `name` is NULL/empty/
+  overlong or the registry (`LOG_NAMED_MAX` = 16 slots) is full (a warning is
+  logged in those cases, never a failure)
+
+**Example:**
+```c
+log_handle *net = log_get("net");
+log_ctx_info(net, "listening on %s", addr);
+```
+
+**Notes:**
+- Safe to call concurrently: the same name always returns the same handle.
+- The returned handle is an alias owned by the default context. Destroying it
+  with `log_destroy()` is a no-op; it is freed when the default context is
+  destroyed.
+
+---
+
+### log_named_set_level()
+
+Sets the level of a named logger, creating it if necessary.
+
+**Prototype:**
+```c
+void log_named_set_level(const char *name, int level);
+```
+
+**Parameters:**
+- `name`: Logger name (invalid/overlong names are ignored)
+- `level`: Minimum level for this logger
+
+**Example:**
+```c
+log_named_set_level("net", LOG_DEBUG);
+log_named_set_level("db",  LOG_ERROR);
 ```
 
 ---

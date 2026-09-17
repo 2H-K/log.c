@@ -53,6 +53,16 @@ _Static_assert(LOG_RING_CAPACITY > 0 &&
                (LOG_RING_CAPACITY & (LOG_RING_CAPACITY - 1)) == 0,
                "LOG_RING_CAPACITY must be a power of two");
 #endif
+#if LOG_FEATURE_MEMORY_HANDLER
+/* The crash path writes these entries with write(2) directly, so the entry
+ * layout must stay POD: a fixed char array followed by two ints, no pointers
+ * and no implicit padding. Adding a pointer (or a wider field that forces
+ * padding) breaks this assertion. */
+_Static_assert(LOG_MEMORY_LINE_MAX >= 8,
+               "LOG_MEMORY_LINE_MAX must leave room for prefix + '\\n'");
+_Static_assert(sizeof(log_memory_entry) == LOG_MEMORY_LINE_MAX + 2 * sizeof(int),
+               "log_memory_entry must be POD (no pointers/extra padding)");
+#endif
 #endif
 #endif
 
@@ -439,7 +449,8 @@ static void rwlock_write_unlock(log_rwlock *lock) {
 #endif
 }
 
-/* Lock-free Queue Implementation */
+/* ==================== Async Queue (linked-list) ==================== */
+
 #if LOG_FEATURE_ASYNC
 static log_queue_entry* queue_entry_create(log_handle *ctx, log_event *ev) {
   (void)ctx;
@@ -512,13 +523,18 @@ fail:
   return NULL;
 }
 
-#if LOG_FEATURE_KV
-/* Literal-message variant used by log_log_kv() when the linked-list queue is
- * active (ring queue unavailable). Body and kv are copied, never borrowed. */
-static log_queue_entry* queue_entry_create_kv(log_handle *ctx, const char *body,
-                                              const char *kv, const char *file,
-                                              int level, int line, double timestamp) {
+#if LOG_FEATURE_KV || LOG_FEATURE_FILTER
+/* Pre-rendered-message variant of queue_entry_create(): the body (and an
+ * optional encoded kv blob) are copied, never borrowed. Used by log_log_kv()
+ * and by the filtering path (B3), which renders the body before deciding
+ * whether to enqueue it. `kv` is NULL outside LOG_FEATURE_KV builds. */
+static log_queue_entry* queue_entry_create_body(log_handle *ctx, const char *body,
+                                                const char *kv, const char *file,
+                                                int level, int line, double timestamp) {
   (void)ctx;
+#if !LOG_FEATURE_KV
+  (void)kv;
+#endif
 #if LOG_FEATURE_MPOOL
   log_mpool *mp = &ctx->mpool;
   bool use_mpool = ctx->enable_mpool;
@@ -561,6 +577,7 @@ static log_queue_entry* queue_entry_create_kv(log_handle *ctx, const char *body,
     if (!entry->file) goto fail;
   }
 
+#if LOG_FEATURE_KV
   size_t kv_bytes = kv_blob_size(kv);
   if (kv_bytes) {
     entry->kv = malloc(kv_bytes);
@@ -569,6 +586,7 @@ static log_queue_entry* queue_entry_create_kv(log_handle *ctx, const char *body,
   } else {
     entry->kv = NULL;
   }
+#endif
   entry->level = level;
   entry->line = line;
   entry->timestamp = timestamp;
@@ -581,11 +599,13 @@ fail:
 #endif
   free(entry->msg);
   free(entry->file);
+#if LOG_FEATURE_KV
   free(entry->kv);
+#endif
   free(entry);
   return NULL;
 }
-#endif /* LOG_FEATURE_KV */
+#endif /* LOG_FEATURE_KV || LOG_FEATURE_FILTER */
 
 static void queue_entry_destroy(log_handle *ctx, log_queue_entry *entry) {
   if (!entry) return;
@@ -999,15 +1019,16 @@ static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap
   return true;
 }
 
-#if LOG_FEATURE_KV
-/* Push a literal message plus an encoded kv blob.
- * Non-static: body and blob share one heap block ("body\0blob"), tracked by
- * has_large_msg so the existing ownership transfer / free path releases it.
- * Static: the body and blob are copied into the slot (truncated if too long;
- * the overflow is counted). */
-static bool ring_queue_push_kv(log_ring_queue *rq, const char *body, const char *kv,
-                               const char *file, int level, int line,
-                               double timestamp, bool blocking) {
+#if LOG_FEATURE_KV || LOG_FEATURE_FILTER
+/* Push a literal, already-rendered message (plus an optional encoded kv blob).
+ * Non-static: a small body with no kv stays inline in the slot; a large body
+ * or any kv goes into one heap block ("body\0blob") tracked by has_large_msg
+ * so the existing ownership transfer / free path releases it.
+ * Static: body and blob are copied into the slot (truncated if too long; the
+ * overflow is counted). */
+static bool ring_queue_push_body(log_ring_queue *rq, const char *body, const char *kv,
+                                 const char *file, int level, int line,
+                                 double timestamp, bool blocking) {
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_lock(&rq->mtx);
 #else
@@ -1086,7 +1107,12 @@ static bool ring_queue_push_kv(log_ring_queue *rq, const char *body, const char 
   }
 
   size_t body_len = body ? strlen(body) : 0;
+#if LOG_FEATURE_KV
   size_t kv_len = kv_blob_size(kv);   /* self-describing; may contain NULs */
+#else
+  size_t kv_len = 0;
+  (void)kv;
+#endif
 #if LOG_FEATURE_STATIC_ALLOC
   entry->has_large_msg = false;
   if (body_len >= sizeof(entry->msg)) {
@@ -1095,6 +1121,7 @@ static bool ring_queue_push_kv(log_ring_queue *rq, const char *body, const char 
   }
   if (body) memcpy(entry->msg, body, body_len);
   entry->msg[body_len] = '\0';
+#if LOG_FEATURE_KV
   if (kv_len > sizeof(entry->kv_storage)) {
     /* The blob is self-describing and cannot be split: drop it whole. */
     entry->has_kv = false;
@@ -1103,27 +1130,39 @@ static bool ring_queue_push_kv(log_ring_queue *rq, const char *body, const char 
     entry->has_kv = kv_len > 0;
     if (kv_len) memcpy(entry->kv_storage, kv, kv_len);
   }
-#else
-  char *combined = malloc(body_len + 1 + kv_len + 1);
-  if (!combined) {
-    if (entry->has_large_file) {
-      free(*(char**)entry->file);
-      entry->has_large_file = false;
-    }
-#if defined(LOG_PLATFORM_POSIX)
-    pthread_mutex_unlock(&rq->mtx);
-#else
-    LeaveCriticalSection(&rq->mtx);
 #endif
-    return false;
+#else
+  if (kv_len > 0 || body_len >= sizeof(entry->msg)) {
+    char *combined = malloc(body_len + 1 + kv_len + 1);
+    if (!combined) {
+      if (entry->has_large_file) {
+        free(*(char**)entry->file);
+        entry->has_large_file = false;
+      }
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&rq->mtx);
+#else
+      LeaveCriticalSection(&rq->mtx);
+#endif
+      return false;
+    }
+    if (body_len) memcpy(combined, body, body_len);
+    combined[body_len] = '\0';
+    if (kv_len) memcpy(combined + body_len + 1, kv, kv_len);
+    combined[body_len + 1 + kv_len] = '\0';
+    entry->has_large_msg = true;
+#if LOG_FEATURE_KV
+    entry->has_kv = kv_len > 0;
+#endif
+    *(char**)entry->msg = combined;
+  } else {
+    entry->has_large_msg = false;
+    if (body) memcpy(entry->msg, body, body_len);
+    entry->msg[body_len] = '\0';
+#if LOG_FEATURE_KV
+    entry->has_kv = false;
+#endif
   }
-  if (body_len) memcpy(combined, body, body_len);
-  combined[body_len] = '\0';
-  if (kv_len) memcpy(combined + body_len + 1, kv, kv_len);
-  combined[body_len + 1 + kv_len] = '\0';
-  entry->has_large_msg = true;
-  entry->has_kv = kv_len > 0;
-  *(char**)entry->msg = combined;
 #endif
 
   entry->level = level;
@@ -1138,6 +1177,15 @@ static bool ring_queue_push_kv(log_ring_queue *rq, const char *body, const char 
   LeaveCriticalSection(&rq->mtx);
 #endif
   return true;
+}
+#endif /* LOG_FEATURE_KV || LOG_FEATURE_FILTER */
+
+#if LOG_FEATURE_KV
+/* Backwards-compatible name for the kv path. */
+static bool ring_queue_push_kv(log_ring_queue *rq, const char *body, const char *kv,
+                               const char *file, int level, int line,
+                               double timestamp, bool blocking) {
+  return ring_queue_push_body(rq, body, kv, file, level, line, timestamp, blocking);
 }
 #endif /* LOG_FEATURE_KV */
 #endif /* LOG_FEATURE_ASYNC */
@@ -1274,6 +1322,8 @@ static void ring_queue_shutdown(log_ring_queue *rq) {
 }
 
 #endif /* LOG_FEATURE_RING_QUEUE */
+
+/* ==================== Formatting helpers ==================== */
 
 /* Format helpers: the message is formatted exactly once, then shared by all handlers.
  * Sets *heap_owned when the caller must free the returned pointer; otherwise the
@@ -1644,6 +1694,67 @@ static void crash_refresh_targets(log_handle *ctx) {
   crash_targets.count = n;
 }
 
+#if LOG_FEATURE_MEMORY_HANDLER
+/* Registry of flight-recorder stores to dump from the fatal-signal handler.
+ * Pointer written before count, so a signal arriving mid-registration sees
+ * either the old or the new set. Bounded; stores beyond the cap are simply
+ * not dumped on crash. */
+#define LOG_CRASH_MEM_MAX 8
+static struct {
+  const log_memory_store *stores[LOG_CRASH_MEM_MAX];
+  int count;
+} crash_memory;
+
+static void crash_memory_register(const log_memory_store *st) {
+  if (crash_memory.count >= LOG_CRASH_MEM_MAX) return;
+  crash_memory.stores[crash_memory.count] = st;
+  crash_memory.count++;
+}
+
+static void crash_memory_unregister(const log_memory_store *st) {
+  for (int i = 0; i < crash_memory.count; i++) {
+    if (crash_memory.stores[i] == st) {
+      crash_memory.stores[i] = crash_memory.stores[crash_memory.count - 1];
+      crash_memory.count--;
+      return;
+    }
+  }
+}
+
+#if defined(LOG_PLATFORM_POSIX)
+/* Async-signal-safe tail dump: walk each registered ring and write(2) the
+ * retained lines to the crash target fds. No locks, no allocation; a store
+ * concurrently mid-write may expose at most one inconsistent entry, which is
+ * acceptable for a dying process. */
+static void crash_memory_dump(void) {
+  static const char header[] = "==== log: flight recorder tail ====\n";
+  for (int s = 0; s < crash_memory.count; s++) {
+    const log_memory_store *st = crash_memory.stores[s];
+    if (!st || !st->entries) continue;
+    size_t cap = st->capacity;
+    if (cap == 0) continue;
+    size_t count = st->count;
+    if (count > cap) count = cap;
+    size_t start = (count < cap) ? 0 : st->head;   /* oldest entry */
+    for (int i = 0; i < crash_targets.count; i++) {
+      ssize_t r = write(crash_targets.fds[i], header, sizeof(header) - 1);
+      (void)r;
+    }
+    for (size_t k = 0; k < count; k++) {
+      const log_memory_entry *e = &st->entries[(start + k) % cap];
+      int len = e->len;
+      if (len <= 0) continue;
+      if ((size_t)len > LOG_MEMORY_LINE_MAX) len = (int)LOG_MEMORY_LINE_MAX;
+      for (int i = 0; i < crash_targets.count; i++) {
+        ssize_t r = write(crash_targets.fds[i], e->line, (size_t)len);
+        (void)r;
+      }
+    }
+  }
+}
+#endif /* LOG_PLATFORM_POSIX */
+#endif /* LOG_FEATURE_MEMORY_HANDLER */
+
 #if defined(LOG_PLATFORM_POSIX)
 /* Async-signal-safe marker line: constant text plus a hand-rolled integer
  * conversion. Only write(2)/memcpy/stack are used here. */
@@ -1672,6 +1783,9 @@ static void crash_marker_write(int sig) {
  * recursing. */
 static void crash_signal_handler(int sig) {
   crash_marker_write(sig);
+#if LOG_FEATURE_MEMORY_HANDLER
+  crash_memory_dump();
+#endif
   kill(getpid(), sig);
 }
 #endif /* LOG_PLATFORM_POSIX */
@@ -1859,6 +1973,83 @@ static void file_handler_wrapper(log_handle *ctx, log_event *ev) {
     if (heap_fb) free(msg);
   }
 }
+
+#if LOG_FEATURE_MEMORY_HANDLER
+/* In-memory flight recorder (B1). Render the complete line (prefix + body +
+ * kv suffix + '\n') once and append it to the handler's ring. The store lock
+ * serializes concurrent producers: the ctx rwlock is only a read lock during
+ * dispatch, so handlers must guard their own mutable state. */
+static void memory_handler(log_handle *ctx, log_event *ev) {
+  log_memory_store *st = (log_memory_store*)ev->udata;
+  if (!st || !st->entries || st->capacity == 0) return;
+
+  bool heap_msg = false;
+  char *msg = format_message(ev, &heap_msg);
+  if (!msg) return;
+
+  log_FormatFn handler_fmt = NULL;
+  bool show_tid = false;
+  if (ctx) {
+    for (int i = 0; i < ctx->handler_count; i++) {
+      if (ctx->handlers[i].kind == HANDLER_MEMORY && ctx->handlers[i].udata == st) {
+        handler_fmt = ctx->handlers[i].format_fn;
+        show_tid = ctx->handlers[i].show_thread_id;
+        break;
+      }
+    }
+  }
+
+  char prefix[512];
+  int plen = format_prefix(ctx, ev, handler_fmt, prefix, sizeof(prefix), show_tid, false);
+  if (plen < 0) plen = 0;
+  if ((size_t)plen >= sizeof(prefix)) plen = (int)sizeof(prefix) - 1;
+
+#if LOG_FEATURE_KV
+  char kv_buf[LOG_KV_TEXT_RENDER_MAX];
+  const char *kv_text = "";
+  if (ev->kv) {
+    kv_render_text(ev->kv, kv_buf, sizeof(kv_buf));
+    kv_text = kv_buf;
+  }
+#else
+  const char *kv_text = "";
+#endif
+
+  char line[LOG_MEMORY_LINE_MAX];
+  int n = snprintf(line, sizeof(line), "%s%s%s\n", prefix, msg, kv_text);
+  if (heap_msg) free(msg);
+  if (n < 0) return;
+
+  size_t len = (size_t)n;
+  if (len >= sizeof(line)) {
+    /* Truncated: force a terminating '\n' so every dumped record is still a
+     * complete, newline-terminated line (and crash write(2) emits whole
+     * lines). The final byte is therefore always '\n' when len > 0. */
+    len = sizeof(line) - 1;
+    line[len - 1] = '\n';
+    line[len] = '\0';
+    STAT_INC(truncated_count);
+  }
+
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&st->mtx);
+#else
+  EnterCriticalSection(&st->mtx);
+#endif
+  log_memory_entry *e = &st->entries[st->head];
+  memcpy(e->line, line, len);
+  e->line[len] = '\0';
+  e->len = (int)len;
+  e->level = ev->level;
+  st->head = (st->head + 1) % st->capacity;
+  if (st->count < st->capacity) st->count++;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&st->mtx);
+#else
+  LeaveCriticalSection(&st->mtx);
+#endif
+}
+#endif /* LOG_FEATURE_MEMORY_HANDLER */
 
 #if LOG_FEATURE_JSON
 /* Escape a NUL-terminated string for use inside a JSON string literal.
@@ -2152,6 +2343,15 @@ static bool init_context(log_handle *ctx) {
   ctx->queue_policy = LOG_QUEUE_FALLBACK_SYNC;
   ctx->crash_safe = false;
 
+#if LOG_FEATURE_FILTER
+  memset(&ctx->filter, 0, sizeof(ctx->filter));
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_init(&ctx->filter.mtx, NULL);
+#else
+  InitializeCriticalSection(&ctx->filter.mtx);
+#endif
+#endif
+
   queue_init(&ctx->queue, DEFAULT_QUEUE_SIZE);
 
   ctx->handler_capacity = MAX_HANDLERS;
@@ -2265,6 +2465,9 @@ static int lifecycle_find(log_handle *ctx) {
 static void lifecycle_lock(log_handle *ctx) {
   pthread_mutex_lock(&ctx->mutex);
   rwlock_write_lock(&ctx->rwlock);
+#if LOG_FEATURE_FILTER
+  pthread_mutex_lock(&ctx->filter.mtx);
+#endif
   pthread_mutex_lock(&ctx->file_mtx);
   pthread_mutex_lock(&ctx->queue.mtx);
 #if LOG_FEATURE_RING_QUEUE
@@ -2284,6 +2487,9 @@ static void lifecycle_unlock(log_handle *ctx) {
 #endif
   pthread_mutex_unlock(&ctx->queue.mtx);
   pthread_mutex_unlock(&ctx->file_mtx);
+#if LOG_FEATURE_FILTER
+  pthread_mutex_unlock(&ctx->filter.mtx);
+#endif
   rwlock_write_unlock(&ctx->rwlock);
   pthread_mutex_unlock(&ctx->mutex);
 }
@@ -2295,6 +2501,9 @@ static void lifecycle_reinit(log_handle *ctx) {
   rwlock_init(&ctx->rwlock);
   pthread_mutex_init(&ctx->mutex, NULL);
   pthread_mutex_init(&ctx->file_mtx, NULL);
+#if LOG_FEATURE_FILTER
+  pthread_mutex_init(&ctx->filter.mtx, NULL);
+#endif
   pthread_mutex_init(&ctx->queue.mtx, NULL);
   pthread_cond_init(&ctx->queue.cond, NULL);
   pthread_cond_init(&ctx->queue.space_cond, NULL);
@@ -2426,10 +2635,155 @@ int log_install_atexit(log_handle *ctx) { (void)ctx; return -1; }  /* POSIX only
 
 #endif /* LOG_FEATURE_LIFECYCLE && POSIX */
 
+/* ==================== Named loggers (B4) ==================== */
+#if LOG_FEATURE_NAMED
+
+/* Build an alias handle that shares `def`'s handlers and owns only its own
+ * level/quiet. Caller holds def->mutex. */
+static log_handle* named_alias_create(log_handle *def, const char *name) {
+  log_handle *h = calloc(1, sizeof(log_handle));
+  if (!h) return NULL;
+  rwlock_init(&h->rwlock);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_init(&h->mutex, NULL);
+  pthread_mutex_init(&h->file_mtx, NULL);
+#else
+  InitializeCriticalSection(&h->mutex);
+  InitializeCriticalSection(&h->file_mtx);
+#endif
+#if LOG_FEATURE_FILTER
+  memset(&h->filter, 0, sizeof(h->filter));
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_init(&h->filter.mtx, NULL);
+#else
+  InitializeCriticalSection(&h->filter.mtx);
+#endif
+#endif
+  h->base = def;
+  h->level = def->level;
+  h->quiet = false;
+  h->async_enabled = false;
+
+  size_t n = strlen(name);
+  memcpy(def->named[def->named_count].name, name, n);
+  def->named[def->named_count].name[n] = '\0';
+  def->named[def->named_count].handle = h;
+  def->named_count++;
+  return h;
+}
+
+static void named_alias_free(log_handle *h) {
+  if (!h) return;
+  rwlock_destroy(&h->rwlock);
+#if LOG_FEATURE_FILTER
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_destroy(&h->filter.mtx);
+#else
+  DeleteCriticalSection(&h->filter.mtx);
+#endif
+#endif
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_destroy(&h->mutex);
+  pthread_mutex_destroy(&h->file_mtx);
+#else
+  DeleteCriticalSection(&h->mutex);
+  DeleteCriticalSection(&h->file_mtx);
+#endif
+  free(h);
+}
+
+log_handle* log_get(const char *name) {
+  log_handle *def = log_default();
+  if (!def) return NULL;
+  if (!name || name[0] == '\0' || strlen(name) >= LOG_NAMED_NAME_MAX) {
+    log_warn("log_get: invalid name, using default context");
+    return def;
+  }
+
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&def->mutex);
+#else
+  EnterCriticalSection(&def->mutex);
+#endif
+  log_handle *found = NULL;
+  for (int i = 0; i < def->named_count; i++) {
+    if (strcmp(def->named[i].name, name) == 0) {
+      found = def->named[i].handle;
+      break;
+    }
+  }
+  bool full = false;
+  if (!found) {
+    if (def->named_count >= LOG_NAMED_MAX) {
+      full = true;
+    } else {
+      found = named_alias_create(def, name);
+    }
+  }
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&def->mutex);
+#else
+  LeaveCriticalSection(&def->mutex);
+#endif
+
+  if (full) {
+    log_warn("log_get: named logger registry full, using default context");
+    return def;
+  }
+  if (!found) {
+    log_warn("log_get: allocation failed, using default context");
+    return def;
+  }
+  return found;
+}
+
+void log_named_set_level(const char *name, int level) {
+  if (!name || name[0] == '\0' || strlen(name) >= LOG_NAMED_NAME_MAX) return;
+  log_handle *def = log_default();
+  if (!def) return;
+
+  log_handle *target = NULL;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&def->mutex);
+#else
+  EnterCriticalSection(&def->mutex);
+#endif
+  for (int i = 0; i < def->named_count; i++) {
+    if (strcmp(def->named[i].name, name) == 0) {
+      target = def->named[i].handle;
+      break;
+    }
+  }
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&def->mutex);
+#else
+  LeaveCriticalSection(&def->mutex);
+#endif
+
+  if (!target) target = log_get(name);
+  if (target && target != def) log_set_level(target, level);
+}
+
+#endif /* LOG_FEATURE_NAMED */
+
+/* ==================== Public API: context lifecycle & configuration ==================== */
+
 void log_destroy(log_handle *ctx) {
   if (!ctx) return;
 
+#if LOG_FEATURE_NAMED
+  /* Named loggers are owned by the default context; destroying one is a
+   * no-op (it is freed when its owner is destroyed). */
+  if (ctx->base) return;
+#endif
+
   lifecycle_unregister(ctx);
+
+#if LOG_FEATURE_FILTER
+  /* Emit any pending "last message repeated N times" summaries before the
+   * queue is drained/closed and the handlers go away. */
+  log_flush_suppressed(ctx);
+#endif
 
   if (ctx->async_enabled) {
 #if LOG_FEATURE_RING_QUEUE
@@ -2462,6 +2816,22 @@ void log_destroy(log_handle *ctx) {
       }
     }
     free(ctx->handlers[i].filename);
+#if LOG_FEATURE_MEMORY_HANDLER
+    if (ctx->handlers[i].kind == HANDLER_MEMORY && ctx->handlers[i].udata) {
+      log_memory_store *st = (log_memory_store*)ctx->handlers[i].udata;
+#if LOG_FEATURE_CRASH_MODE
+      crash_memory_unregister(st);
+#endif
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_destroy(&st->mtx);
+#else
+      DeleteCriticalSection(&st->mtx);
+#endif
+      free(st->entries);
+      free(st);
+      ctx->handlers[i].udata = NULL;
+    }
+#endif
   }
 #if LOG_FEATURE_STATIC_ALLOC
   /* handlers storage is embedded in the caller-provided context */
@@ -2471,6 +2841,13 @@ void log_destroy(log_handle *ctx) {
 
   free(ctx->file_prefix);
   free(ctx->syslog_ident);
+#if LOG_FEATURE_FILTER
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_destroy(&ctx->filter.mtx);
+#else
+  DeleteCriticalSection(&ctx->filter.mtx);
+#endif
+#endif
 #if defined(LOG_PLATFORM_POSIX)
   pthread_mutex_destroy(&ctx->mutex);
   pthread_mutex_destroy(&ctx->file_mtx);
@@ -2482,6 +2859,14 @@ void log_destroy(log_handle *ctx) {
   rwlock_destroy(&ctx->rwlock);
 #if LOG_FEATURE_MPOOL
   mpool_destroy(&ctx->mpool);
+#endif
+#if LOG_FEATURE_NAMED
+  /* Named aliases are owned by this context; free them with it. */
+  for (int i = 0; i < ctx->named_count; i++) {
+    named_alias_free(ctx->named[i].handle);
+    ctx->named[i].handle = NULL;
+  }
+  ctx->named_count = 0;
 #endif
 #if LOG_FEATURE_STATIC_ALLOC
   /* context memory belongs to the caller's storage block */
@@ -2770,6 +3155,7 @@ static void stats_snapshot(log_handle *ctx, log_stats *stats) {
     acc.async_writes += s->async_writes;
     acc.sync_writes += s->sync_writes;
     acc.truncated_count += s->truncated_count;
+    acc.suppressed_count += s->suppressed_count;
     lat_count += s->queue_latency_count;
     lat_total += s->queue_latency_total_ms;
   }
@@ -2784,6 +3170,7 @@ static void stats_snapshot(log_handle *ctx, log_stats *stats) {
     acc.async_writes += s->async_writes;
     acc.sync_writes += s->sync_writes;
     acc.truncated_count += s->truncated_count;
+    acc.suppressed_count += s->suppressed_count;
     lat_count += s->queue_latency_count;
     lat_total += s->queue_latency_total_ms;
   }
@@ -2806,6 +3193,8 @@ void log_get_perf_stats(log_handle *ctx, log_stats *stats) {
   stats_snapshot(ctx, stats);
 }
 #endif /* LOG_FEATURE_STATS */
+
+/* ==================== Handler management ==================== */
 
 int log_add_handler(log_handle *ctx, log_LogFn fn, void *udata, int level) {
   if (!fn || !ctx || ctx->handler_count >= ctx->handler_capacity) {
@@ -2865,6 +3254,98 @@ int log_add_fp(log_handle *ctx, FILE *fp, int level) {
   return ctx->handler_count - 1;
 }
 
+#if LOG_FEATURE_MEMORY_HANDLER
+int log_add_memory_handler(log_handle *ctx, int lines, int level) {
+  if (!ctx || lines <= 0) return -1;
+  if (ctx->handler_count >= ctx->handler_capacity) return -1;
+  if (lines > LOG_MEMORY_MAX_LINES) lines = LOG_MEMORY_MAX_LINES;
+
+  log_memory_store *st = calloc(1, sizeof(*st));
+  if (!st) return -1;
+  st->entries = calloc((size_t)lines, sizeof(log_memory_entry));
+  if (!st->entries) { free(st); return -1; }
+  st->capacity = (size_t)lines;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_init(&st->mtx, NULL);
+#else
+  InitializeCriticalSection(&st->mtx);
+#endif
+
+  rwlock_write_lock(&ctx->rwlock);
+  /* Re-check under the write lock: a concurrent add may have filled the
+   * table between the hint check above and here. */
+  if (ctx->handler_count >= ctx->handler_capacity) {
+    rwlock_write_unlock(&ctx->rwlock);
+#if defined(LOG_PLATFORM_POSIX)
+    pthread_mutex_destroy(&st->mtx);
+#else
+    DeleteCriticalSection(&st->mtx);
+#endif
+    free(st->entries);
+    free(st);
+    return -1;
+  }
+
+  log_handler *h = &ctx->handlers[ctx->handler_count++];
+  h->fn = memory_handler;
+  h->udata = st;
+  h->level = level;
+  h->active = true;
+  h->fp = NULL;
+  h->filename = NULL;
+  h->file_size = 0;
+  h->syslog_enabled = false;
+  h->syslog_facility = LOG_USER;
+  h->show_thread_id = false;
+  h->kind = HANDLER_MEMORY;
+  h->owns_file = false;
+  h->flush_policy = LOG_FLUSH_NEVER;
+  h->flush_interval_ms = 0;
+  h->flush_fsync = false;
+  h->last_flush = 0.0;
+  h->format_fn = NULL;
+
+  rwlock_write_unlock(&ctx->rwlock);
+#if LOG_FEATURE_CRASH_MODE
+  crash_memory_register(st);
+#endif
+  return ctx->handler_count - 1;
+}
+
+void log_dump_memory_handler(log_handle *ctx, int handler_idx, FILE *out) {
+  if (!ctx || !out) return;
+  if (handler_idx < 0 || handler_idx >= ctx->handler_count) return;
+
+  rwlock_read_lock(&ctx->rwlock);
+  log_handler *h = &ctx->handlers[handler_idx];
+  if (h->kind != HANDLER_MEMORY || !h->udata) {
+    rwlock_read_unlock(&ctx->rwlock);
+    return;
+  }
+  log_memory_store *st = (log_memory_store*)h->udata;
+  /* Hold the store lock for the whole dump so the sequence is a consistent
+   * snapshot: producers block briefly, but no entry is torn or reordered. */
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&st->mtx);
+#else
+  EnterCriticalSection(&st->mtx);
+#endif
+  size_t cap = st->capacity;
+  size_t count = st->count;
+  size_t start = (count < cap) ? 0 : st->head;   /* oldest entry */
+  for (size_t k = 0; k < count; k++) {
+    log_memory_entry *e = &st->entries[(start + k) % cap];
+    if (e->len > 0) fwrite(e->line, 1, (size_t)e->len, out);
+  }
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&st->mtx);
+#else
+  LeaveCriticalSection(&st->mtx);
+#endif
+  rwlock_read_unlock(&ctx->rwlock);
+}
+#endif /* LOG_FEATURE_MEMORY_HANDLER */
+
 #if LOG_FEATURE_FILE_OPS
 int log_add_file(log_handle *ctx, const char *filename, int level) {
   if (!ctx || !filename) return -1;
@@ -2904,9 +3385,16 @@ void log_remove_handler(log_handle *ctx, int idx) {
   if (!ctx || idx < 0 || idx >= ctx->handler_count) return;
   
   rwlock_write_lock(&ctx->rwlock);
+#if LOG_FEATURE_MEMORY_HANDLER && LOG_FEATURE_CRASH_MODE
+  if (ctx->handlers[idx].kind == HANDLER_MEMORY && ctx->handlers[idx].udata) {
+    crash_memory_unregister((const log_memory_store*)ctx->handlers[idx].udata);
+  }
+#endif
   ctx->handlers[idx].active = false;
   rwlock_write_unlock(&ctx->rwlock);
 }
+
+/* ==================== Formatting & synchronous dispatch ==================== */
 
 /* Format the message body once (thread-local buffer; exact-size heap
  * fallback for oversized messages, truncation in static mode), then
@@ -2956,8 +3444,303 @@ static void sync_format_and_dispatch(log_handle *ctx, log_event *ev) {
   free(big);
 }
 
+/* ==================== Log flood control (B3) ==================== */
+#if LOG_FEATURE_FILTER
+
+/* FNV-1a 64-bit over `len` bytes, continuing from seed `h`. */
+static uint64_t fnv1a_64(const void *data, size_t len, uint64_t h) {
+  const unsigned char *p = (const unsigned char*)data;
+  for (size_t i = 0; i < len; i++) {
+    h ^= p[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+typedef struct log_filter_result {
+  bool suppress;          /* current message must not be emitted */
+  bool emit_summary;      /* a pending dedupe summary must be emitted first */
+  int summary_level;
+  unsigned summary_count;
+} log_filter_result;
+
+/* Render a printf-style body for the filter path. Returns tl_msg_buf when the
+ * body fits, or an exact-size heap copy (tracked in *owned) otherwise; static
+ * builds always truncate into tl_msg_buf. */
+static const char* filter_render_body(const char *fmt, va_list ap, char **owned) {
+  *owned = NULL;
+  va_list probe;
+  va_copy(probe, ap);
+  int len = vsnprintf(NULL, 0, fmt, probe);
+  va_end(probe);
+  if (len < 0) return "";
+  if ((size_t)len < sizeof(tl_msg_buf)) {
+    vsnprintf(tl_msg_buf, sizeof(tl_msg_buf), fmt, ap);
+    return tl_msg_buf;
+  }
+#if LOG_FEATURE_STATIC_ALLOC
+  vsnprintf(tl_msg_buf, sizeof(tl_msg_buf), fmt, ap);
+  return tl_msg_buf;
+#else
+  char *big = malloc((size_t)len + 1);
+  if (!big) return "";
+  vsnprintf(big, (size_t)len + 1, fmt, ap);
+  *owned = big;
+  return big;
+#endif
+}
+
+/* Decide whether a rendered message should be emitted. `body` is the rendered
+ * text; `kv`/`kv_len` are the optional encoded kv bytes (hashed with the body
+ * so distinct structured events are not collapsed). All state is per level. */
+static void filter_check(log_handle *ctx, int level, const char *body,
+                         const void *kv, size_t kv_len, double now,
+                         log_filter_result *res) {
+  level = clamp_level(level);   /* caller may pass an out-of-range level */
+  res->suppress = false;
+  res->emit_summary = false;
+  res->summary_level = level;
+  res->summary_count = 0;
+  log_filter *f = &ctx->filter;
+
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&f->mtx);
+#else
+  EnterCriticalSection(&f->mtx);
+#endif
+
+  /* Rate limit: at most max_per_sec messages per one-second window. */
+  log_rate_limit *rl = &f->rate[level];
+  if (rl->max_per_sec > 0) {
+    if (rl->window_start == 0.0 || now - rl->window_start >= 1.0) {
+      rl->window_start = now;
+      rl->count = 0;
+    }
+    if (rl->count >= rl->max_per_sec) {
+      res->suppress = true;
+      STAT_INC(suppressed_count);
+      goto done;
+    }
+    rl->count++;
+  }
+
+  /* Dedupe: one active group per level. A different (or post-window) message
+   * closes the current group; if it had suppressed repeats, ask the caller to
+   * emit the summary line first. */
+  {
+    unsigned win = f->dedupe_window_ms[level];
+    log_dedupe_group *g = &f->dedupe[level];
+    uint64_t h = 1469598103934665603ULL;
+    if (win > 0) {
+      h = fnv1a_64(body, body ? strlen(body) : 0, h);
+      if (kv && kv_len) h = fnv1a_64(kv, kv_len, h);
+    }
+    if (g->active) {
+      bool expired = (win == 0) || (now - g->window_start >= (double)win / 1000.0);
+      bool different = (win == 0) || (h != g->hash);
+      if (g->suppressed > 0 && (expired || different)) {
+        res->emit_summary = true;
+        res->summary_count = g->suppressed;
+      }
+      if (expired || different) {
+        g->active = false;
+        g->suppressed = 0;
+      }
+    }
+    if (win > 0) {
+      if (g->active && h == g->hash) {
+        g->suppressed++;
+        res->suppress = true;
+        STAT_INC(suppressed_count);
+      } else {
+        g->active = true;
+        g->hash = h;
+        g->window_start = now;
+        g->suppressed = 0;
+      }
+    }
+  }
+
+done:
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&f->mtx);
+#else
+  LeaveCriticalSection(&f->mtx);
+#endif
+}
+
+/* Dispatch a fully rendered line to the handlers. Caller holds ctx->rwlock
+ * for reading (sync path). */
+static void filter_dispatch_raw(log_handle *ctx, int level, const char *file,
+                                int line, double timestamp, const char *body) {
+  log_event ev = {0};
+  ev.fmt = body;
+  ev.raw_msg = body;
+  ev.file = file;
+  ev.line = line;
+  ev.level = level;
+  ev.timestamp = timestamp;
+  sync_format_and_dispatch(ctx, &ev);
+}
+
+static bool filter_is_async(log_handle *ctx) {
+#if LOG_FEATURE_CRASH_MODE
+  return ctx->async_enabled && !ctx->crash_safe;
+#else
+  return ctx->async_enabled;
+#endif
+}
+
+#if LOG_FEATURE_ASYNC
+/* Enqueue a fully rendered line. Returns 1 enqueued, 0 dropped (DROP policy),
+ * -1 caller must write synchronously (FALLBACK_SYNC / BLOCK). */
+static int filter_enqueue(log_handle *ctx, int level, const char *file, int line,
+                          double timestamp, const char *body, const char *kv,
+                          int queue_policy) {
+#if LOG_FEATURE_RING_QUEUE
+  if (ctx->use_ring_queue) {
+    if (ring_queue_push_body(&ctx->ring_queue, body, kv, file, level, line,
+                             timestamp, queue_policy == LOG_QUEUE_BLOCK)) {
+      return 1;
+    }
+  } else
+#endif
+  {
+    log_queue_entry *entry = queue_entry_create_body(ctx, body, kv, file, level,
+                                                     line, timestamp);
+    bool ok = entry && queue_push(ctx, entry, queue_policy == LOG_QUEUE_BLOCK);
+    if (!ok && entry) queue_entry_destroy(ctx, entry);
+    if (ok) return 1;
+  }
+  if (queue_policy == LOG_QUEUE_DROP) return 0;
+  return -1;
+}
+#endif /* LOG_FEATURE_ASYNC */
+
+/* Emit a pending dedupe summary. lock_held says whether the caller already
+ * holds ctx->rwlock for reading (sync dispatch inline); otherwise the async
+ * path enqueues it, falling back to a synchronous write if needed. */
+static void filter_emit_summary(log_handle *ctx, int level, unsigned count,
+                                bool lock_held) {
+  char buf[80];
+  double ts = get_timestamp_with_clock(ctx->clock_source);
+  snprintf(buf, sizeof(buf), "last message repeated %u times", count);
+
+  if (!filter_is_async(ctx)) {
+    if (!lock_held) rwlock_read_lock(&ctx->rwlock);
+    filter_dispatch_raw(ctx, level, "log_filter", 0, ts, buf);
+    if (!lock_held) rwlock_read_unlock(&ctx->rwlock);
+    return;
+  }
+#if LOG_FEATURE_ASYNC
+  {
+    int policy = ctx->queue_policy;
+    int r = filter_enqueue(ctx, level, "log_filter", 0, ts, buf, NULL, policy);
+    if (r == -1) {
+      rwlock_read_lock(&ctx->rwlock);
+      filter_dispatch_raw(ctx, level, "log_filter", 0, ts, buf);
+      rwlock_read_unlock(&ctx->rwlock);
+    }
+  }
+#else
+  (void)lock_held;
+#endif
+}
+
+/* Public B3 API ----------------------------------------------------------- */
+
+void log_set_rate_limit(log_handle *ctx, int level, unsigned max_per_sec) {
+  if (!ctx || level < 0 || level >= LOG_LEVELS) return;
+  rwlock_write_lock(&ctx->rwlock);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&ctx->filter.mtx);
+#else
+  EnterCriticalSection(&ctx->filter.mtx);
+#endif
+  ctx->filter.rate[level].max_per_sec = max_per_sec;
+  ctx->filter.rate[level].count = 0;
+  ctx->filter.rate[level].window_start = 0.0;
+  if (max_per_sec) ctx->filter.enabled = true;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&ctx->filter.mtx);
+#else
+  LeaveCriticalSection(&ctx->filter.mtx);
+#endif
+  rwlock_write_unlock(&ctx->rwlock);
+}
+
+void log_set_dedupe(log_handle *ctx, int level, unsigned window_ms) {
+  if (!ctx || level < 0 || level >= LOG_LEVELS) return;
+  rwlock_write_lock(&ctx->rwlock);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&ctx->filter.mtx);
+#else
+  EnterCriticalSection(&ctx->filter.mtx);
+#endif
+  ctx->filter.dedupe_window_ms[level] = window_ms;
+  ctx->filter.dedupe[level].active = false;
+  ctx->filter.dedupe[level].suppressed = 0;
+  if (window_ms) ctx->filter.enabled = true;
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&ctx->filter.mtx);
+#else
+  LeaveCriticalSection(&ctx->filter.mtx);
+#endif
+  rwlock_write_unlock(&ctx->rwlock);
+}
+
+void log_flush_suppressed(log_handle *ctx) {
+  if (!ctx) return;
+  stats_ensure_registered(ctx);
+
+  int levels[LOG_LEVELS];
+  unsigned counts[LOG_LEVELS];
+  int n = 0;
+
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&ctx->filter.mtx);
+#else
+  EnterCriticalSection(&ctx->filter.mtx);
+#endif
+  for (int l = 0; l < LOG_LEVELS; l++) {
+    log_dedupe_group *g = &ctx->filter.dedupe[l];
+    if (g->active && g->suppressed > 0) {
+      levels[n] = l;
+      counts[n] = g->suppressed;
+      n++;
+      g->suppressed = 0;
+    }
+  }
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_unlock(&ctx->filter.mtx);
+#else
+  LeaveCriticalSection(&ctx->filter.mtx);
+#endif
+
+  /* Emit outside the filter lock: emission takes the rwlock / queue locks. */
+  for (int i = 0; i < n; i++) {
+    filter_emit_summary(ctx, levels[i], counts[i], false);
+  }
+}
+
+#endif /* LOG_FEATURE_FILTER */
+
+/* ==================== Public API: logging entry points ==================== */
+
 void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...) {
   if (!ctx || !fmt) return;
+
+  /* Named logger (B4): its own level/quiet gate, then emit through the shared
+   * default context. The default's level must not filter it again, otherwise
+   * a named logger could never be more verbose than the default. */
+  bool apply_ctx_level = true;
+#if LOG_FEATURE_NAMED
+  if (ctx->base) {
+    if (ctx->quiet || level < ctx->level) return;
+    ctx = ctx->base;
+    apply_ctx_level = false;
+  }
+#endif
 
   /* Register before taking the rwlock: log_enable_mpool()/ts_cache() hold
    * ctx->mutex while acquiring the rwlock, so taking ctx->mutex under the
@@ -2966,7 +3749,7 @@ void log_log(log_handle *ctx, int level, const char *file, int line, const char 
 
   rwlock_read_lock(&ctx->rwlock);
 
-  if (ctx->quiet || level < ctx->level) {
+  if (apply_ctx_level && (ctx->quiet || level < ctx->level)) {
     rwlock_read_unlock(&ctx->rwlock);
     return;
   }
@@ -2990,6 +3773,61 @@ void log_log(log_handle *ctx, int level, const char *file, int line, const char 
 #else
   bool async_path = ctx->async_enabled;
 #endif
+
+#if LOG_FEATURE_FILTER
+  if (ctx->filter.enabled) {
+    char *owned = NULL;
+    va_start(ev.ap, fmt);
+    const char *body = filter_render_body(fmt, ev.ap, &owned);
+    va_end(ev.ap);
+
+    log_filter_result fr;
+    filter_check(ctx, level, body, NULL, 0, monotonic_seconds(), &fr);
+
+    if (!async_path) {
+      if (fr.emit_summary) {
+        filter_emit_summary(ctx, fr.summary_level, fr.summary_count, true);
+      }
+      if (!fr.suppress) {
+        STAT_INC(sync_writes);
+        filter_dispatch_raw(ctx, level, file, line, ev.timestamp, body);
+      }
+      free(owned);
+      rwlock_read_unlock(&ctx->rwlock);
+      return;
+    }
+
+#if LOG_FEATURE_ASYNC
+    {
+      int queue_policy = ctx->queue_policy;
+      rwlock_read_unlock(&ctx->rwlock);
+      if (fr.emit_summary) {
+        filter_emit_summary(ctx, fr.summary_level, fr.summary_count, false);
+      }
+      if (!fr.suppress) {
+        int r = filter_enqueue(ctx, level, file, line, ev.timestamp, body, NULL,
+                               queue_policy);
+        if (r == 1) {
+          STAT_INC(async_writes);
+        } else if (r == 0) {
+          STAT_INC(queue_drops);
+        } else {
+          rwlock_read_lock(&ctx->rwlock);
+          STAT_INC(sync_writes);
+          filter_dispatch_raw(ctx, level, file, line, ev.timestamp, body);
+          rwlock_read_unlock(&ctx->rwlock);
+        }
+      }
+      free(owned);
+      return;
+    }
+#else
+    free(owned);
+    rwlock_read_unlock(&ctx->rwlock);
+    return;
+#endif
+  }
+#endif /* LOG_FEATURE_FILTER */
 
   if (!async_path) {
     STAT_INC(sync_writes);
@@ -3054,6 +3892,15 @@ void log_log_kv(log_handle *ctx, int level, const char *file, int line,
                 const log_kv *kvs, int kv_count, const char *msg) {
   if (!ctx) return;
 
+  bool apply_ctx_level = true;
+#if LOG_FEATURE_NAMED
+  if (ctx->base) {
+    if (ctx->quiet || level < ctx->level) return;
+    ctx = ctx->base;
+    apply_ctx_level = false;
+  }
+#endif
+
   const char *body = msg ? msg : "";
 
   /* Encode the typed pairs into our own stack buffer before touching any
@@ -3072,7 +3919,7 @@ void log_log_kv(log_handle *ctx, int level, const char *file, int line,
 
   rwlock_read_lock(&ctx->rwlock);
 
-  if (ctx->quiet || level < ctx->level) {
+  if (apply_ctx_level && (ctx->quiet || level < ctx->level)) {
     rwlock_read_unlock(&ctx->rwlock);
     return;
   }
@@ -3098,6 +3945,53 @@ void log_log_kv(log_handle *ctx, int level, const char *file, int line,
   bool async_path = ctx->async_enabled;
 #endif
 
+#if LOG_FEATURE_FILTER
+  if (ctx->filter.enabled) {
+    log_filter_result fr;
+    filter_check(ctx, level, body, kv_blob, kv_len, monotonic_seconds(), &fr);
+
+    if (!async_path) {
+      if (fr.emit_summary) {
+        filter_emit_summary(ctx, fr.summary_level, fr.summary_count, true);
+      }
+      if (!fr.suppress) {
+        STAT_INC(sync_writes);
+        sync_format_and_dispatch(ctx, &ev);
+      }
+      rwlock_read_unlock(&ctx->rwlock);
+      return;
+    }
+
+#if LOG_FEATURE_ASYNC
+    {
+      int queue_policy = ctx->queue_policy;
+      rwlock_read_unlock(&ctx->rwlock);
+      if (fr.emit_summary) {
+        filter_emit_summary(ctx, fr.summary_level, fr.summary_count, false);
+      }
+      if (!fr.suppress) {
+        int r = filter_enqueue(ctx, level, file, line, ev.timestamp, body, kv_blob,
+                               queue_policy);
+        if (r == 1) {
+          STAT_INC(async_writes);
+        } else if (r == 0) {
+          STAT_INC(queue_drops);
+        } else {
+          rwlock_read_lock(&ctx->rwlock);
+          STAT_INC(sync_writes);
+          sync_format_and_dispatch(ctx, &ev);
+          rwlock_read_unlock(&ctx->rwlock);
+        }
+      }
+      return;
+    }
+#else
+    rwlock_read_unlock(&ctx->rwlock);
+    return;
+#endif
+  }
+#endif /* LOG_FEATURE_FILTER */
+
   if (!async_path) {
     STAT_INC(sync_writes);
     sync_format_and_dispatch(ctx, &ev);
@@ -3120,8 +4014,8 @@ void log_log_kv(log_handle *ctx, int level, const char *file, int line,
   } else
 #endif /* LOG_FEATURE_RING_QUEUE */
   {
-    log_queue_entry *entry = queue_entry_create_kv(ctx, body, kv_blob, file,
-                                                   level, line, ev.timestamp);
+    log_queue_entry *entry = queue_entry_create_body(ctx, body, kv_blob, file,
+                                                     level, line, ev.timestamp);
     pushed = entry && queue_push(ctx, entry, queue_policy == LOG_QUEUE_BLOCK);
     if (!pushed && entry) queue_entry_destroy(ctx, entry);
   }
@@ -3141,6 +4035,8 @@ void log_log_kv(log_handle *ctx, int level, const char *file, int line,
 #endif /* LOG_FEATURE_ASYNC */
 }
 #endif /* LOG_FEATURE_KV */
+
+/* ==================== Extended API: rotation, stats, format & crash ==================== */
 
 #if LOG_FEATURE_FILE_OPS
 void log_rotate(log_handle *ctx) {
@@ -3398,6 +4294,8 @@ void log_enable_thread_id(log_handle *ctx, int handler_idx, bool enable) {
   rwlock_write_unlock(&ctx->rwlock);
 }
 #endif /* LOG_FEATURE_THREAD_ID */
+
+/* ==================== Syslog integration ==================== */
 
 /* Syslog support implementation */
 #if LOG_FEATURE_SYSLOG
