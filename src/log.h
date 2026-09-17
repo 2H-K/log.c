@@ -105,7 +105,7 @@
   #define LOG_THREAD_LOCAL
 #endif
 
-#define LOG_VERSION "3.0.0"
+#define LOG_VERSION "0.1.0"
 #define LOG_MAX_QUEUE_SIZE 4096
 #define LOG_MAX_ROTATION_FILES 5
 #define LOG_DEFAULT_MAX_SIZE (10 * 1024 * 1024)

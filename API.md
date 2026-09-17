@@ -1,6 +1,6 @@
 # Enhanced Log Library API Documentation
 
-Version 3.0.0
+Version 0.1.0 (experimental)
 
 ## Table of Contents
 
@@ -42,6 +42,15 @@ structs (fenced as `INTERNAL` in the header) so the two-file build and its
 white-box tests can compile. Those fields are not part of the API, carry no
 ABI guarantee, and may change without notice — do not access them from
 application code.
+
+### Versioning & stability
+
+The current version is **0.1.0** and is **experimental**: there is no formal
+release plan and no source/ABI stability guarantee yet. Public declarations may
+still be renamed, reshaped or removed between revisions. The version history at
+the end of this document is retained for provenance only; the `3.0.0` entries
+predate the current experimental renumbering. Pin a specific commit when
+depending on this library.
 
 ### Log Levels
 
