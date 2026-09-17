@@ -10,10 +10,11 @@
 - **线程安全**: 读写锁保护配置与并发访问
 - **异步日志**: 互斥锁 + 条件变量保护的环形缓冲队列 + 专用写入线程（用于解耦而非吞吐）
 - **崩溃安全**: `log_set_crash_safe` 逐行落盘；`log_install_crash_handler` 致命信号时写入标记行（POSIX）
+- **生命周期安全**: `log_install_atfork` 在 `fork()` 后子进程重建锁并把异步降级为同步；`log_install_atexit` 退出时排空异步队列（POSIX）
 - **持久化策略**: 按 handler 配置 NEVER / EVERY / INTERVAL flush 与独立 fsync 开关
 - **静态零分配**: `-DLOG_STATIC_ALLOC` + `log_create_static`，热路径 0 次堆分配
 - **日志轮转**: 按大小自动轮转文件（最多 5 个轮转文件）
-- **结构化日志**: JSON 格式支持
+- **结构化日志**: JSON 格式支持；类型化键值元数据（`LOG_KV_*`）输出为 JSON 顶级字段或 `key=value` 文本后缀
 - **线程ID追踪**: 输出中可选显示线程ID
 - **Syslog集成**: 原生 syslog 支持（仅 POSIX）
 - **动态配置**: 运行时级别/格式更改
@@ -269,17 +270,19 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 
 | 标志 | 说明 | 节省 |
 |------|------|------|
-| `LOG_DISABLE_JSON` | 禁用 JSON 格式化 | ~2.6 KB |
+| `LOG_DISABLE_JSON` | 禁用 JSON 格式化 | ~4.7 KB |
 | `LOG_DISABLE_SYSLOG` | 禁用 Syslog 支持 | ~1.3 KB |
-| `LOG_DISABLE_ASYNC` | 禁用异步日志 | ~6.3 KB |
-| `LOG_DISABLE_MPOOL` | 禁用内存池 | ~1.4 KB |
-| `LOG_DISABLE_RING_QUEUE` | 禁用环形缓冲区队列 | ~3.0 KB |
-| `LOG_DISABLE_STATS` | 禁用性能统计 | ~1.8 KB |
+| `LOG_DISABLE_ASYNC` | 禁用异步日志 | ~8.0 KB |
+| `LOG_DISABLE_MPOOL` | 禁用内存池 | ~1.8 KB |
+| `LOG_DISABLE_RING_QUEUE` | 禁用环形缓冲区队列 | ~3.7 KB |
+| `LOG_DISABLE_STATS` | 禁用性能统计 | ~1.9 KB |
 | `LOG_DISABLE_FILE_OPS` | 禁用文件操作 | ~2.2 KB |
 | `LOG_DISABLE_THREAD_ID` | 禁用线程ID | ~0.15 KB |
 | `LOG_DISABLE_TS_CACHE` | 禁用时间戳缓存 | ~0.6 KB |
 | `LOG_DISABLE_CRASH_MODE` | 禁用崩溃安全模式 | ~1.3 KB |
-| `LOG_MINIMAL` | 禁用所有可选功能 | ~15.2 KB |
+| `LOG_DISABLE_KV` | 禁用键值元数据 | ~6.3 KB |
+| `LOG_DISABLE_LIFECYCLE` | 禁用 fork/退出生命周期安全 | ~1.7 KB |
+| `LOG_MINIMAL` | 禁用所有可选功能 | ~23.3 KB |
 
 ### 静态模式占用
 
@@ -287,11 +290,13 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 
 | 构建 | `sizeof(log_handle)` |
 |------|----------------------|
-| `LOG_STATIC_ALLOC`，`LOG_RING_CAPACITY=4096`（默认） | ~2.61 MiB |
-| `LOG_STATIC_ALLOC`，`LOG_RING_CAPACITY=256` | ~183 KiB |
+| `LOG_STATIC_ALLOC`，`LOG_RING_CAPACITY=4096`（默认） | ~3.61 MiB |
+| `LOG_STATIC_ALLOC`，`LOG_RING_CAPACITY=256` | ~246 KiB |
 | `LOG_STATIC_ALLOC` + `LOG_MINIMAL`，`LOG_RING_CAPACITY=256` | ~4 KiB |
 
-选择能吸收你突发量的最小容量；默认值偏向吞吐而非占用。
+选择能吸收你突发量的最小容量；默认值偏向吞吐而非占用。启用 KV 时每个环槽还内嵌
+`LOG_KV_INLINE_MAX`（256）字节的键值存储，开销为 `256 × LOG_RING_CAPACITY`；
+可用 `LOG_DISABLE_KV`（如 `LOG_MINIMAL`）回收。
 
 ## 📋 核心功能
 
@@ -457,6 +462,53 @@ int main(void) {
 }
 ```
 
+### 7. 结构化键值元数据
+
+给日志行附加类型化字段：JSON 格式化器输出为顶级字段，文本格式化器追加为
+`key=value` 后缀。消息按**字面量**输出（不做 `printf` 格式化），因此可以安全包含 `%`。
+
+```c
+log_ctx_info_kv(ctx, "user login",
+                LOG_KV_STR("user", "alice"),
+                LOG_KV_INT("id", 42),
+                LOG_KV_DOUBLE("score", 1.5),
+                LOG_KV_BOOL("mfa", true));
+```
+
+JSON 输出：
+
+```json
+{"time": "...", "level": "INFO", "file": "main.c", "line": 42, "message": "user login", "user": "alice", "id": 42, "score": 1.5, "mfa": true}
+```
+
+文本输出：
+
+```
+2026-09-17T10:30:45.123 INFO  main.c:42: user login user=alice id=42 score=1.5 mfa=true
+```
+
+- 键值对在调用者栈上组装（零分配）。最多编码 `LOG_KV_MAX_PAIRS`（8）对；超出部分丢弃并计入 `truncated_count`。
+- `key` 为 `NULL` 时跳过该对；空列表退化为普通消息。
+- 同步与异步路径均支持；字符串值会做 JSON 转义。
+- 各日志级别都有对应宏：`log_info_kv(msg, ...)`、`log_ctx_error_kv(...)` 等。
+- 用 `LOG_DISABLE_KV`（或 `LOG_MINIMAL`）裁剪；此时 `*_kv` 宏退化为普通消息日志。
+
+### 8. 进程生命周期安全（POSIX）
+
+异步日志在进程内保留写入线程与队列，在 `fork()` 与进程退出时很脆弱。提供两个可选辅助函数：
+
+```c
+log_set_async(ctx, true);
+log_install_atfork(ctx);   /* 初始化阶段调用一次，须在创建线程之前 */
+log_install_atexit(ctx);
+```
+
+- **`log_install_atfork(ctx)`** 安装 `pthread_atfork` 处理器。`fork()` 前后将 context 静默（持有全部锁）；子进程中重建锁并把异步降级为同步，因此子进程可继续写日志，不会因继承自已消失线程的锁而死锁。子进程正常 `exit()` 会刷出其日志行。
+- **`log_install_atexit(ctx)`** 注册 `atexit` 处理器，在进程经 `exit()` / `main` 返回退出时排空仍处于异步状态的队列。
+- 两者对同一 context 幂等；`log_destroy()` 会注销（最多 8 个 context）。
+- 仅 POSIX：Windows 下两者返回 `-1`（没有 `fork`；需要 flush 请在退出前调用 `log_set_async(ctx, false)`）。
+- 注意：`fork()` 瞬间仍在队列中的异步条目在子进程中被放弃，不会重复写出。
+
 ## 🔧 API 参考
 
 完整的 API 文档请参阅 [API.md](API.md)。
@@ -535,13 +587,13 @@ typedef struct log_stats {
 
 ## 🧪 测试
 
-项目包含 127 项测试，分为 6 个类别（以各 runner 输出的实测数为准；static_alloc 仅在 Linux + GNU ld 下构建）：
+项目包含 137 项测试，分为 6 个类别（以各 runner 输出的实测数为准；static_alloc 仅在 Linux + GNU ld 下构建）：
 
 | 类别 | 测试数 | 说明 |
 |------|--------|------|
-| core | 52 | 级别、处理器、格式、NULL安全、统计、边界、越界级别 |
+| core | 59 | 级别、处理器、格式、NULL安全、统计、键值元数据、边界、越界级别 |
 | thread | 10 | 多线程同步/异步、配置竞态、统计聚合 |
-| platform | 25 | Syslog、轮转、Unicode路径、flush策略、崩溃安全 |
+| platform | 28 | Syslog、轮转、Unicode路径、flush策略、崩溃安全、fork/退出生命周期 |
 | stress | 28 | 队列满、长消息、完整性、崩溃安全、资源 |
 | perf | 7 | 吞吐量和延迟基准测试 |
 | static_alloc | 5 | 静态零分配模式（`--wrap=malloc` 真实计数） |

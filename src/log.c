@@ -133,6 +133,15 @@ static LOG_THREAD_LOCAL char tl_msg_buf[LOG_MSG_BUF_SIZE];
  * (log_add_file / rotation reopen). Fewer write() syscalls per message. */
 #define LOG_FILE_BUF_SIZE (256 * 1024)
 
+#if LOG_FEATURE_KV
+/* Upper bound for the stack buffer an event's typed pairs are encoded into.
+ * Pairs beyond this (or beyond LOG_KV_MAX_PAIRS) are dropped and counted. */
+#define LOG_KV_ENCODE_MAX 1024
+/* Stack buffer used when a text handler renders the kv suffix. */
+#define LOG_KV_TEXT_RENDER_MAX 512
+static size_t kv_blob_size(const char *blob);   /* defined with the kv helpers */
+#endif /* LOG_FEATURE_KV */
+
 #if LOG_FEATURE_STATS
 /* Per-thread statistics pointer. Points at a slot in the current context's
  * pool (stats_registry.slots), never at thread-local storage: slots outlive
@@ -484,6 +493,9 @@ static log_queue_entry* queue_entry_create(log_handle *ctx, log_event *ev) {
   entry->line = ev->line;
   entry->timestamp = ev->timestamp;
   entry->next = NULL;
+#if LOG_FEATURE_KV
+  entry->kv = NULL;
+#endif
   return entry;
 
 fail:
@@ -500,6 +512,81 @@ fail:
   return NULL;
 }
 
+#if LOG_FEATURE_KV
+/* Literal-message variant used by log_log_kv() when the linked-list queue is
+ * active (ring queue unavailable). Body and kv are copied, never borrowed. */
+static log_queue_entry* queue_entry_create_kv(log_handle *ctx, const char *body,
+                                              const char *kv, const char *file,
+                                              int level, int line, double timestamp) {
+  (void)ctx;
+#if LOG_FEATURE_MPOOL
+  log_mpool *mp = &ctx->mpool;
+  bool use_mpool = ctx->enable_mpool;
+  log_queue_entry *entry = use_mpool ? mpool_alloc(mp) : calloc(1, sizeof(log_queue_entry));
+#else
+  log_queue_entry *entry = calloc(1, sizeof(log_queue_entry));
+#endif
+  if (!entry) return NULL;
+
+  size_t len = body ? strlen(body) : 0;
+#if LOG_FEATURE_MPOOL
+  size_t file_len = file ? strlen(file) : 0;
+#endif
+
+#if LOG_FEATURE_MPOOL
+  if (use_mpool) {
+    if (!entry->msg || len >= 512) {
+      char *new_msg = realloc(entry->msg, len + 1);
+      if (!new_msg) goto fail;
+      entry->msg = new_msg;
+    }
+    if (body) memcpy(entry->msg, body, len);
+    entry->msg[len] = '\0';
+
+    if (!entry->file || file_len >= 128) {
+      char *new_file = realloc(entry->file, file_len + 1);
+      if (!new_file) goto fail;
+      entry->file = new_file;
+    }
+    if (file) memcpy(entry->file, file, file_len);
+    entry->file[file_len] = '\0';
+  } else
+#endif
+  {
+    entry->msg = malloc(len + 1);
+    if (!entry->msg) goto fail;
+    if (body) memcpy(entry->msg, body, len);
+    entry->msg[len] = '\0';
+    entry->file = strdup(file ? file : "");
+    if (!entry->file) goto fail;
+  }
+
+  size_t kv_bytes = kv_blob_size(kv);
+  if (kv_bytes) {
+    entry->kv = malloc(kv_bytes);
+    if (!entry->kv) goto fail;
+    memcpy(entry->kv, kv, kv_bytes);
+  } else {
+    entry->kv = NULL;
+  }
+  entry->level = level;
+  entry->line = line;
+  entry->timestamp = timestamp;
+  entry->next = NULL;
+  return entry;
+
+fail:
+#if LOG_FEATURE_MPOOL
+  if (use_mpool) { mpool_free(mp, entry); return NULL; }
+#endif
+  free(entry->msg);
+  free(entry->file);
+  free(entry->kv);
+  free(entry);
+  return NULL;
+}
+#endif /* LOG_FEATURE_KV */
+
 static void queue_entry_destroy(log_handle *ctx, log_queue_entry *entry) {
   if (!entry) return;
   (void)ctx;
@@ -511,6 +598,9 @@ static void queue_entry_destroy(log_handle *ctx, log_queue_entry *entry) {
 #endif
   free(entry->msg);
   free(entry->file);
+#if LOG_FEATURE_KV
+  free(entry->kv);
+#endif
   free(entry);
 }
 #endif /* LOG_FEATURE_ASYNC */
@@ -704,6 +794,9 @@ static void queue_destroy(log_queue *q) {
     log_queue_entry *next = cur->next;
     free(cur->msg);
     free(cur->file);
+#if LOG_FEATURE_KV
+    free(cur->kv);
+#endif
     free(cur);
     cur = next;
   }
@@ -821,6 +914,9 @@ static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap
     tail = atomic_load(&rq->tail);
   }
   log_ring_entry *entry = &rq->buffer[tail & rq->mask];
+#if LOG_FEATURE_KV
+  entry->has_kv = false;
+#endif
 
   va_list ap_copy;
   va_copy(ap_copy, ap);
@@ -902,6 +998,148 @@ static bool ring_queue_push_vfmt(log_ring_queue *rq, const char *fmt, va_list ap
 #endif
   return true;
 }
+
+#if LOG_FEATURE_KV
+/* Push a literal message plus an encoded kv blob.
+ * Non-static: body and blob share one heap block ("body\0blob"), tracked by
+ * has_large_msg so the existing ownership transfer / free path releases it.
+ * Static: the body and blob are copied into the slot (truncated if too long;
+ * the overflow is counted). */
+static bool ring_queue_push_kv(log_ring_queue *rq, const char *body, const char *kv,
+                               const char *file, int level, int line,
+                               double timestamp, bool blocking) {
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_mutex_lock(&rq->mtx);
+#else
+  EnterCriticalSection(&rq->mtx);
+#endif
+  if (rq->closed) {
+#if defined(LOG_PLATFORM_POSIX)
+    pthread_mutex_unlock(&rq->mtx);
+#else
+    LeaveCriticalSection(&rq->mtx);
+#endif
+    return false;
+  }
+  size_t head = atomic_load(&rq->head);
+  size_t tail = atomic_load(&rq->tail);
+  while (tail - head >= rq->capacity) {
+    if (!blocking) {
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&rq->mtx);
+#else
+      LeaveCriticalSection(&rq->mtx);
+#endif
+      return false;
+    }
+    STAT_INC(queue_blocked);
+#if defined(LOG_PLATFORM_POSIX)
+    pthread_cond_wait(&rq->space_cond, &rq->mtx);
+#else
+    SleepConditionVariableCS(&rq->space_cond, &rq->mtx, INFINITE);
+#endif
+    if (rq->closed) {
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&rq->mtx);
+#else
+      LeaveCriticalSection(&rq->mtx);
+#endif
+      return false;
+    }
+    head = atomic_load(&rq->head);
+    tail = atomic_load(&rq->tail);
+  }
+  log_ring_entry *entry = &rq->buffer[tail & rq->mask];
+
+  /* File path first: on the rare large-path OOM the body block is not yet
+   * allocated, so unwinding stays leak-free. */
+  size_t file_len = file ? strlen(file) : 0;
+  if (file_len >= sizeof(entry->file)) {
+#if LOG_FEATURE_STATIC_ALLOC
+    entry->has_large_file = false;
+    if (file) {
+      size_t copy = sizeof(entry->file) - 1;
+      memcpy(entry->file, file, copy);
+      entry->file[copy] = '\0';
+    } else {
+      entry->file[0] = '\0';
+    }
+    STAT_INC(truncated_count);
+#else
+    char *large_file = malloc(file_len + 1);
+    if (!large_file) {
+#if defined(LOG_PLATFORM_POSIX)
+      pthread_mutex_unlock(&rq->mtx);
+#else
+      LeaveCriticalSection(&rq->mtx);
+#endif
+      return false;
+    }
+    memcpy(large_file, file, file_len + 1);
+    entry->has_large_file = true;
+    *(char**)entry->file = large_file;
+#endif
+  } else {
+    entry->has_large_file = false;
+    if (file) memcpy(entry->file, file, file_len + 1);
+    else entry->file[0] = '\0';
+  }
+
+  size_t body_len = body ? strlen(body) : 0;
+  size_t kv_len = kv_blob_size(kv);   /* self-describing; may contain NULs */
+#if LOG_FEATURE_STATIC_ALLOC
+  entry->has_large_msg = false;
+  if (body_len >= sizeof(entry->msg)) {
+    body_len = sizeof(entry->msg) - 1;
+    STAT_INC(truncated_count);
+  }
+  if (body) memcpy(entry->msg, body, body_len);
+  entry->msg[body_len] = '\0';
+  if (kv_len > sizeof(entry->kv_storage)) {
+    /* The blob is self-describing and cannot be split: drop it whole. */
+    entry->has_kv = false;
+    STAT_INC(truncated_count);
+  } else {
+    entry->has_kv = kv_len > 0;
+    if (kv_len) memcpy(entry->kv_storage, kv, kv_len);
+  }
+#else
+  char *combined = malloc(body_len + 1 + kv_len + 1);
+  if (!combined) {
+    if (entry->has_large_file) {
+      free(*(char**)entry->file);
+      entry->has_large_file = false;
+    }
+#if defined(LOG_PLATFORM_POSIX)
+    pthread_mutex_unlock(&rq->mtx);
+#else
+    LeaveCriticalSection(&rq->mtx);
+#endif
+    return false;
+  }
+  if (body_len) memcpy(combined, body, body_len);
+  combined[body_len] = '\0';
+  if (kv_len) memcpy(combined + body_len + 1, kv, kv_len);
+  combined[body_len + 1 + kv_len] = '\0';
+  entry->has_large_msg = true;
+  entry->has_kv = kv_len > 0;
+  *(char**)entry->msg = combined;
+#endif
+
+  entry->level = level;
+  entry->line = line;
+  entry->timestamp = timestamp;
+  atomic_store(&rq->tail, tail + 1);
+#if defined(LOG_PLATFORM_POSIX)
+  pthread_cond_signal(&rq->cond);
+  pthread_mutex_unlock(&rq->mtx);
+#else
+  WakeConditionVariable(&rq->cond);
+  LeaveCriticalSection(&rq->mtx);
+#endif
+  return true;
+}
+#endif /* LOG_FEATURE_KV */
 #endif /* LOG_FEATURE_ASYNC */
 
 /* Batch drain state for the async writer thread (on its stack). */
@@ -1104,6 +1342,194 @@ static int format_prefix(log_handle *ctx, log_event *ev, log_FormatFn handler_fm
                   ev->file ? ev->file : "", ev->line);
 }
 
+/* ==================== Typed key-value metadata (B2) ==================== */
+
+#if LOG_FEATURE_KV
+/* Encoded blob layout: a 4-byte big-endian record-stream length, then records
+ *   [type:1][key_len:1][key][val_len:2 big-endian][val]
+ * INT/DOUBLE/BOOL carry an ASCII decimal/bool value; STR carries raw bytes.
+ * The stream length makes the blob self-describing: it may contain NUL bytes
+ * (the value-length high byte), so it is never treated as a C string. */
+static size_t kv_encode(const log_kv *kvs, int count, char *dst, size_t dst_size,
+                        bool *truncated) {
+  size_t used = 4;   /* reserve the length header */
+  int pairs = 0;
+  for (int i = 0; i < count; i++) {
+    const char *key = kvs[i].key;
+    if (!key) continue;                 /* NULL key skips the pair */
+    if (pairs >= LOG_KV_MAX_PAIRS) { *truncated = true; break; }
+
+    size_t klen = strlen(key);
+    if (klen > 255) { klen = 255; *truncated = true; }
+
+    char vbuf[64];
+    const char *val;
+    size_t vlen;
+    switch (kvs[i].type) {
+      case LOG_KV_T_INT:
+        snprintf(vbuf, sizeof(vbuf), "%lld", kvs[i].i);
+        val = vbuf; vlen = strlen(vbuf);
+        break;
+      case LOG_KV_T_DOUBLE:
+        snprintf(vbuf, sizeof(vbuf), "%.17g", kvs[i].d);
+        val = vbuf; vlen = strlen(vbuf);
+        break;
+      case LOG_KV_T_BOOL:
+        val = kvs[i].i ? "true" : "false"; vlen = strlen(val);
+        break;
+      default:  /* LOG_KV_T_STR */
+        val = kvs[i].s ? kvs[i].s : ""; vlen = strlen(val);
+        break;
+    }
+    if (vlen > 65535) { vlen = 65535; *truncated = true; }
+
+    size_t need = 1 + 1 + klen + 2 + vlen;
+    if (used + need > dst_size) { *truncated = true; break; }
+
+    size_t p = used;
+    dst[p++] = (char)kvs[i].type;
+    dst[p++] = (char)klen;
+    memcpy(dst + p, key, klen); p += klen;
+    dst[p++] = (char)((vlen >> 8) & 0xFF);
+    dst[p++] = (char)(vlen & 0xFF);
+    memcpy(dst + p, val, vlen); p += vlen;
+    used = p;
+    pairs++;
+  }
+  if (pairs == 0) return 0;            /* no pairs: signal "no kv" to caller */
+  size_t stream = used - 4;
+  dst[0] = (char)((stream >> 24) & 0xFF);
+  dst[1] = (char)((stream >> 16) & 0xFF);
+  dst[2] = (char)((stream >> 8) & 0xFF);
+  dst[3] = (char)(stream & 0xFF);
+  return used;
+}
+
+/* Total byte size of a self-describing blob (header + records). */
+static size_t kv_blob_size(const char *blob) {
+  if (!blob) return 0;
+  return 4 + (((size_t)(unsigned char)blob[0] << 24) |
+              ((size_t)(unsigned char)blob[1] << 16) |
+              ((size_t)(unsigned char)blob[2] << 8) |
+              (size_t)(unsigned char)blob[3]);
+}
+
+/* Bounded string sink: len always reports the required length (snprintf
+ * semantics), while at most cap-1 bytes plus NUL are stored. */
+typedef struct {
+  char *dst;
+  size_t cap;
+  size_t len;
+} kv_sink;
+
+static void kv_sink_putc(kv_sink *s, char c) {
+  if (s->dst && s->len + 1 < s->cap) s->dst[s->len] = c;
+  s->len++;
+}
+
+static void kv_sink_write(kv_sink *s, const char *p, size_t n) {
+  if (s->dst && s->len < s->cap) {
+    size_t room = (s->cap - 1) - s->len;
+    size_t w = n < room ? n : room;
+    if (w) memcpy(s->dst + s->len, p, w);
+  }
+  s->len += n;
+}
+
+static void kv_sink_finish(kv_sink *s) {
+  if (s->dst && s->cap) s->dst[s->len < s->cap ? s->len : s->cap - 1] = '\0';
+}
+
+#if LOG_FEATURE_JSON
+static void kv_sink_json_str(kv_sink *s, const char *p, size_t n) {
+  kv_sink_putc(s, '"');
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)p[i];
+    switch (c) {
+      case '"':  kv_sink_putc(s, '\\'); kv_sink_putc(s, '"');  break;
+      case '\\': kv_sink_putc(s, '\\'); kv_sink_putc(s, '\\'); break;
+      case '\n': kv_sink_putc(s, '\\'); kv_sink_putc(s, 'n');  break;
+      case '\r': kv_sink_putc(s, '\\'); kv_sink_putc(s, 'r');  break;
+      case '\t': kv_sink_putc(s, '\\'); kv_sink_putc(s, 't');  break;
+      case '\b': kv_sink_putc(s, '\\'); kv_sink_putc(s, 'b');  break;
+      case '\f': kv_sink_putc(s, '\\'); kv_sink_putc(s, 'f');  break;
+      default:
+        if (c < 0x20) {
+          char u[8];
+          snprintf(u, sizeof(u), "\\u%04x", c);
+          kv_sink_write(s, u, 6);
+        } else {
+          kv_sink_putc(s, (char)c);
+        }
+        break;
+    }
+  }
+  kv_sink_putc(s, '"');
+}
+#endif /* LOG_FEATURE_JSON */
+
+/* Decode one record; returns the pointer past it, or NULL on malformed input. */
+static const char* kv_next(const char *p, const char *end, int *type,
+                           const char **key, size_t *klen,
+                           const char **val, size_t *vlen) {
+  if (p + 2 > end) return NULL;
+  *type = (unsigned char)p[0];
+  *klen = (unsigned char)p[1];
+  p += 2;
+  if (p + *klen + 2 > end) return NULL;
+  *key = p; p += *klen;
+  *vlen = ((size_t)(unsigned char)p[0] << 8) | (size_t)(unsigned char)p[1];
+  p += 2;
+  if (p + *vlen > end) return NULL;
+  *val = p; p += *vlen;
+  return p;
+}
+
+/* Render " key=value ..." (text form). Returns needed length (excluding NUL). */
+static size_t kv_render_text(const char *blob, char *dst, size_t cap) {
+  kv_sink s = { dst, cap, 0 };
+  if (blob) {
+    size_t total = kv_blob_size(blob);
+    const char *p = blob + 4;
+    const char *end = blob + total;
+    int type; const char *key, *val; size_t klen, vlen;
+    while ((p = kv_next(p, end, &type, &key, &klen, &val, &vlen)) != NULL) {
+      kv_sink_putc(&s, ' ');
+      kv_sink_write(&s, key, klen);
+      kv_sink_putc(&s, '=');
+      kv_sink_write(&s, val, vlen);
+    }
+  }
+  kv_sink_finish(&s);
+  return s.len;
+}
+
+#if LOG_FEATURE_JSON
+/* Render ', "key": value, ...' (JSON object fragment). Needed length excl NUL. */
+static size_t kv_render_json(const char *blob, char *dst, size_t cap) {
+  kv_sink s = { dst, cap, 0 };
+  if (blob) {
+    size_t total = kv_blob_size(blob);
+    const char *p = blob + 4;
+    const char *end = blob + total;
+    int type; const char *key, *val; size_t klen, vlen;
+    while ((p = kv_next(p, end, &type, &key, &klen, &val, &vlen)) != NULL) {
+      kv_sink_write(&s, ", ", 2);
+      kv_sink_json_str(&s, key, klen);
+      kv_sink_write(&s, ": ", 2);
+      if (type == LOG_KV_T_INT || type == LOG_KV_T_DOUBLE || type == LOG_KV_T_BOOL) {
+        kv_sink_write(&s, val, vlen);
+      } else {
+        kv_sink_json_str(&s, val, vlen);
+      }
+    }
+  }
+  kv_sink_finish(&s);
+  return s.len;
+}
+#endif /* LOG_FEATURE_JSON */
+#endif /* LOG_FEATURE_KV */
+
 /* ==================== Stream buffering & durability ==================== */
 
 #if LOG_FEATURE_FILE_OPS
@@ -1301,7 +1727,17 @@ static void stdout_handler(log_handle *ctx, log_event *ev) {
                 false
 #endif
                );
+#if LOG_FEATURE_KV
+  char kv_buf[LOG_KV_TEXT_RENDER_MAX];
+  const char *kv_text = "";
+  if (ev->kv) {
+    kv_render_text(ev->kv, kv_buf, sizeof(kv_buf));
+    kv_text = kv_buf;
+  }
+  fprintf(ev->udata, "%s%s%s\n", prefix, msg, kv_text);
+#else
   fprintf(ev->udata, "%s%s\n", prefix, msg);
+#endif
   if (heap_msg) free(msg);
 }
 
@@ -1318,25 +1754,43 @@ static void file_handler_internal(log_handle *ctx, log_event *ev, int handler_id
   if ((size_t)prefix_len >= sizeof(prefix)) prefix_len = (int)sizeof(prefix) - 1;
 
   size_t msg_len = strlen(msg);
+#if LOG_FEATURE_KV
+  char kv_buf[LOG_KV_TEXT_RENDER_MAX];
+  const char *kv_text = "";
+  size_t kv_len = 0;
+  if (ev->kv) {
+    kv_len = kv_render_text(ev->kv, kv_buf, sizeof(kv_buf));
+    kv_text = kv_buf;
+  }
+#else
+  const char *kv_text = "";
+  size_t kv_len = 0;
+#endif
   FILE *fp = h->fp;
-  /* Assemble prefix+msg+'\n' and write with a SINGLE fwrite: stdio holds
+  /* Assemble prefix+msg+kv+'\n' and write with a SINGLE fwrite: stdio holds
    * the stream lock for the whole line, so concurrent writers cannot tear
    * lines apart. The common case assembles into thread-local storage (no
    * heap); oversized lines fall back to an exact-size malloc. */
-  size_t total = (size_t)prefix_len + msg_len + 1;
-  static LOG_THREAD_LOCAL char tl_line_buf[512 + LOG_MSG_BUF_SIZE + 2];
+  size_t total = (size_t)prefix_len + msg_len + kv_len + 1;
+  static LOG_THREAD_LOCAL char tl_line_buf[512 + LOG_MSG_BUF_SIZE +
+#if LOG_FEATURE_KV
+                                           LOG_KV_TEXT_RENDER_MAX +
+#endif
+                                           2];
   size_t written;
   if (total <= sizeof(tl_line_buf)) {
     memcpy(tl_line_buf, prefix, (size_t)prefix_len);
     memcpy(tl_line_buf + prefix_len, msg, msg_len);
-    tl_line_buf[prefix_len + msg_len] = '\n';
+    if (kv_len) memcpy(tl_line_buf + prefix_len + msg_len, kv_text, kv_len);
+    tl_line_buf[prefix_len + msg_len + kv_len] = '\n';
     written = fwrite(tl_line_buf, 1, total, fp);
   } else {
     char *buf = malloc(total);
     if (!buf) { if (heap_msg) free(msg); return; }
     memcpy(buf, prefix, (size_t)prefix_len);
     memcpy(buf + prefix_len, msg, msg_len);
-    buf[prefix_len + msg_len] = '\n';
+    if (kv_len) memcpy(buf + prefix_len + msg_len, kv_text, kv_len);
+    buf[prefix_len + msg_len + kv_len] = '\n';
     written = fwrite(buf, 1, total, fp);
     free(buf);
   }
@@ -1493,28 +1947,43 @@ static void json_handler(log_handle *ctx, log_event *ev) {
   const char *lvl_str = level_strings[clamp_level(ev->level)];
   int line_val = ev->line;
 
-  size_t needed = 0;
+#if LOG_FEATURE_KV
+  size_t kv_len = ev->kv ? kv_render_json(ev->kv, NULL, 0) : 0;
+#endif
+
+  size_t head;
   if (show_tid) {
-    needed = snprintf(NULL, 0,
-      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"thread_id\": %lu, \"message\": \"%s\"}",
+    head = snprintf(NULL, 0,
+      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"thread_id\": %lu, \"message\": \"%s\"",
       time_buf, lvl_str, escaped_file, line_val, LOG_GET_THREAD_ID(), escaped_msg);
   } else {
-    needed = snprintf(NULL, 0,
-      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"}",
+    head = snprintf(NULL, 0,
+      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"",
       time_buf, lvl_str, escaped_file, line_val, escaped_msg);
   }
 
-  char *buf = malloc(needed + 2);
+#if LOG_FEATURE_KV
+  size_t needed = head + kv_len;
+#else
+  size_t needed = head;
+#endif
+
+  char *buf = malloc(needed + 2);   /* +1 closing brace, +1 NUL */
   if (!buf) { free(escaped_msg); free(escaped_file); return; }
   if (show_tid) {
-    snprintf(buf, needed + 1,
-      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"thread_id\": %lu, \"message\": \"%s\"}",
+    snprintf(buf, head + 1,
+      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"thread_id\": %lu, \"message\": \"%s\"",
       time_buf, lvl_str, escaped_file, line_val, LOG_GET_THREAD_ID(), escaped_msg);
   } else {
-    snprintf(buf, needed + 1,
-      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"}",
+    snprintf(buf, head + 1,
+      "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"",
       time_buf, lvl_str, escaped_file, line_val, escaped_msg);
   }
+#if LOG_FEATURE_KV
+  if (kv_len) kv_render_json(ev->kv, buf + head, kv_len + 1);
+#endif
+  buf[needed] = '}';
+  buf[needed + 1] = '\0';
 
   fprintf(ev->udata, "%s\n", buf);
   free(escaped_msg);
@@ -1562,6 +2031,15 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
         ev.line = re->line;
         ev.timestamp = re->timestamp;
         ev.raw_msg = batch.large_msg[k] ? batch.large_msg[k] : re->msg;
+#if LOG_FEATURE_KV
+        if (re->has_kv) {
+#if LOG_FEATURE_STATIC_ALLOC
+          ev.kv = re->kv_storage;
+#else
+          ev.kv = ev.raw_msg + strlen(ev.raw_msg) + 1;
+#endif
+        }
+#endif
         for (int i = 0; i < ctx->handler_count; i++) {
           if (ctx->handlers[i].active && ctx->handlers[i].fn && re->level >= ctx->handlers[i].level) {
             ev.udata = ctx->handlers[i].udata;
@@ -1606,6 +2084,9 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
         ev.line = entry->line;
         ev.timestamp = entry->timestamp;
         ev.raw_msg = entry->msg;
+#if LOG_FEATURE_KV
+        ev.kv = entry->kv;
+#endif
         for (int i = 0; i < ctx->handler_count; i++) {
           if (ctx->handlers[i].active && ctx->handlers[i].fn && entry->level >= ctx->handlers[i].level) {
             ev.udata = ctx->handlers[i].udata;
@@ -1629,6 +2110,10 @@ static DWORD WINAPI async_writer_thread(LPVOID arg) {
         free(entry->file);
         entry->msg = NULL;
         entry->file = NULL;
+#if LOG_FEATURE_KV
+        free(entry->kv);
+        entry->kv = NULL;
+#endif
         queue_entry_destroy(ctx, entry);
       }
     }
@@ -1752,8 +2237,199 @@ log_handle* log_create_static(void *buf, size_t buf_size) {
 }
 #endif /* LOG_FEATURE_STATIC_ALLOC */
 
+/* ==================== Process lifecycle safety (B6) ==================== */
+/* log_destroy() drops the context from these registries so an exit or fork
+ * after teardown never touches freed memory. */
+#if LOG_FEATURE_LIFECYCLE && defined(LOG_PLATFORM_POSIX)
+
+#define LOG_LIFECYCLE_MAX_CTXS 8
+
+typedef struct { log_handle *ctx; bool atfork; bool atexit; } log_lifecycle_entry;
+
+static log_lifecycle_entry g_lifecycle[LOG_LIFECYCLE_MAX_CTXS];
+static int g_lifecycle_count = 0;
+static pthread_mutex_t g_lifecycle_mtx = PTHREAD_MUTEX_INITIALIZER;
+static bool g_atfork_installed = false;
+static bool g_atexit_installed = false;
+
+static int lifecycle_find(log_handle *ctx) {
+  for (int i = 0; i < g_lifecycle_count; i++) {
+    if (g_lifecycle[i].ctx == ctx) return i;
+  }
+  return -1;
+}
+
+/* Quiesce a context: hold every lock a logging thread could hold, in the
+ * same order the library acquires them (mutex -> rwlock -> file_mtx ->
+ * queue/ring -> mpool), so fork() happens at a consistent point. */
+static void lifecycle_lock(log_handle *ctx) {
+  pthread_mutex_lock(&ctx->mutex);
+  rwlock_write_lock(&ctx->rwlock);
+  pthread_mutex_lock(&ctx->file_mtx);
+  pthread_mutex_lock(&ctx->queue.mtx);
+#if LOG_FEATURE_RING_QUEUE
+  pthread_mutex_lock(&ctx->ring_queue.mtx);
+#endif
+#if LOG_FEATURE_MPOOL
+  pthread_mutex_lock(&ctx->mpool.mtx);
+#endif
+}
+
+static void lifecycle_unlock(log_handle *ctx) {
+#if LOG_FEATURE_MPOOL
+  pthread_mutex_unlock(&ctx->mpool.mtx);
+#endif
+#if LOG_FEATURE_RING_QUEUE
+  pthread_mutex_unlock(&ctx->ring_queue.mtx);
+#endif
+  pthread_mutex_unlock(&ctx->queue.mtx);
+  pthread_mutex_unlock(&ctx->file_mtx);
+  rwlock_write_unlock(&ctx->rwlock);
+  pthread_mutex_unlock(&ctx->mutex);
+}
+
+/* Child side: the parent's threads do not exist, so reinitialize the locks
+ * and downgrade async to synchronous. Anything still queued is abandoned
+ * (writing it would duplicate the parent's pending output). */
+static void lifecycle_reinit(log_handle *ctx) {
+  rwlock_init(&ctx->rwlock);
+  pthread_mutex_init(&ctx->mutex, NULL);
+  pthread_mutex_init(&ctx->file_mtx, NULL);
+  pthread_mutex_init(&ctx->queue.mtx, NULL);
+  pthread_cond_init(&ctx->queue.cond, NULL);
+  pthread_cond_init(&ctx->queue.space_cond, NULL);
+  ctx->queue.head = NULL;
+  ctx->queue.tail = NULL;
+  ctx->queue.size = 0;
+  ctx->queue.closed = false;
+#if LOG_FEATURE_RING_QUEUE
+  pthread_mutex_init(&ctx->ring_queue.mtx, NULL);
+  pthread_cond_init(&ctx->ring_queue.cond, NULL);
+  pthread_cond_init(&ctx->ring_queue.space_cond, NULL);
+  atomic_store(&ctx->ring_queue.head, 0);
+  atomic_store(&ctx->ring_queue.tail, 0);
+  ctx->ring_queue.closed = false;
+#endif
+#if LOG_FEATURE_MPOOL
+  pthread_mutex_init(&ctx->mpool.mtx, NULL);
+#endif
+  ctx->async_enabled = false;   /* no writer thread exists in the child */
+}
+
+static void lifecycle_atfork_prepare(void) {
+  pthread_mutex_lock(&g_lifecycle_mtx);
+  for (int i = 0; i < g_lifecycle_count; i++) {
+    if (g_lifecycle[i].atfork && g_lifecycle[i].ctx) lifecycle_lock(g_lifecycle[i].ctx);
+  }
+  pthread_mutex_lock(&default_log_mutex);
+}
+
+static void lifecycle_atfork_parent(void) {
+  pthread_mutex_unlock(&default_log_mutex);
+  for (int i = g_lifecycle_count - 1; i >= 0; i--) {
+    if (g_lifecycle[i].atfork && g_lifecycle[i].ctx) lifecycle_unlock(g_lifecycle[i].ctx);
+  }
+  pthread_mutex_unlock(&g_lifecycle_mtx);
+}
+
+static void lifecycle_atfork_child(void) {
+  pthread_mutex_init(&g_lifecycle_mtx, NULL);
+  pthread_mutex_init(&default_log_mutex, NULL);
+  for (int i = 0; i < g_lifecycle_count; i++) {
+    if (g_lifecycle[i].atfork && g_lifecycle[i].ctx) lifecycle_reinit(g_lifecycle[i].ctx);
+  }
+}
+
+static void lifecycle_atexit_handler(void) {
+  pthread_mutex_lock(&g_lifecycle_mtx);
+  for (int i = 0; i < g_lifecycle_count; i++) {
+    log_handle *ctx = g_lifecycle[i].ctx;
+    if (!g_lifecycle[i].atexit || !ctx) continue;
+#if LOG_FEATURE_ASYNC
+    if (ctx->async_enabled) {
+      log_set_async(ctx, false);   /* drains the queue and joins the writer */
+    }
+#endif
+  }
+  pthread_mutex_unlock(&g_lifecycle_mtx);
+}
+
+int log_install_atfork(log_handle *ctx) {
+  if (!ctx) return -1;
+  pthread_mutex_lock(&g_lifecycle_mtx);
+  int idx = lifecycle_find(ctx);
+  if (idx < 0) {
+    if (g_lifecycle_count >= LOG_LIFECYCLE_MAX_CTXS) {
+      pthread_mutex_unlock(&g_lifecycle_mtx);
+      return -1;
+    }
+    idx = g_lifecycle_count++;
+    g_lifecycle[idx].ctx = ctx;
+    g_lifecycle[idx].atfork = false;
+    g_lifecycle[idx].atexit = false;
+  }
+  g_lifecycle[idx].atfork = true;
+  int rc = 0;
+  if (!g_atfork_installed) {
+    if (pthread_atfork(lifecycle_atfork_prepare, lifecycle_atfork_parent,
+                       lifecycle_atfork_child) != 0) {
+      rc = -1;
+    } else {
+      g_atfork_installed = true;
+    }
+  }
+  pthread_mutex_unlock(&g_lifecycle_mtx);
+  return rc;
+}
+
+int log_install_atexit(log_handle *ctx) {
+  if (!ctx) return -1;
+  pthread_mutex_lock(&g_lifecycle_mtx);
+  int idx = lifecycle_find(ctx);
+  if (idx < 0) {
+    if (g_lifecycle_count >= LOG_LIFECYCLE_MAX_CTXS) {
+      pthread_mutex_unlock(&g_lifecycle_mtx);
+      return -1;
+    }
+    idx = g_lifecycle_count++;
+    g_lifecycle[idx].ctx = ctx;
+    g_lifecycle[idx].atfork = false;
+    g_lifecycle[idx].atexit = false;
+  }
+  g_lifecycle[idx].atexit = true;
+  int rc = 0;
+  if (!g_atexit_installed) {
+    if (atexit(lifecycle_atexit_handler) != 0) rc = -1;
+    else g_atexit_installed = true;
+  }
+  pthread_mutex_unlock(&g_lifecycle_mtx);
+  return rc;
+}
+
+static void lifecycle_unregister(log_handle *ctx) {
+  pthread_mutex_lock(&g_lifecycle_mtx);
+  int idx = lifecycle_find(ctx);
+  if (idx >= 0) {
+    g_lifecycle[idx] = g_lifecycle[g_lifecycle_count - 1];
+    g_lifecycle_count--;
+  }
+  pthread_mutex_unlock(&g_lifecycle_mtx);
+}
+
+#else  /* !(LOG_FEATURE_LIFECYCLE && POSIX) */
+
+static void lifecycle_unregister(log_handle *ctx) { (void)ctx; }
+#if LOG_FEATURE_LIFECYCLE
+int log_install_atfork(log_handle *ctx) { (void)ctx; return -1; }  /* POSIX only */
+int log_install_atexit(log_handle *ctx) { (void)ctx; return -1; }  /* POSIX only */
+#endif
+
+#endif /* LOG_FEATURE_LIFECYCLE && POSIX */
+
 void log_destroy(log_handle *ctx) {
   if (!ctx) return;
+
+  lifecycle_unregister(ctx);
 
   if (ctx->async_enabled) {
 #if LOG_FEATURE_RING_QUEUE
@@ -2239,31 +2915,35 @@ void log_remove_handler(log_handle *ctx, int idx) {
  * already va_start()ed ev->ap (consumed here). */
 static void sync_format_and_dispatch(log_handle *ctx, log_event *ev) {
   char *big = NULL;
-  va_list probe;
-  va_copy(probe, ev->ap);
-  int pflen = vsnprintf(NULL, 0, ev->fmt, probe);
-  va_end(probe);
-  if (pflen < 0) {
-    return;
-  }
-  if ((size_t)pflen < sizeof(tl_msg_buf)) {
-    vsnprintf(tl_msg_buf, sizeof(tl_msg_buf), ev->fmt, ev->ap);
-    ev->raw_msg = tl_msg_buf;
-  } else {
-#if LOG_FEATURE_STATIC_ALLOC
-    /* Static mode: keep the truncated text, no heap allocation. */
-    vsnprintf(tl_msg_buf, sizeof(tl_msg_buf), ev->fmt, ev->ap);
-    ev->raw_msg = tl_msg_buf;
-    STAT_INC(truncated_count);
-#else
-    big = malloc((size_t)pflen + 1);
-    if (big) {
-      vsnprintf(big, (size_t)pflen + 1, ev->fmt, ev->ap);
-      ev->raw_msg = big;
-    } else {
-      ev->raw_msg = "";   /* OOM: handlers print an empty body */
+  /* A caller may have supplied a pre-rendered body (structured kv logging
+   * passes the literal message this way); then no printf work is needed. */
+  if (!ev->raw_msg) {
+    va_list probe;
+    va_copy(probe, ev->ap);
+    int pflen = vsnprintf(NULL, 0, ev->fmt, probe);
+    va_end(probe);
+    if (pflen < 0) {
+      return;
     }
+    if ((size_t)pflen < sizeof(tl_msg_buf)) {
+      vsnprintf(tl_msg_buf, sizeof(tl_msg_buf), ev->fmt, ev->ap);
+      ev->raw_msg = tl_msg_buf;
+    } else {
+#if LOG_FEATURE_STATIC_ALLOC
+      /* Static mode: keep the truncated text, no heap allocation. */
+      vsnprintf(tl_msg_buf, sizeof(tl_msg_buf), ev->fmt, ev->ap);
+      ev->raw_msg = tl_msg_buf;
+      STAT_INC(truncated_count);
+#else
+      big = malloc((size_t)pflen + 1);
+      if (big) {
+        vsnprintf(big, (size_t)pflen + 1, ev->fmt, ev->ap);
+        ev->raw_msg = big;
+      } else {
+        ev->raw_msg = "";   /* OOM: handlers print an empty body */
+      }
 #endif
+    }
   }
 
   for (int i = 0; i < ctx->handler_count; i++) {
@@ -2369,6 +3049,99 @@ void log_log(log_handle *ctx, int level, const char *file, int line, const char 
 #endif /* LOG_FEATURE_ASYNC */
 }
 
+#if LOG_FEATURE_KV
+void log_log_kv(log_handle *ctx, int level, const char *file, int line,
+                const log_kv *kvs, int kv_count, const char *msg) {
+  if (!ctx) return;
+
+  const char *body = msg ? msg : "";
+
+  /* Encode the typed pairs into our own stack buffer before touching any
+   * lock: pure CPU, and valid for the whole call (handlers read it inline on
+   * the sync path; the async push copies it before returning). */
+  char kv_buf[LOG_KV_ENCODE_MAX];
+  bool kv_truncated = false;
+  size_t kv_len = 0;
+  if (kvs && kv_count > 0) {
+    kv_len = kv_encode(kvs, kv_count, kv_buf, sizeof(kv_buf), &kv_truncated);
+  }
+  const char *kv_blob = kv_len ? kv_buf : NULL;
+
+  /* Register before taking the rwlock (see log_log for the lock-order note). */
+  stats_ensure_registered(ctx);
+
+  rwlock_read_lock(&ctx->rwlock);
+
+  if (ctx->quiet || level < ctx->level) {
+    rwlock_read_unlock(&ctx->rwlock);
+    return;
+  }
+
+  STAT_INC(total_count);
+  if (level >= 0 && level < LOG_LEVELS) {
+    STAT_INC(level_counts[level]);
+  }
+  if (kv_truncated) STAT_INC(truncated_count);
+
+  log_event ev = {0};
+  ev.fmt = body;        /* literal: raw_msg short-circuits printf formatting */
+  ev.raw_msg = body;
+  ev.file = file;
+  ev.line = line;
+  ev.level = level;
+  ev.timestamp = get_timestamp_with_clock(ctx->clock_source);
+  ev.kv = kv_blob;
+
+#if LOG_FEATURE_CRASH_MODE
+  bool async_path = ctx->async_enabled && !ctx->crash_safe;
+#else
+  bool async_path = ctx->async_enabled;
+#endif
+
+  if (!async_path) {
+    STAT_INC(sync_writes);
+    sync_format_and_dispatch(ctx, &ev);
+    rwlock_read_unlock(&ctx->rwlock);
+    return;
+  }
+
+#if LOG_FEATURE_ASYNC
+  int queue_policy = ctx->queue_policy;
+#if LOG_FEATURE_RING_QUEUE
+  bool use_ring_queue = ctx->use_ring_queue;
+#endif
+  bool pushed = false;
+  rwlock_read_unlock(&ctx->rwlock);
+
+#if LOG_FEATURE_RING_QUEUE
+  if (use_ring_queue) {
+    pushed = ring_queue_push_kv(&ctx->ring_queue, body, kv_blob, file, level, line,
+                                ev.timestamp, queue_policy == LOG_QUEUE_BLOCK);
+  } else
+#endif /* LOG_FEATURE_RING_QUEUE */
+  {
+    log_queue_entry *entry = queue_entry_create_kv(ctx, body, kv_blob, file,
+                                                   level, line, ev.timestamp);
+    pushed = entry && queue_push(ctx, entry, queue_policy == LOG_QUEUE_BLOCK);
+    if (!pushed && entry) queue_entry_destroy(ctx, entry);
+  }
+
+  if (pushed) {
+    STAT_INC(async_writes);
+  } else if (queue_policy == LOG_QUEUE_DROP) {
+    STAT_INC(queue_drops);
+  } else {
+    rwlock_read_lock(&ctx->rwlock);
+    sync_format_and_dispatch(ctx, &ev);
+    STAT_INC(sync_writes);
+    rwlock_read_unlock(&ctx->rwlock);
+  }
+#else
+  rwlock_read_unlock(&ctx->rwlock);
+#endif /* LOG_FEATURE_ASYNC */
+}
+#endif /* LOG_FEATURE_KV */
+
 #if LOG_FEATURE_FILE_OPS
 void log_rotate(log_handle *ctx) {
   if (!ctx || !ctx->file_prefix) return;
@@ -2449,13 +3222,32 @@ int log_format_json(log_handle *ctx, log_event *ev, char *buf, size_t buf_size) 
   if (!escaped_file) { free(escaped_msg); return 0; }
 
   (void)ctx;
-  int n = snprintf(buf, buf_size,
-    "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"}",
+#if LOG_FEATURE_KV
+  int kv_len = ev->kv ? (int)kv_render_json(ev->kv, NULL, 0) : 0;
+#else
+  int kv_len = 0;
+#endif
+  int head = snprintf(buf, buf_size,
+    "{\"time\": \"%s\", \"level\": \"%s\", \"file\": \"%s\", \"line\": %d, \"message\": \"%s\"",
     time_buf, level_strings[clamp_level(ev->level)],
     escaped_file, ev->line, escaped_msg);
   free(escaped_msg);
   free(escaped_file);
-  return n;
+#if LOG_FEATURE_KV
+  if (ev->kv && buf && buf_size > 0 && head > 0 && (size_t)head < buf_size) {
+    kv_render_json(ev->kv, buf + head, buf_size - (size_t)head);
+  }
+#endif
+  if (buf && buf_size > 0) {
+    size_t brace = (head > 0 ? (size_t)head : 0) + (size_t)kv_len;
+    if (brace + 1 < buf_size) {
+      buf[brace] = '}';
+      buf[brace + 1] = '\0';
+    } else {
+      buf[buf_size - 1] = '\0';
+    }
+  }
+  return head + kv_len + 1;
 }
 #endif /* LOG_FEATURE_JSON */
 

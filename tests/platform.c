@@ -12,6 +12,7 @@
 #include "platform/test_unicode_path.c"
 #include "platform/test_flush.c"
 #include "platform/test_crash.c"
+#include "platform/test_lifecycle.c"
 
 int main(void) {
     extern void test_syslog_register(void);
@@ -19,11 +20,13 @@ int main(void) {
     extern void test_unicode_path_register(void);
     extern void test_flush_register(void);
     extern void test_crash_register(void);
+    extern void test_lifecycle_register(void);
 
     test_syslog_register();
     test_rotation_register();
     test_unicode_path_register();
     test_flush_register();
     test_crash_register();
+    test_lifecycle_register();
     return test_run_all() ? 1 : 0;
 }

@@ -10,10 +10,11 @@ A simple, powerful, and thread-safe logging library implemented in C11 with full
 - **Thread-Safe**: Reader-writer locks for configuration and concurrent access
 - **Async Logging**: Mutex + condvar protected ring buffer queue with dedicated writer thread (for decoupling, not throughput)
 - **Crash Safety**: `log_set_crash_safe` flushes every line; `log_install_crash_handler` writes a marker on fatal signals (POSIX)
+- **Lifecycle Safety**: `log_install_atfork` reinitializes locks in the child and downgrades async to sync after `fork()`; `log_install_atexit` flushes a still-async context on exit (POSIX)
 - **Durability Policies**: Per-handler NEVER / EVERY / INTERVAL flush with an independent fsync switch
 - **Static Zero-Allocation**: `-DLOG_STATIC_ALLOC` + `log_create_static`, zero heap allocations on the hot path
 - **Log Rotation**: Automatic file rotation by size (up to 5 rotated files)
-- **Structured Logging**: JSON format support
+- **Structured Logging**: JSON format support; typed key-value metadata (`LOG_KV_*`) emitted as top-level JSON fields or a `key=value` text suffix
 - **Thread ID Tracking**: Optional thread ID in output
 - **Syslog Integration**: Native syslog support (POSIX only)
 - **Dynamic Configuration**: Runtime level/format changes
@@ -288,17 +289,19 @@ Disable optional features to reduce binary size (savings are measured .text delt
 
 | Flag | Description | Savings |
 |------|-------------|---------|
-| `LOG_DISABLE_JSON` | Disable JSON formatting | ~2.6 KB |
+| `LOG_DISABLE_JSON` | Disable JSON formatting | ~4.7 KB |
 | `LOG_DISABLE_SYSLOG` | Disable Syslog support | ~1.3 KB |
-| `LOG_DISABLE_ASYNC` | Disable async logging | ~6.3 KB |
-| `LOG_DISABLE_MPOOL` | Disable memory pool | ~1.4 KB |
-| `LOG_DISABLE_RING_QUEUE` | Disable ring buffer queue | ~3.0 KB |
-| `LOG_DISABLE_STATS` | Disable performance stats | ~1.8 KB |
+| `LOG_DISABLE_ASYNC` | Disable async logging | ~8.0 KB |
+| `LOG_DISABLE_MPOOL` | Disable memory pool | ~1.8 KB |
+| `LOG_DISABLE_RING_QUEUE` | Disable ring buffer queue | ~3.7 KB |
+| `LOG_DISABLE_STATS` | Disable performance stats | ~1.9 KB |
 | `LOG_DISABLE_FILE_OPS` | Disable file operations | ~2.2 KB |
 | `LOG_DISABLE_THREAD_ID` | Disable thread ID | ~0.15 KB |
 | `LOG_DISABLE_TS_CACHE` | Disable timestamp cache | ~0.6 KB |
 | `LOG_DISABLE_CRASH_MODE` | Disable crash-safe mode | ~1.3 KB |
-| `LOG_MINIMAL` | Disable all optional features | ~15.2 KB |
+| `LOG_DISABLE_KV` | Disable key-value metadata | ~6.3 KB |
+| `LOG_DISABLE_LIFECYCLE` | Disable fork/exit lifecycle safety | ~1.7 KB |
+| `LOG_MINIMAL` | Disable all optional features | ~23.3 KB |
 
 ### Static-mode footprint
 
@@ -308,12 +311,14 @@ be a power of two):
 
 | Build | `sizeof(log_handle)` |
 |-------|----------------------|
-| `LOG_STATIC_ALLOC`, `LOG_RING_CAPACITY=4096` (default) | ~2.61 MiB |
-| `LOG_STATIC_ALLOC`, `LOG_RING_CAPACITY=256` | ~183 KiB |
+| `LOG_STATIC_ALLOC`, `LOG_RING_CAPACITY=4096` (default) | ~3.61 MiB |
+| `LOG_STATIC_ALLOC`, `LOG_RING_CAPACITY=256` | ~246 KiB |
 | `LOG_STATIC_ALLOC` + `LOG_MINIMAL`, `LOG_RING_CAPACITY=256` | ~4 KiB |
 
 Pick the smallest capacity that absorbs your burst; the default favors throughput
-over footprint.
+over footprint. With KV enabled each ring slot also embeds `LOG_KV_INLINE_MAX`
+(256) bytes of key-value storage — cost `256 × LOG_RING_CAPACITY`; disable it
+with `LOG_DISABLE_KV` (e.g. `LOG_MINIMAL`) to reclaim it.
 
 ## 📋 Core Features
 
@@ -479,6 +484,65 @@ int main(void) {
 }
 ```
 
+### 7. Structured Key-Value Metadata
+
+Attach typed fields to a log line. The JSON formatter emits them as top-level
+fields; the text formatter appends them as a `key=value` suffix. The message is
+emitted **literally** (no `printf` formatting), so it may safely contain `%`.
+
+```c
+log_ctx_info_kv(ctx, "user login",
+                LOG_KV_STR("user", "alice"),
+                LOG_KV_INT("id", 42),
+                LOG_KV_DOUBLE("score", 1.5),
+                LOG_KV_BOOL("mfa", true));
+```
+
+JSON output:
+
+```json
+{"time": "...", "level": "INFO", "file": "main.c", "line": 42, "message": "user login", "user": "alice", "id": 42, "score": 1.5, "mfa": true}
+```
+
+Text output:
+
+```
+2026-09-17T10:30:45.123 INFO  main.c:42: user login user=alice id=42 score=1.5 mfa=true
+```
+
+- Pairs live on the caller's stack (no allocation). At most `LOG_KV_MAX_PAIRS`
+  (8) are encoded; extra pairs are dropped and counted in `truncated_count`.
+- A `NULL` key skips that pair; an empty pair list degrades to a plain message.
+- Works on both the sync and async paths; values are escaped for JSON.
+- `log_info_kv(msg, ...)`, `log_ctx_error_kv(...)`, etc. exist for all levels.
+- Disable with `LOG_DISABLE_KV` (or `LOG_MINIMAL`); the `*_kv` macros then
+  degrade to plain message logging.
+
+### 8. Process Lifecycle Safety (POSIX)
+
+Async logging keeps a writer thread and a queue inside the process, which is
+fragile across `fork()` and process exit. Two opt-in helpers cover it:
+
+```c
+log_set_async(ctx, true);
+log_install_atfork(ctx);   /* call once during setup, before spawning threads */
+log_install_atexit(ctx);
+```
+
+- **`log_install_atfork(ctx)`** installs `pthread_atfork` handlers. Around
+  `fork()` the context is quiesced (all locks held); in the child the locks are
+  reinitialized and async is downgraded to synchronous, so the child can keep
+  logging without deadlocking on locks inherited from threads that no longer
+  exist. A normal `exit()` in the child flushes its lines.
+- **`log_install_atexit(ctx)`** registers an `atexit` handler that drains a
+  still-async queue when the process exits via `exit()` / `return` from `main`.
+- Both are idempotent per context and `log_destroy()` unregisters it (up to 8
+  contexts).
+- POSIX only: on Windows both return `-1` (no `fork`; call
+  `log_set_async(ctx, false)` before exiting if you need a flush).
+- Pending async entries at the instant of `fork()` are abandoned in the child
+  rather than duplicated.
+
 ## 🔧 API Reference
 
 For complete API documentation, see [API.md](API.md).
@@ -558,13 +622,13 @@ See [tests/example.c](tests/example.c) for comprehensive examples:
 
 ## 🧪 Testing
 
-The project includes 127 tests across 6 categories (actual counts as reported by each test runner; static_alloc only builds on Linux with GNU ld):
+The project includes 137 tests across 6 categories (actual counts as reported by each test runner; static_alloc only builds on Linux with GNU ld):
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| core | 52 | Levels, handlers, format, null safety, stats, boundary, OOB level |
+| core | 59 | Levels, handlers, format, null safety, stats, key-value metadata, boundary, OOB level |
 | thread | 10 | Multi-threaded sync/async, config races, stats aggregation |
-| platform | 25 | Syslog, rotation, unicode paths, flush policies, crash safety |
+| platform | 28 | Syslog, rotation, unicode paths, flush policies, crash safety, fork/exit lifecycle |
 | stress | 28 | Queue full, long messages, integrity, crash safety, resources |
 | perf | 7 | Throughput and latency benchmarks |
 | static_alloc | 5 | Static zero-allocation mode (real counting via `--wrap=malloc`) |

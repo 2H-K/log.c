@@ -25,6 +25,8 @@ This is an enhanced logging library for C11 that provides:
 - Asynchronous logging with Asynchronous Queue: dedicated writer thread drains a bounded queue
 - Log file rotation based on size
 - JSON format output for structured logging
+- Typed key-value metadata (`LOG_KV_*`) as top-level JSON fields
+- Fork/exit lifecycle safety (POSIX): reinitialize locks in the child, flush on exit
 - Dynamic runtime configuration
 - Thread ID tracking
 - Syslog integration
@@ -153,6 +155,113 @@ log_log(ctx, LOG_INFO, __FILE__, __LINE__, "Value: %d", 42);
 - Filters messages below configured level
 - Respects quiet mode setting
 - Supports async mode with Asynchronous Queue: dedicated writer thread drains a bounded queue
+
+---
+
+### log_log_kv()
+
+Structured logging with typed key-value metadata. Prefer the `log_*_kv()`
+macros, which build the pair array on the caller's stack.
+
+**Prototype:**
+```c
+void log_log_kv(log_handle *ctx, int level, const char *file, int line,
+                const log_kv *kvs, int kv_count, const char *msg);
+```
+
+**Types and helpers:**
+```c
+typedef struct log_kv {
+    const char *key;   /* NULL entries are skipped */
+    int type;          /* LOG_KV_T_INT / _DOUBLE / _STR / _BOOL */
+    long long i;       /* INT / BOOL value */
+    double d;          /* DOUBLE value */
+    const char *s;     /* STR value (borrowed) */
+} log_kv;
+
+#define LOG_KV_INT(k, v)
+#define LOG_KV_DOUBLE(k, v)
+#define LOG_KV_STR(k, v)
+#define LOG_KV_BOOL(k, v)
+#define LOG_KV_END
+```
+
+**Example:**
+```c
+log_ctx_info_kv(ctx, "login",
+                LOG_KV_STR("user", "alice"),
+                LOG_KV_INT("id", 42));
+```
+
+**Notes:**
+- `msg` is emitted **literally** (not a printf format), so it may contain `%`.
+- JSON output emits each pair as a top-level field; text output appends
+  `key=value` after the message.
+- At most `LOG_KV_MAX_PAIRS` (8) pairs are encoded; extras are dropped and
+  counted in `log_stats.truncated_count`.
+- Works on the sync and async paths.
+- Trimmed by `LOG_DISABLE_KV` / `LOG_MINIMAL`; the `*_kv` macros then degrade to
+  plain message logging.
+- Per-level macros: `log_ctx_trace_kv`, `log_ctx_debug_kv`, `log_ctx_info_kv`,
+  `log_ctx_warn_kv`, `log_ctx_error_kv`, `log_ctx_fatal_kv`, plus the
+  default-context `log_trace_kv` … `log_fatal_kv`.
+
+---
+
+### log_install_atfork()
+
+Installs `pthread_atfork` handlers for a context (POSIX only). Around `fork()`
+the context is quiesced (all locks held); in the child the synchronization
+primitives are reinitialized and async logging is downgraded to synchronous, so
+the child can keep logging without deadlocking on locks inherited from threads
+that no longer exist.
+
+**Prototype:**
+```c
+int log_install_atfork(log_handle *ctx);
+```
+
+**Returns:**
+- 0 on success, -1 on failure / unsupported platform (Windows)
+
+**Example:**
+```c
+log_install_atfork(ctx);   /* once during setup, before spawning threads */
+```
+
+**Notes:**
+- Idempotent per context; `log_destroy()` unregisters it (up to 8 contexts).
+- Call from a context that is not inside a log handler (do not call `fork()`
+  while the library holds this context's locks).
+- Pending async entries at the instant of `fork()` are abandoned in the child,
+  not duplicated.
+
+---
+
+### log_install_atexit()
+
+Registers an `atexit` handler that drains a still-async context when the process
+exits through `exit()` / `return` from `main` (POSIX only), so queued messages
+are not lost.
+
+**Prototype:**
+```c
+int log_install_atexit(log_handle *ctx);
+```
+
+**Returns:**
+- 0 on success, -1 on failure / unsupported platform (Windows)
+
+**Example:**
+```c
+log_set_async(ctx, true);
+log_install_atexit(ctx);
+/* ... log without calling log_set_async(false) ... */
+```
+
+**Notes:**
+- Idempotent per context; `log_destroy()` unregisters it.
+- On Windows, call `log_set_async(ctx, false)` before exiting to flush.
 
 ---
 

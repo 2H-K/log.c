@@ -282,6 +282,142 @@ static void test_handler_formatter_async(void) {
     TEST_PASS("handler formatter async");
 }
 
+#if LOG_FEATURE_KV
+static void test_kv_text_suffix(void) {
+    const char *path = TEST_TMP_DIR "test_kv_text.log";
+    remove(path);
+
+    log_handle *ctx = log_create();
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen");
+    int idx = log_add_fp(ctx, fp, LOG_INFO);
+    TEST_ASSERT(idx >= 0, "add fp");
+    ctx->handlers[0].active = false;
+
+    log_ctx_info_kv(ctx, "boot", LOG_KV_STR("mod", "net"),
+                    LOG_KV_INT("port", 8080), LOG_KV_BOOL("ready", true));
+
+    log_destroy(ctx);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp, "reopen");
+    char buf[1024];
+    TEST_ASSERT(fgets(buf, sizeof(buf), fp) != NULL, "read line");
+    TEST_ASSERT(strstr(buf, "boot") != NULL, "message present");
+    TEST_ASSERT(strstr(buf, "mod=net") != NULL, "str kv suffix");
+    TEST_ASSERT(strstr(buf, "port=8080") != NULL, "int kv suffix");
+    TEST_ASSERT(strstr(buf, "ready=true") != NULL, "bool kv suffix");
+    fclose(fp);
+    remove(path);
+
+    TEST_PASS("kv text suffix");
+}
+
+static void test_kv_json_top_level(void) {
+    const char *path = TEST_TMP_DIR "test_kv.json";
+    remove(path);
+
+    log_handle *ctx = log_create();
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen");
+    int idx = log_add_fp(ctx, fp, LOG_INFO);
+    TEST_ASSERT(idx >= 0, "add fp");
+    ctx->handlers[0].active = false;
+    log_enable_json_format(ctx);
+
+    log_ctx_info_kv(ctx, "login",
+                    LOG_KV_STR("user", "alice"),
+                    LOG_KV_INT("id", 42),
+                    LOG_KV_DOUBLE("score", 1.5),
+                    LOG_KV_BOOL("ok", true));
+
+    log_destroy(ctx);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp, "reopen");
+    char buf[1024];
+    TEST_ASSERT(fgets(buf, sizeof(buf), fp) != NULL, "read line");
+    TEST_ASSERT(strstr(buf, "\"message\": \"login\"") != NULL, "message field only");
+    TEST_ASSERT(strstr(buf, "\"user\": \"alice\"") != NULL, "str field quoted");
+    TEST_ASSERT(strstr(buf, "\"id\": 42") != NULL, "int field unquoted");
+    TEST_ASSERT(strstr(buf, "\"score\": 1.5") != NULL, "double field unquoted");
+    TEST_ASSERT(strstr(buf, "\"ok\": true") != NULL, "bool field unquoted");
+    fclose(fp);
+    remove(path);
+
+    TEST_PASS("kv json top level");
+}
+
+static void test_kv_json_escape(void) {
+    const char *path = TEST_TMP_DIR "test_kv_escape.json";
+    remove(path);
+
+    log_handle *ctx = log_create();
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen");
+    int idx = log_add_fp(ctx, fp, LOG_INFO);
+    TEST_ASSERT(idx >= 0, "add fp");
+    ctx->handlers[0].active = false;
+    log_enable_json_format(ctx);
+
+    log_ctx_info_kv(ctx, "esc", LOG_KV_STR("s", "a\"b\nc\001d"));
+
+    log_destroy(ctx);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp, "reopen");
+    char buf[1024];
+    TEST_ASSERT(fgets(buf, sizeof(buf), fp) != NULL, "read line");
+    TEST_ASSERT(strstr(buf, "a\\\"b") != NULL, "quote escaped");
+    TEST_ASSERT(strstr(buf, "\\n") != NULL, "newline escaped");
+    TEST_ASSERT(strstr(buf, "\\u0001") != NULL, "control char escaped");
+    TEST_ASSERT(strchr(buf, '\001') == NULL, "no raw control byte");
+    fclose(fp);
+    remove(path);
+
+    TEST_PASS("kv json escaping");
+}
+
+static void test_kv_async(void) {
+    const char *path = TEST_TMP_DIR "test_kv_async.json";
+    remove(path);
+
+    log_handle *ctx = log_create();
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen");
+    int idx = log_add_fp(ctx, fp, LOG_INFO);
+    TEST_ASSERT(idx >= 0, "add fp");
+    ctx->handlers[0].active = false;
+    log_enable_json_format(ctx);
+    log_set_async(ctx, true);
+
+    for (int i = 0; i < 5; i++) {
+        log_ctx_info_kv(ctx, "evt", LOG_KV_INT("seq", i), LOG_KV_STR("kind", "tick"));
+    }
+    log_set_async(ctx, false);
+
+    log_destroy(ctx);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp, "reopen");
+    char buf[1024];
+    int lines = 0;
+    while (fgets(buf, sizeof(buf), fp)) {
+        lines++;
+        TEST_ASSERT(strstr(buf, "\"kind\": \"tick\"") != NULL, "kv survives async");
+    }
+    fclose(fp);
+    TEST_ASSERT_EQ(lines, 5, "all async kv lines written");
+    remove(path);
+
+    TEST_PASS("kv async transport");
+}
+#endif /* LOG_FEATURE_KV */
+
 void test_format_register(void) {
     test_add(test_json_escape_double_quote, "json_escape_double_quote");
     test_add(test_json_escape_newline, "json_escape_newline");
@@ -293,4 +429,10 @@ void test_format_register(void) {
     test_add(test_text_format_output, "text_format_output");
     test_add(test_handler_formatter_writes, "handler_formatter_writes");
     test_add(test_handler_formatter_async, "handler_formatter_async");
+#if LOG_FEATURE_KV
+    test_add(test_kv_text_suffix, "kv_text_suffix");
+    test_add(test_kv_json_top_level, "kv_json_top_level");
+    test_add(test_kv_json_escape, "kv_json_escaping");
+    test_add(test_kv_async, "kv_async");
+#endif
 }

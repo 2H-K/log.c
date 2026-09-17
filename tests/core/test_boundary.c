@@ -352,6 +352,107 @@ static void test_very_small_queue_size(void) {
     TEST_PASS("very small queue size");
 }
 
+#if LOG_FEATURE_KV
+static void test_kv_null_key_and_empty(void) {
+    const char *path = TEST_TMP_DIR "test_kv_null.log";
+    remove(path);
+
+    log_handle *ctx = log_create();
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen");
+    int idx = log_add_fp(ctx, fp, LOG_INFO);
+    TEST_ASSERT(idx >= 0, "add fp");
+    ctx->handlers[0].active = false;
+
+    log_ctx_info_kv(ctx, "plain", LOG_KV_END);   /* empty pair list */
+    log_ctx_info_kv(ctx, "mixed", LOG_KV_STR(NULL, "ignored"), LOG_KV_INT("a", 1));
+
+    log_destroy(ctx);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp, "reopen");
+    char l1[512], l2[512];
+    TEST_ASSERT(fgets(l1, sizeof(l1), fp) != NULL, "line 1");
+    TEST_ASSERT(fgets(l2, sizeof(l2), fp) != NULL, "line 2");
+    TEST_ASSERT(strchr(l1, '=') == NULL, "empty list adds no suffix");
+    TEST_ASSERT(strstr(l2, "a=1") != NULL, "valid pair encoded");
+    TEST_ASSERT(strstr(l2, "ignored") == NULL, "NULL key skipped");
+    fclose(fp);
+    remove(path);
+
+    TEST_PASS("kv null key / empty list");
+}
+
+static void test_kv_over_limit(void) {
+    const char *path = TEST_TMP_DIR "test_kv_limit.log";
+    remove(path);
+
+    log_handle *ctx = log_create();
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen");
+    int idx = log_add_fp(ctx, fp, LOG_INFO);
+    TEST_ASSERT(idx >= 0, "add fp");
+    ctx->handlers[0].active = false;
+
+    log_ctx_info_kv(ctx, "many",
+        LOG_KV_INT("k0", 0), LOG_KV_INT("k1", 1), LOG_KV_INT("k2", 2),
+        LOG_KV_INT("k3", 3), LOG_KV_INT("k4", 4), LOG_KV_INT("k5", 5),
+        LOG_KV_INT("k6", 6), LOG_KV_INT("k7", 7), LOG_KV_INT("k8", 8),
+        LOG_KV_INT("k9", 9));
+
+    log_stats st;
+    memset(&st, 0, sizeof(st));
+    TEST_ASSERT_EQ(log_get_stats(ctx, &st), 0, "get stats");
+    TEST_ASSERT(st.truncated_count >= 1, "over-limit counted as truncated");
+
+    log_destroy(ctx);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp, "reopen");
+    char buf[1024];
+    TEST_ASSERT(fgets(buf, sizeof(buf), fp) != NULL, "read line");
+    TEST_ASSERT(strstr(buf, "k0=0") != NULL, "first pair kept");
+    TEST_ASSERT(strstr(buf, "k7=7") != NULL, "8th pair kept");
+    TEST_ASSERT(strstr(buf, "k8=8") == NULL, "9th pair dropped");
+    fclose(fp);
+    remove(path);
+
+    TEST_PASS("kv over-limit truncated");
+}
+
+static void test_kv_mixed_types(void) {
+    const char *path = TEST_TMP_DIR "test_kv_mixed.log";
+    remove(path);
+
+    log_handle *ctx = log_create();
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp, "fopen");
+    int idx = log_add_fp(ctx, fp, LOG_INFO);
+    TEST_ASSERT(idx >= 0, "add fp");
+    ctx->handlers[0].active = false;
+
+    log_ctx_info_kv(ctx, "mix", LOG_KV_INT("n", -5), LOG_KV_DOUBLE("d", 2.5),
+                    LOG_KV_BOOL("b", false));
+
+    log_destroy(ctx);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp, "reopen");
+    char buf[1024];
+    TEST_ASSERT(fgets(buf, sizeof(buf), fp) != NULL, "read line");
+    TEST_ASSERT(strstr(buf, "n=-5") != NULL, "negative int");
+    TEST_ASSERT(strstr(buf, "d=2.5") != NULL, "double");
+    TEST_ASSERT(strstr(buf, "b=false") != NULL, "false bool");
+    fclose(fp);
+    remove(path);
+
+    TEST_PASS("kv mixed types");
+}
+#endif /* LOG_FEATURE_KV */
+
 static void test_boundary_register(void) {
     test_add(test_boundary_null_filename, "boundary_null_filename");
     test_add(test_boundary_empty_filename, "boundary_empty_filename");
@@ -372,4 +473,9 @@ static void test_boundary_register(void) {
     test_add(test_format_percent, "format_percent");
     test_add(test_format_null_args, "format_null_args");
     test_add(test_very_small_queue_size, "very_small_queue_size");
+#if LOG_FEATURE_KV
+    test_add(test_kv_null_key_and_empty, "kv_null_key_and_empty");
+    test_add(test_kv_over_limit, "kv_over_limit");
+    test_add(test_kv_mixed_types, "kv_mixed_types");
+#endif
 }

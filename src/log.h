@@ -154,6 +154,12 @@
   #ifndef LOG_DISABLE_TS_CACHE
     #define LOG_DISABLE_TS_CACHE
   #endif
+  #ifndef LOG_DISABLE_KV
+    #define LOG_DISABLE_KV
+  #endif
+  #ifndef LOG_DISABLE_LIFECYCLE
+    #define LOG_DISABLE_LIFECYCLE
+  #endif
 #endif
 
 /* Disable JSON formatting support (saves ~2KB binary) */
@@ -217,6 +223,20 @@
   #define LOG_FEATURE_TS_CACHE 1
 #else
   #define LOG_FEATURE_TS_CACHE 0
+#endif
+
+/* Typed key-value metadata / structured logging (B2) */
+#ifndef LOG_DISABLE_KV
+  #define LOG_FEATURE_KV 1
+#else
+  #define LOG_FEATURE_KV 0
+#endif
+
+/* Process lifecycle safety: fork / exit flushing (B6) */
+#ifndef LOG_DISABLE_LIFECYCLE
+  #define LOG_FEATURE_LIFECYCLE 1
+#else
+  #define LOG_FEATURE_LIFECYCLE 0
 #endif
 
 /* Crash-safe logging: per-line flush plus a fatal-signal marker line
@@ -345,6 +365,49 @@ typedef void (*log_LockFn)(bool lock, void *udata);
  */
 typedef int (*log_FormatFn)(log_handle *ctx, log_event *ev, char *buf, size_t buf_size);
 
+#if LOG_FEATURE_KV
+/**
+ * @brief Typed key-value metadata for structured logging.
+ *
+ * Pairs are assembled on the caller's stack by the log_*_kv() macros and
+ * passed to log_log_kv(). The JSON formatter emits them as top-level fields;
+ * the text formatter appends them as `key=value` after the message. At most
+ * LOG_KV_MAX_PAIRS pairs are used; extra pairs are dropped and counted in
+ * log_stats::truncated_count. A NULL key skips that pair.
+ */
+#define LOG_KV_MAX_PAIRS 8
+#if LOG_FEATURE_STATIC_ALLOC
+/* Static mode embeds the encoded kv blob in each ring slot. Cost is
+ * LOG_KV_INLINE_MAX * LOG_RING_CAPACITY bytes; larger blobs are dropped
+ * whole (counted in truncated_count) rather than heap-allocated. */
+  #ifndef LOG_KV_INLINE_MAX
+    #define LOG_KV_INLINE_MAX 256
+  #endif
+#endif
+
+enum {
+  LOG_KV_T_INT,
+  LOG_KV_T_DOUBLE,
+  LOG_KV_T_STR,
+  LOG_KV_T_BOOL
+};
+
+typedef struct log_kv {
+  const char *key;   /* field name; NULL entries are skipped */
+  int type;          /* one of LOG_KV_T_* */
+  long long i;       /* backing value for INT / BOOL */
+  double d;          /* backing value for DOUBLE */
+  const char *s;     /* borrowed string for STR (copied during the call) */
+} log_kv;
+
+/* Use as initializers of a stack log_kv array; LOG_KV_END is optional. */
+#define LOG_KV_INT(k, v)    { (k), LOG_KV_T_INT,    (long long)(v), 0.0,         NULL }
+#define LOG_KV_DOUBLE(k, v) { (k), LOG_KV_T_DOUBLE, 0,               (double)(v), NULL }
+#define LOG_KV_STR(k, v)    { (k), LOG_KV_T_STR,    0,               0.0,         (v) }
+#define LOG_KV_BOOL(k, v)   { (k), LOG_KV_T_BOOL,   ((v) ? 1 : 0),   0.0,         NULL }
+#define LOG_KV_END          { NULL, LOG_KV_T_INT,   0,               0.0,         NULL }
+#endif /* LOG_FEATURE_KV */
+
 /**
  * @brief Log event structure
  */
@@ -358,6 +421,9 @@ struct log_event {
   int line;
   int level;
   double timestamp;  /* High-precision timestamp in seconds */
+#if LOG_FEATURE_KV
+  const char *kv;    /* encoded KV blob (internal); NULL when none */
+#endif
 };
 
 /**
@@ -389,7 +455,7 @@ typedef struct log_stats {
   double avg_queue_latency_ms;  /* mean async enqueue->dequeue latency, ms */
   uint64_t async_writes;
   uint64_t sync_writes;
-  uint64_t truncated_count;   /* messages truncated (static mode / size limits) */
+  uint64_t truncated_count;   /* messages / kv pairs dropped by size limits */
 } log_stats;
 
 /**
@@ -438,6 +504,9 @@ typedef struct log_queue_entry {
   char *file;
   int line;
   double timestamp;
+#if LOG_FEATURE_KV
+  char *kv;     /* encoded kv blob (owned; NULL when none) */
+#endif
   struct log_queue_entry *next;
 } log_queue_entry;
 
@@ -467,6 +536,12 @@ typedef struct log_ring_entry {
   double timestamp;
   bool has_large_msg;
   bool has_large_file;
+#if LOG_FEATURE_KV
+  bool has_kv;
+#if LOG_FEATURE_STATIC_ALLOC
+  char kv_storage[LOG_KV_INLINE_MAX];
+#endif
+#endif
 } log_ring_entry;
 
 /**
@@ -700,6 +775,11 @@ static inline int log_set_crash_safe(log_handle *ctx, bool enable) { (void)ctx; 
 static inline int log_install_crash_handler(log_handle *ctx) { (void)ctx; return -1; }
 #endif
 
+#if !LOG_FEATURE_LIFECYCLE
+static inline int log_install_atfork(log_handle *ctx) { (void)ctx; return -1; }
+static inline int log_install_atexit(log_handle *ctx) { (void)ctx; return -1; }
+#endif
+
 #if !LOG_FEATURE_STATIC_ALLOC
 static inline size_t log_static_ctx_size(void) { return 0; }
 static inline log_handle* log_create_static(void *buf, size_t buf_size) {
@@ -782,6 +862,24 @@ int log_set_crash_safe(log_handle *ctx, bool enable);
 int log_install_crash_handler(log_handle *ctx);
 #endif
 
+/* Process lifecycle safety (POSIX).
+ *
+ * log_install_atfork: registers pthread_atfork handlers for the context.
+ *   Around fork() the context is quiesced (locks held); in the child the
+ *   synchronization primitives are reinitialized (the parent's threads do
+ *   not exist there) and async logging is downgraded to synchronous, so the
+ *   child can keep logging without deadlocking on inherited locks.
+ * log_install_atexit: registers an atexit handler that drains a still-async
+ *   context when the process exits through exit() / return from main.
+ *
+ * Both are idempotent per context. Call them once during setup, before
+ * spawning threads, and from a context that is not inside a log handler.
+ * Return 0 on success, -1 on failure / unsupported platform. */
+#if LOG_FEATURE_LIFECYCLE
+int log_install_atfork(log_handle *ctx);
+int log_install_atexit(log_handle *ctx);
+#endif
+
 /* Static-allocation mode (requires LOG_STATIC_ALLOC).
  * Declare storage as log_static_storage_t to get correct alignment:
  *   static log_static_storage_t g_log_storage;
@@ -802,6 +900,12 @@ log_handle* log_create_static(void *buf, size_t buf_size);
 #endif
 
 void log_log(log_handle *ctx, int level, const char *file, int line, const char *fmt, ...);
+#if LOG_FEATURE_KV
+/* Structured log call: msg is emitted literally (not printf-formatted) and
+ * the typed pairs are attached to the event. */
+void log_log_kv(log_handle *ctx, int level, const char *file, int line,
+                const log_kv *kvs, int kv_count, const char *msg);
+#endif
 #if LOG_FEATURE_FILE_OPS
 void log_rotate(log_handle *ctx);
 #endif
@@ -834,6 +938,46 @@ void log_configure_pipeline(log_handle* ctx, log_stage_function* stages, int sta
 #define log_ctx_warn(ctx, ...)  log_log(ctx, LOG_WARN,  __FILE__, __LINE__, __VA_ARGS__)
 #define log_ctx_error(ctx, ...) log_log(ctx, LOG_ERROR, __FILE__, __LINE__, __VA_ARGS__)
 #define log_ctx_fatal(ctx, ...) log_log(ctx, LOG_FATAL, __FILE__, __LINE__, __VA_ARGS__)
+
+/* Structured (key-value) logging. The message is emitted literally.
+ * Example:
+ *   log_ctx_info_kv(ctx, "login", LOG_KV_STR("user", "alice"),
+ *                   LOG_KV_INT("id", 42));
+ * When LOG_FEATURE_KV is disabled these degrade to plain message logging. */
+#if LOG_FEATURE_KV
+#define LOG_KV_LOG_(ctx, level, msg, ...) do { \
+    log_kv log_kv_items_[] = { __VA_ARGS__ }; \
+    log_log_kv((ctx), (level), __FILE__, __LINE__, log_kv_items_, \
+               (int)(sizeof(log_kv_items_) / sizeof(log_kv_items_[0])), (msg)); \
+  } while (0)
+
+#define log_ctx_trace_kv(ctx, msg, ...) LOG_KV_LOG_((ctx), LOG_TRACE, (msg), __VA_ARGS__)
+#define log_ctx_debug_kv(ctx, msg, ...) LOG_KV_LOG_((ctx), LOG_DEBUG, (msg), __VA_ARGS__)
+#define log_ctx_info_kv(ctx, msg, ...)  LOG_KV_LOG_((ctx), LOG_INFO,  (msg), __VA_ARGS__)
+#define log_ctx_warn_kv(ctx, msg, ...)  LOG_KV_LOG_((ctx), LOG_WARN,  (msg), __VA_ARGS__)
+#define log_ctx_error_kv(ctx, msg, ...) LOG_KV_LOG_((ctx), LOG_ERROR, (msg), __VA_ARGS__)
+#define log_ctx_fatal_kv(ctx, msg, ...) LOG_KV_LOG_((ctx), LOG_FATAL, (msg), __VA_ARGS__)
+
+#define log_trace_kv(msg, ...) LOG_KV_LOG_(log_default(), LOG_TRACE, (msg), __VA_ARGS__)
+#define log_debug_kv(msg, ...) LOG_KV_LOG_(log_default(), LOG_DEBUG, (msg), __VA_ARGS__)
+#define log_info_kv(msg, ...)  LOG_KV_LOG_(log_default(), LOG_INFO,  (msg), __VA_ARGS__)
+#define log_warn_kv(msg, ...)  LOG_KV_LOG_(log_default(), LOG_WARN,  (msg), __VA_ARGS__)
+#define log_error_kv(msg, ...) LOG_KV_LOG_(log_default(), LOG_ERROR, (msg), __VA_ARGS__)
+#define log_fatal_kv(msg, ...) LOG_KV_LOG_(log_default(), LOG_FATAL, (msg), __VA_ARGS__)
+#else
+#define log_ctx_trace_kv(ctx, msg, ...) log_ctx_trace((ctx), "%s", (msg))
+#define log_ctx_debug_kv(ctx, msg, ...) log_ctx_debug((ctx), "%s", (msg))
+#define log_ctx_info_kv(ctx, msg, ...)  log_ctx_info((ctx), "%s", (msg))
+#define log_ctx_warn_kv(ctx, msg, ...)  log_ctx_warn((ctx), "%s", (msg))
+#define log_ctx_error_kv(ctx, msg, ...) log_ctx_error((ctx), "%s", (msg))
+#define log_ctx_fatal_kv(ctx, msg, ...) log_ctx_fatal((ctx), "%s", (msg))
+#define log_trace_kv(msg, ...) log_trace("%s", (msg))
+#define log_debug_kv(msg, ...) log_debug("%s", (msg))
+#define log_info_kv(msg, ...)  log_info("%s", (msg))
+#define log_warn_kv(msg, ...)  log_warn("%s", (msg))
+#define log_error_kv(msg, ...) log_error("%s", (msg))
+#define log_fatal_kv(msg, ...) log_fatal("%s", (msg))
+#endif /* LOG_FEATURE_KV */
 
 #ifdef __cplusplus
 }
