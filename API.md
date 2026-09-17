@@ -19,7 +19,7 @@ Version 3.0.0
 
 ## Overview
 
-This is an enhanced logging library for C17 that provides:
+This is an enhanced logging library for C11 that provides:
 
 - Thread-safe logging with reader-writer locks
 - Asynchronous logging with Asynchronous Queue: dedicated writer thread drains a bounded queue
@@ -263,8 +263,42 @@ if (log_set_async(ctx, true) != 0) {
 **Notes:**
 - Uses a bounded queue drained by a writer thread
 - Background thread handles writes
-- Queue drops messages when full
+- What happens when the queue is full is controlled by `log_set_queue_policy`; the default is `LOG_QUEUE_FALLBACK_SYNC` (writes on the calling thread, does **not** drop)
 - Must disable before destroy
+
+---
+
+### log_set_queue_policy()
+
+Selects what happens when the async queue is full. Only meaningful with async
+logging enabled.
+
+**Prototype:**
+```c
+void log_set_queue_policy(log_handle *ctx, int policy);
+```
+
+**Parameters:**
+- `ctx`: Logger context
+- `policy`: One of `LOG_QUEUE_FALLBACK_SYNC` (default), `LOG_QUEUE_DROP`, `LOG_QUEUE_BLOCK`
+
+**Trade-offs:**
+
+| Policy | Blocks caller? | Can lose messages? | Worst-case caller latency | Fits |
+|--------|----------------|--------------------|---------------------------|------|
+| `LOG_QUEUE_FALLBACK_SYNC` | On overflow | No (written synchronously) | Sink latency, on the calling thread | Correctness over latency |
+| `LOG_QUEUE_DROP` | Never | Yes (`queue_drops`) | Bounded | Best-effort, latency-critical paths |
+| `LOG_QUEUE_BLOCK` | On overflow | No | Unbounded under sustained overload | Producers that tolerate backpressure |
+
+No policy provides both a hard latency ceiling and guaranteed delivery; that
+guarantee must come from an external collector. Monitor
+`log_get_stats`→`queue_drops` / `queue_blocked`.
+
+**Example:**
+```c
+log_set_async(ctx, true);
+log_set_queue_policy(ctx, LOG_QUEUE_DROP);
+```
 
 ---
 

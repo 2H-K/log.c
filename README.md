@@ -42,8 +42,75 @@ taskset -c 2 ./build/test_perf
 
 Measurement notes:
 
-- Numbers are **end-to-end delivery**: when the queue is full, messages are written synchronously per the FALLBACK_SYNC policy — nothing is dropped. Historical versions silently dropped overflowing messages, so the old ~5,700,000 msg/s figure was fake throughput and is not comparable.
+- Numbers are **end-to-end delivery**: when the queue is full, the default `LOG_QUEUE_FALLBACK_SYNC` policy writes synchronously on the calling thread instead of dropping. The benchmark queue is sized so this path is not exercised on the hot run. That is a trade-off (worst-case caller latency for not losing messages), not a free win — see the policy table below. Historical versions silently dropped overflowing messages, so the old ~5,700,000 msg/s figure was fake throughput and is not comparable.
 - The value of async mode is **decoupling** (producers are never blocked by a slow sink, with DROP/BLOCK/FALLBACK_SYNC full-queue policies), not throughput.
+
+## 🧭 Scope, Non-Goals & Composition
+
+This library is an **in-process emit layer**. It deliberately is not a transport or
+reliability layer, and that is exactly what keeps it at two files, zero
+dependencies, and small enough to embed anywhere.
+
+**It does:** level filtering, text/JSON formatting, custom formatters and handlers,
+async decoupling via a writer thread, file rotation, syslog, flush/fsync policies,
+crash-safe marker output, and a static zero-allocation mode.
+
+**It does not (by design):** at-least-once delivery, on-disk spooling or offset
+tracking, network/TLS transport, cross-process aggregation, or storage of large
+binary payloads.
+
+**Compose instead of expanding scope.** Hand bytes to an external collector
+(Vector / Filebeat / Fluent Bit / syslog) that owns buffering, delivery, and
+durability. The seam already exists: a custom handler runs on the async writer
+thread, so a blocking send there never stalls your application.
+
+```c
+static void collector_handler(log_handle *ctx, log_event *ev) {
+    (void)ctx;
+    /* The formatted line is in ev->raw_msg; use it instead of re-expanding
+       ev->fmt / ev->ap, which are not valid on the async writer thread. */
+    const char *line = ev->raw_msg ? ev->raw_msg : "";
+    (void)write(spool_fd, line, strlen(line));   /* or send() to a local collector */
+    (void)write(spool_fd, "\n", 1);
+}
+
+log_set_async(ctx, true);
+log_add_handler(ctx, collector_handler, NULL, LOG_INFO);
+```
+
+Keep large payloads out of the log stream: emit metadata plus a hash/path pointer
+and store the payload separately. Oversized messages are **truncated** (never
+split); `log_stats.truncated_count` counts them.
+
+### Queue-full policy trade-offs
+
+Async decoupling only holds while the bounded queue has room. Choose the policy
+that matches your latency-vs-loss requirement (default is `LOG_QUEUE_FALLBACK_SYNC`):
+
+| Policy | Blocks caller? | Can lose messages? | Worst-case caller latency | Fits |
+|--------|----------------|--------------------|---------------------------|------|
+| `LOG_QUEUE_FALLBACK_SYNC` | On overflow | No (written synchronously) | Sink latency, on the calling thread | Correctness over latency |
+| `LOG_QUEUE_DROP` | Never | Yes (`queue_drops`) | Bounded | Best-effort, latency-critical paths |
+| `LOG_QUEUE_BLOCK` | On overflow | No | Unbounded under sustained overload | Producers that tolerate backpressure |
+
+No policy provides both a hard latency ceiling *and* guaranteed delivery — that
+guarantee has to come from an external collector. Whichever you choose, monitor
+`log_stats.queue_drops` / `queue_blocked` as your loss/backpressure signal.
+
+### Latency-sensitive & high-value logging
+
+For services where logging must not perturb the request path (trading systems,
+security sensors, control planes), the same generic setup applies:
+
+- Enable async and keep the sink fast so the queue never fills; if a sink can
+  stall, do not rely on `FALLBACK_SYNC` in that path (see the table above).
+- Keep `fsync` off the hot path (`log_handler_set_fsync(..., false)`); use
+  `LOG_FLUSH_INTERVAL` for bounded durability latency.
+- Ship bytes out of the process to a collector; treat the in-process queue as a
+  latency smoother, not as durable storage.
+- Watch `truncated_count` and `queue_drops` — both are silent-loss indicators.
+- For small containers, set `LOG_RING_CAPACITY` and/or enable `LOG_STATIC_ALLOC`
+  so the context fits your memory budget (see the footprint table below).
 
 ## 📦 Quick Start
 
@@ -232,6 +299,21 @@ Disable optional features to reduce binary size (savings are measured .text delt
 | `LOG_DISABLE_TS_CACHE` | Disable timestamp cache | ~0.6 KB |
 | `LOG_DISABLE_CRASH_MODE` | Disable crash-safe mode | ~1.3 KB |
 | `LOG_MINIMAL` | Disable all optional features | ~15.2 KB |
+
+### Static-mode footprint
+
+With `LOG_STATIC_ALLOC` the ring and handler table are embedded in the context,
+so its size is a compile-time choice via `LOG_RING_CAPACITY` (default 4096; must
+be a power of two):
+
+| Build | `sizeof(log_handle)` |
+|-------|----------------------|
+| `LOG_STATIC_ALLOC`, `LOG_RING_CAPACITY=4096` (default) | ~2.61 MiB |
+| `LOG_STATIC_ALLOC`, `LOG_RING_CAPACITY=256` | ~183 KiB |
+| `LOG_STATIC_ALLOC` + `LOG_MINIMAL`, `LOG_RING_CAPACITY=256` | ~4 KiB |
+
+Pick the smallest capacity that absorbs your burst; the default favors throughput
+over footprint.
 
 ## 📋 Core Features
 

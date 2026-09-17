@@ -42,8 +42,56 @@ taskset -c 2 ./build/test_perf
 
 口径说明：
 
-- 数字为**端到端送达**口径：队列满时按 FALLBACK_SYNC 策略同步落盘，不丢消息。历史版本在队列满时静默丢弃溢出消息，旧文档的 ~5,700,000 msg/s 是丢弃消息后的假吞吐，不可比。
+- 数字为**端到端送达**口径：队列满时默认策略 `LOG_QUEUE_FALLBACK_SYNC` 在调用线程上同步写出、不丢消息。基准中队列开得足够大，热路径不会触发该分支。这是**取舍**（用最坏情况下的调用延迟换不丢消息），不是纯优点——见下方策略表。历史版本在队列满时静默丢弃溢出消息，旧文档的 ~5,700,000 msg/s 是丢弃消息后的假吞吐，不可比。
 - 异步模式的价值是**解耦**（生产者不被慢 sink 阻塞、可设置 DROP/BLOCK/FALLBACK_SYNC 满载策略），不是吞吐。
+
+## 🧭 范围、非目标与组合
+
+本库是**进程内发射层**，刻意不做传输层或可靠性层——正是这一点让它保持双文件、零依赖、可嵌入任意进程。
+
+**它做：** 级别过滤、文本/JSON 格式化、自定义格式化器与 handler、异步解耦（专用写入线程）、按大小轮转、syslog、flush/fsync 策略、崩溃安全标记输出、静态零分配模式。
+
+**它不做（刻意）：** at-least-once 投递、磁盘 spool/offset 持久化、网络/TLS 传输、跨进程聚合、大块二进制 payload 存储。
+
+**用组合代替扩张范围。** 把字节交给外部采集器（Vector / Filebeat / Fluent Bit / syslog），由它负责缓冲、投递与持久化。缝已经存在：自定义 handler 运行在异步写入线程上，因此在那里阻塞发送**不会**卡住你的应用。
+
+```c
+static void collector_handler(log_handle *ctx, log_event *ev) {
+    (void)ctx;
+    /* 已格式化的整行在 ev->raw_msg；不要重新展开 ev->fmt / ev->ap，
+       它们在异步写入线程上不保证有效。 */
+    const char *line = ev->raw_msg ? ev->raw_msg : "";
+    (void)write(spool_fd, line, strlen(line));   /* 或 send() 到本地 collector */
+    (void)write(spool_fd, "\n", 1);
+}
+
+log_set_async(ctx, true);
+log_add_handler(ctx, collector_handler, NULL, LOG_INFO);
+```
+
+大 payload 不要进日志流：只发元数据 + 哈希/路径指针，payload 另存。超长消息会被**截断**（不会拆分），`log_stats.truncated_count` 会计数。
+
+### 队列满策略的取舍
+
+异步解耦只在有界队列未满时成立。按你的"延迟 vs 丢失"需求选策略（默认为 `LOG_QUEUE_FALLBACK_SYNC`）：
+
+| 策略 | 阻塞调用方？ | 会丢消息？ | 最坏调用延迟 | 适用 |
+|------|--------------|------------|--------------|------|
+| `LOG_QUEUE_FALLBACK_SYNC` | 溢出时阻塞 | 否（同步写出） | sink 延迟，落在调用线程 | 正确性优先于延迟 |
+| `LOG_QUEUE_DROP` | 从不阻塞 | 会（`queue_drops`） | 有界 | 尽力而为、延迟关键路径 |
+| `LOG_QUEUE_BLOCK` | 溢出时阻塞 | 否 | 持续过载下无上界 | 能承受背压的生产者 |
+
+**没有任何一种策略能同时给出"硬延迟上限"和"保证不丢"**——后者必须来自外部采集器。无论选哪种，都请把 `log_stats.queue_drops` / `queue_blocked` 当作丢失/背压信号来监控。
+
+### 延迟敏感与高价值日志
+
+对于"日志不得干扰请求路径"的服务（交易系统、安全传感器、控制面），同一套通用配置适用：
+
+- 开启异步并保持 sink 快速，使队列不积压；若 sink 可能停顿时，不要在关键路径上依赖 `FALLBACK_SYNC`（见上表）。
+- 让 `fsync` 离开热路径（`log_handler_set_fsync(..., false)`）；用 `LOG_FLUSH_INTERVAL` 获得有界的持久化延迟。
+- 尽快把字节送出进程交给采集器；把进程内队列当作延迟平滑器，而**不是**持久存储。
+- 监控 `truncated_count` 与 `queue_drops`——两者都是静默丢失的指标。
+- 小容器场景设置 `LOG_RING_CAPACITY` 和/或启用 `LOG_STATIC_ALLOC`，让 context 适配内存预算（见下方 footprint 表）。
 
 ## 📦 快速开始
 
@@ -232,6 +280,18 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 | `LOG_DISABLE_TS_CACHE` | 禁用时间戳缓存 | ~0.6 KB |
 | `LOG_DISABLE_CRASH_MODE` | 禁用崩溃安全模式 | ~1.3 KB |
 | `LOG_MINIMAL` | 禁用所有可选功能 | ~15.2 KB |
+
+### 静态模式占用
+
+启用 `LOG_STATIC_ALLOC` 时，环与 handler 表内嵌在 context 中，大小由编译期 `LOG_RING_CAPACITY` 决定（默认 4096；必须为 2 的幂）：
+
+| 构建 | `sizeof(log_handle)` |
+|------|----------------------|
+| `LOG_STATIC_ALLOC`，`LOG_RING_CAPACITY=4096`（默认） | ~2.61 MiB |
+| `LOG_STATIC_ALLOC`，`LOG_RING_CAPACITY=256` | ~183 KiB |
+| `LOG_STATIC_ALLOC` + `LOG_MINIMAL`，`LOG_RING_CAPACITY=256` | ~4 KiB |
+
+选择能吸收你突发量的最小容量；默认值偏向吞吐而非占用。
 
 ## 📋 核心功能
 
