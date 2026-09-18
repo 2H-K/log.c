@@ -7,7 +7,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Compiler-specific flags
 if(MSVC)
     add_compile_options(/W4 /WX- /std:c17)
-    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+    add_definitions(-D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()

@@ -19,6 +19,18 @@
   #endif
 #endif
 
+/* MSVC CRT deprecation noise: the POSIX names used here (tzset, ...) are
+ * standard on Windows too. Define before any CRT header so builds with /WX
+ * stay clean; CMake passes the same definitions on the command line. */
+#if defined(_MSC_VER)
+  #ifndef _CRT_SECURE_NO_WARNINGS
+    #define _CRT_SECURE_NO_WARNINGS
+  #endif
+  #ifndef _CRT_NONSTDC_NO_DEPRECATE
+    #define _CRT_NONSTDC_NO_DEPRECATE
+  #endif
+#endif
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -520,6 +532,15 @@ typedef struct log_stats {
  *       torn intermediate value under concurrent writes — acceptable for
  *       best-effort monitoring counters.
  */
+#if defined(_MSC_VER)
+/* Intentional cache-line alignment: log_thread_stats is padded to 64 bytes and
+ * any struct embedding one (log_handle) is padded to match. MSVC flags that as
+ * C4324, which /WX promotes to an error in the /Oi regression guard and in any
+ * consumer building with warnings-as-errors. The padding is by design. */
+#pragma warning(push)
+#pragma warning(disable: 4324)
+#endif
+
 typedef struct log_thread_stats {
   LOG_MEMBER_ALIGN_64 uint64_t total_count;
   uint64_t level_counts[LOG_LEVELS];
@@ -893,6 +914,10 @@ struct log_handle {
   log_ring_entry ring_storage[LOG_RING_CAPACITY];
 #endif
 };
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 /* ==================== End of internal layout ==================== */
 
