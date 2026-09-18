@@ -114,14 +114,14 @@ jobs:
                  LOG_DISABLE_FILTER LOG_DISABLE_NAMED LOG_MINIMAL"
           for f in $flags; do
             echo "=== -D$f ==="
-            gcc -std=c11 -Wall -Wextra -Werror -Isrc -c -D"$f" src/log.c -o /dev/null
+            gcc -std=c17 -Wall -Wextra -Werror -Isrc -c -D"$f" src/log.c -o /dev/null
           done
           echo "=== -DLOG_STATIC_ALLOC ==="
-          gcc -std=c11 -Wall -Wextra -Werror -Isrc -c -DLOG_STATIC_ALLOC src/log.c -o /dev/null
+          gcc -std=c17 -Wall -Wextra -Werror -Isrc -c -DLOG_STATIC_ALLOC src/log.c -o /dev/null
           echo "=== -DLOG_MINIMAL -DLOG_STATIC_ALLOC ==="
-          gcc -std=c11 -Wall -Wextra -Werror -Isrc -c -DLOG_MINIMAL -DLOG_STATIC_ALLOC src/log.c -o /dev/null
+          gcc -std=c17 -Wall -Wextra -Werror -Isrc -c -DLOG_MINIMAL -DLOG_STATIC_ALLOC src/log.c -o /dev/null
           echo "=== -DLOG_RING_CAPACITY=256 -DLOG_STATIC_ALLOC ==="
-          gcc -std=c11 -Wall -Wextra -Werror -Isrc -c -DLOG_RING_CAPACITY=256 -DLOG_STATIC_ALLOC src/log.c -o /dev/null
+          gcc -std=c17 -Wall -Wextra -Werror -Isrc -c -DLOG_RING_CAPACITY=256 -DLOG_STATIC_ALLOC src/log.c -o /dev/null
 
       - name: Size gate (LOG_MINIMAL +2 KiB budget)
         run: tests/size_gate.sh gcc

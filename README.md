@@ -1,6 +1,6 @@
 # Enhanced C Log Library - Cross Platform
 
-A simple, powerful, and thread-safe logging library implemented in C11 with full cross-platform support.
+A simple, powerful, and thread-safe logging library implemented in C17 with full cross-platform support.
 
 ![screenshot](https://cloud.githubusercontent.com/assets/3920290/23831970/a2415e96-0723-11e7-9886-f8f5d2de60fe.png)
 
@@ -268,11 +268,11 @@ make CC=cl clean
 make
 
 # Then link your program
-gcc -std=c11 -Wall -Wextra -I./src \
+gcc -std=c17 -Wall -Wextra -I./src \
     your_app.c -L. -llogc -o your_app
 
 # Or compile everything together (no Makefile needed)
-gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
+gcc -std=c17 -Wall -Wextra -DLOG_USE_COLOR -I./src \
     src/log.c your_app.c -o your_app -lpthread
 ```
 
@@ -289,7 +289,7 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 | Feature | Windows | POSIX |
 |---------|---------|-------|
 | Threads | Win32 API | pthread |
-| Atomic Ops | InterlockedXxx | C11 stdatomic |
+| Atomic Ops | InterlockedXxx | C17 stdatomic |
 | Syslog | ❌ Not available | ✅ Available |
 | High-res Time | GetSystemTimePreciseAsFileTime | clock_gettime |
 
@@ -313,7 +313,7 @@ Color output is enabled by default and uses ANSI escape codes:
 
 ## 🔧 Compile-Time Feature Flags
 
-Disable optional features to reduce binary size (savings are measured .text deltas: `gcc -std=c11 -O2 -c src/log.c` + `size`, 2026-09; varies slightly by compiler/arch):
+Disable optional features to reduce binary size (savings are measured .text deltas: `gcc -std=c17 -O2 -c src/log.c` + `size`, 2026-09; varies slightly by compiler/arch):
 
 | Flag | Description | Savings |
 |------|-------------|---------|
@@ -759,63 +759,9 @@ make run-tests    # Run all categories separately
 make run-all      # Run unified test suite
 ```
 
-## 🔄 Migrating from 2.x
-
-Version 3.0.0 renames the opaque handle type from `log` to `log_handle`:
-
-```c
-/* before (2.x) */
-log *ctx = log_create();
-
-/* after (3.0) */
-log_handle *ctx = log_create();
-```
-
-Only the type name changed. Every `log_*` function and `LOG_*` macro keeps its
-name, so a plain textual replacement of the standalone token `log` is enough:
-
-```sh
-sed -i 's/\blog\b/log_handle/g' your_source.c
-```
-
-Why the rename: `log` shares the ordinary identifier namespace with the C math
-function `log()`. MSVC enables that builtin under `/Oi` (implied by `/O2`), and
-`<math.h>`/`<cmath>` expose it on every platform, so a public type called `log`
-cannot coexist with them.
-
 ## 📄 License
 
 MIT License - See [LICENSE](LICENSE) for details.
-
-## 📈 Version History
-
-- **3.0.0** (2026): Breaking - opaque handle type renamed from `log` to `log_handle`
-  - `log` collided with the math builtin `log` (MSVC `/Oi` via `/O2`, `<math.h>`, C++ `<cmath>`)
-  - All `log_*` functions and `LOG_*` macros are unchanged; only the type name moved
-  - Added GitHub Actions CI (Linux GCC/Clang, macOS Clang, Windows MSVC/MinGW)
-  - Added an MSVC `/O2 /Oi /WX` public-header regression guard
-
-- **2.0.1** (2026): Code quality improvements
-  - Cleaned up compiler warnings (unused variables, format strings)
-  - Removed dead code (arena allocator, unused functions)
-  - Added comprehensive example.c demonstrating all features
-  - Fixed format string portability (uint64_t printing)
-
-- **2.0.0** (2026): Major enhancements
-  - Added cross-platform support (Windows/Linux/macOS)
-  - Added CMake build system
-  - Added colored output support
-  - Enhanced async logging (ring buffer queue + dedicated writer thread)
-  - Added JSON format support
-  - Added thread ID tracking
-  - Added syslog integration
-  - Added performance statistics
-  - Added dynamic configuration APIs
-  - Enhanced thread safety with reader-writer locks
-  - Added NULL string safety
-  - Added compile-time feature flags
-
-- **1.0.0** (2020): Original implementation by rxi
 
 ## 🙏 Credits
 
@@ -827,7 +773,7 @@ Enhanced with cross-platform support and additional features in 2026.
 
 Contributions are welcome! Please ensure:
 
-1. Code follows C11 standard
+1. Code follows C17 standard
 2. All functions are documented
 3. Tests pass
 4. Thread safety is maintained

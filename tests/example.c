@@ -2,7 +2,7 @@
  * example.c - Demonstrates key features of the log.c library
  *
  * Build:
- *   gcc -std=c11 -Wall -Isrc -o example example.c src/log.c -lpthread
+ *   gcc -std=c17 -Wall -Isrc -o example example.c src/log.c -lpthread
  */
 
 #include "log.h"

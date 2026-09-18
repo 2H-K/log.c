@@ -4,7 +4,7 @@
 # the minimal/embedded configuration.
 #
 # Usage: tests/size_gate.sh [compiler]
-# Baseline: .text + .data + .bss of `-std=c11 -O2 -DLOG_MINIMAL src/log.c`,
+# Baseline: .text + .data + .bss of `-std=c17 -O2 -DLOG_MINIMAL src/log.c`,
 # measured with GNU `size` on ubuntu-latest x86_64 (GCC). Update the constant
 # only with a deliberate, reviewed size change.
 
@@ -17,7 +17,7 @@ SLACK=2048       # allow +2 KiB before failing
 tmp="${TMPDIR:-/tmp}/logc_size_gate.$$.o"
 trap 'rm -f "$tmp"' EXIT
 
-"$CC" -std=c11 -O2 -Isrc -c -DLOG_MINIMAL src/log.c -o "$tmp"
+"$CC" -std=c17 -O2 -Isrc -c -DLOG_MINIMAL src/log.c -o "$tmp"
 
 # shellcheck disable=SC2046
 set -- $(size "$tmp" | awk 'NR==2 { print $1, $2, $3 }')

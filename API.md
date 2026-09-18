@@ -1,6 +1,6 @@
 # Enhanced Log Library API Documentation
 
-Version 0.1.0 (experimental)
+Version 0.1.0
 
 ## Table of Contents
 
@@ -21,7 +21,7 @@ Version 0.1.0 (experimental)
 
 ## Overview
 
-This is an enhanced logging library for C11 that provides:
+This is an enhanced logging library for C17 that provides:
 
 - Thread-safe logging with reader-writer locks
 - Asynchronous logging with Asynchronous Queue: dedicated writer thread drains a bounded queue
@@ -45,12 +45,9 @@ application code.
 
 ### Versioning & stability
 
-The current version is **0.1.0** and is **experimental**: there is no formal
-release plan and no source/ABI stability guarantee yet. Public declarations may
-still be renamed, reshaped or removed between revisions. The version history at
-the end of this document is retained for provenance only; the `3.0.0` entries
-predate the current experimental renumbering. Pin a specific commit when
-depending on this library.
+The current version is **0.1.0**, and there is no source/ABI stability guarantee
+yet. Public declarations may still be renamed, reshaped or removed between
+revisions.
 
 ### Log Levels
 
@@ -1395,9 +1392,3 @@ gcc -DLOG_USE_COLOR -std=c17 -Wall -Wextra \
 ## License
 
 MIT License - See LICENSE file for details.
-
-## Version History
-
-- **3.0.0** (2026): Breaking - opaque handle type renamed `log` -> `log_handle`
-- **2.0.0** (2026): Added async logging, JSON format, thread ID, syslog support
-- **1.0.0** (2020): Original implementation by rxi

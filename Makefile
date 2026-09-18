@@ -24,14 +24,14 @@ ifneq ($(CC),cl)
   else
     LDFLAGS  = -lpthread
   endif
-  CFLAGS  += -std=c11 -Wall -Wextra -Isrc -Itests
+  CFLAGS  += -std=c17 -Wall -Wextra -Isrc -Itests
   TEST_EXT =
 else
   LIB_EXT  = .lib
   AR       = lib
   TARGET   = logc.lib
   LDFLAGS  =
-  CFLAGS  += /std:c11 /W4 /WX- /D_CRT_SECURE_NO_WARNINGS /Isrc /Itests
+  CFLAGS  += /std:c17 /W4 /WX- /D_CRT_SECURE_NO_WARNINGS /Isrc /Itests
   TEST_EXT = .exe
 endif
 

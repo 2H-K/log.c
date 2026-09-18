@@ -1,5 +1,5 @@
 /*
- * Enhanced C11 Log Library with async support, rotation, and performance stats
+ * Enhanced C17 Log Library with async support, rotation, and performance stats
  * Based on rxi/log.c (original copyright 2020 rxi)
  * Modified for enhanced features (2026)
  *

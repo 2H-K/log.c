@@ -38,7 +38,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(_MSC_VER)
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201710L && !defined(_MSC_VER)
   #define LOG_USE_STDATOMIC 1
   #include <stdatomic.h>
 #elif defined(_MSC_VER)
@@ -59,7 +59,7 @@
     #endif
   #endif
 #else
-  #error "C11 or later with stdatomic.h required, or MSVC"
+  #error "C17 or later with stdatomic.h required, or MSVC"
 #endif
 
 /* Cross-platform alignment macro */
@@ -69,7 +69,7 @@
 #elif defined(__GNUC__) || defined(__clang__)
   #define LOG_ALIGN_64 __attribute__((aligned(64)))
   #define LOG_MEMBER_ALIGN_64
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201710L
   #define LOG_ALIGN_64
   #define LOG_MEMBER_ALIGN_64 _Alignas(64)
 #else
@@ -107,7 +107,7 @@
   #define LOG_GET_THREAD_ID() ((LOG_THREAD_ID_T)GetCurrentThreadId())
 #endif
 
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201710L
   #define LOG_THREAD_LOCAL _Thread_local
 #elif defined(_MSC_VER)
   #define LOG_THREAD_LOCAL __declspec(thread)

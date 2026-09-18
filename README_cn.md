@@ -1,6 +1,6 @@
 # 增强型 C 日志库 - 跨平台
 
-一个简单、强大且线程安全的 C11 日志库，具备完整的跨平台支持。
+一个简单、强大且线程安全的 C17 日志库，具备完整的跨平台支持。
 
 ![screenshot](https://cloud.githubusercontent.com/assets/3920290/23831970/a2415e96-0723-11e7-9886-f8f5d2de60fe.png)
 
@@ -244,11 +244,11 @@ make CC=cl clean
 make
 
 # 然后链接你的程序
-gcc -std=c11 -Wall -Wextra -I./src \
+gcc -std=c17 -Wall -Wextra -I./src \
     your_app.c -L. -llogc -o your_app
 
 # 或直接一起编译（无需 Makefile）
-gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
+gcc -std=c17 -Wall -Wextra -DLOG_USE_COLOR -I./src \
     src/log.c your_app.c -o your_app -lpthread
 ```
 
@@ -265,7 +265,7 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 | 功能 | Windows | POSIX |
 |------|---------|-------|
 | 线程 | Win32 API | pthread |
-| 原子操作 | InterlockedXxx | C11 stdatomic |
+| 原子操作 | InterlockedXxx | C17 stdatomic |
 | Syslog | ❌ 不可用 | ✅ 可用 |
 | 高精度时间 | GetSystemTimePreciseAsFileTime | clock_gettime |
 
@@ -289,7 +289,7 @@ gcc -std=c11 -Wall -Wextra -DLOG_USE_COLOR -I./src \
 
 ## 🔧 编译时功能标志
 
-禁用可选功能以减小二进制体积（节省值为 .text 实测差值：`gcc -std=c11 -O2 -c src/log.c` 后 `size` 对比，2026-09；随编译器/架构略有浮动）：
+禁用可选功能以减小二进制体积（节省值为 .text 实测差值：`gcc -std=c17 -O2 -c src/log.c` 后 `size` 对比，2026-09；随编译器/架构略有浮动）：
 
 | 标志 | 说明 | 节省 |
 |------|------|------|
@@ -697,59 +697,9 @@ make run-tests    # 分别运行所有类别
 make run-all      # 运行统一测试套件
 ```
 
-## 🔄 从 2.x 迁移
-
-3.0.0 把不透明句柄类型从 `log` 改名为 `log_handle`：
-
-```c
-/* 2.x 之前的写法 */
-log *ctx = log_create();
-
-/* 3.0 的写法 */
-log_handle *ctx = log_create();
-```
-
-只改了类型名。所有 `log_*` 函数和 `LOG_*` 宏名称不变，所以对独立的 `log` 令牌做一次文本替换即可：
-
-```sh
-sed -i 's/\blog\b/log_handle/g' your_source.c
-```
-
-改名原因：`log` 与 C 数学函数 `log()` 共用 ordinary identifier 命名空间。MSVC 在 `/Oi`（由 `/O2` 隐含）下会启用该内置函数，而 `<math.h>`/`<cmath>` 在任何平台都会暴露它，因此名为 `log` 的公共类型无法与它们共存。
-
 ## 📄 许可证
 
 MIT 许可证 - 详情请参阅 [LICENSE](LICENSE)。
-
-## 📈 版本历史
-
-- **3.0.0** (2026): 破坏性变更 —— 不透明句柄类型由 `log` 改名为 `log_handle`
-  - `log` 与数学内置函数 `log` 冲突（MSVC 经 `/O2` 隐含的 `/Oi`、`<math.h>`、C++ `<cmath>`）
-  - 所有 `log_*` 函数与 `LOG_*` 宏不变，仅类型名变更
-  - 新增 GitHub Actions CI（Linux GCC/Clang、macOS Clang、Windows MSVC/MinGW）
-  - 新增 MSVC `/O2 /Oi /WX` 公共头回归门禁
-
-- **2.0.1** (2026): 代码质量改进
-  - 清理编译警告（未使用变量、格式字符串）
-  - 移除死代码（arena 分配器、未使用函数）
-  - 添加全面的 example.c 演示所有功能
-  - 修复格式字符串可移植性（uint64_t 打印）
-
-- **2.0.0** (2026): 重大增强
-  - 添加跨平台支持（Windows/Linux/macOS）
-  - 添加 CMake 构建系统
-  - 添加彩色输出支持
-  - 增强异步日志（环形缓冲队列 + 专用写入线程）
-  - 添加 JSON 格式支持
-  - 添加线程ID追踪
-  - 添加 syslog 集成
-  - 添加性能统计
-  - 添加动态配置 API
-  - 增强线程安全（读写锁）
-  - 添加 NULL 字符串安全
-  - 添加编译时功能标志
-
-- **1.0.0** (2020): rxi 的原始实现
 
 ## 🙏 致谢
 
@@ -761,7 +711,7 @@ MIT 许可证 - 详情请参阅 [LICENSE](LICENSE)。
 
 欢迎贡献！请确保：
 
-1. 代码遵循 C11 标准
+1. 代码遵循 C17 标准
 2. 所有函数都有文档
 3. 测试通过
 4. 保持线程安全
