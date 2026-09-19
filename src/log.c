@@ -2542,8 +2542,11 @@ static void lifecycle_atfork_parent(void) {
 }
 
 static void lifecycle_atfork_child(void) {
-  pthread_mutex_init(&g_lifecycle_mtx, NULL);
-  pthread_mutex_init(&default_log_mutex, NULL);
+  pthread_mutex_unlock(&default_log_mutex);
+  for (int i = g_lifecycle_count - 1; i >= 0; i--) {
+    if (g_lifecycle[i].atfork && g_lifecycle[i].ctx) lifecycle_unlock(g_lifecycle[i].ctx);
+  }
+  pthread_mutex_unlock(&g_lifecycle_mtx);
   for (int i = 0; i < g_lifecycle_count; i++) {
     if (g_lifecycle[i].atfork && g_lifecycle[i].ctx) lifecycle_reinit(g_lifecycle[i].ctx);
   }
