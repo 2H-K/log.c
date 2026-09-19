@@ -62,13 +62,13 @@ static void run_durability(const char *label, const char *path, int n,
 
 static void test_bench_durability(void) {
     /* Buffered: the hot path is dominated by vsnprintf/handler work. */
-    run_durability("buffered", "/tmp/bench_durable_buffered.log", 200000,
+    run_durability("buffered", "bench_durable_buffered.log", 200000,
                    LOG_FLUSH_NEVER, 0, false);
     /* Flushed: one write(2) per message. */
-    run_durability("flushed", "/tmp/bench_durable_flushed.log", 50000,
+    run_durability("flushed", "bench_durable_flushed.log", 50000,
                    LOG_FLUSH_EVERY, 0, false);
     /* Fsynced: one fsync(2) per message (slowest, most durable). */
-    run_durability("fsynced", "/tmp/bench_durable_fsynced.log", 2000,
+    run_durability("fsynced", "bench_durable_fsynced.log", 2000,
                    LOG_FLUSH_EVERY, 0, true);
     TEST_PASS("bench durability tiers");
 }
