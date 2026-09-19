@@ -64,7 +64,7 @@ static void test_queue_fallback_sync_policy(void) {
      * messages on the ring path (queue_drops stayed 0, so the old assertion
      * passed while 56% of messages vanished). Verify delivery, not just
      * the drop counter. */
-    const char *path = "/tmp/test_fallback_delivery.log";
+    const char *path = TEST_TMP_DIR "test_fallback_delivery.log";
     remove(path);
 
     log_handle *ctx = log_create();
